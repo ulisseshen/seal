@@ -68,20 +68,47 @@ echo -e "${CYAN}→${NC} Installing dependencies..."
 npm install --production 2>/dev/null
 echo -e "${GREEN}✓${NC} Dependencies installed"
 
-# --- Install Claude Code skill ---
+# --- Detect and install skills for all runtimes ---
 
-echo -e "${CYAN}→${NC} Installing /seal skill for Claude Code..."
-mkdir -p "$SKILL_DIR"
+SKILL_FILE="$INSTALL_DIR/skill/SKILL.md"
+CURSOR_FILE="$INSTALL_DIR/skills/cursor/seal.mdc"
 
-if [ -f "$INSTALL_DIR/skill/SKILL.md" ]; then
-  cp "$INSTALL_DIR/skill/SKILL.md" "$SKILL_DIR/SKILL.md"
-elif [ -f "$INSTALL_DIR/.claude/skills/seal/SKILL.md" ]; then
-  cp "$INSTALL_DIR/.claude/skills/seal/SKILL.md" "$SKILL_DIR/SKILL.md"
-else
-  echo -e "${YELLOW}⚠${NC} Skill file not found in repo, skipping"
+# Claude Code
+if [ -d "$HOME/.claude" ]; then
+  mkdir -p "$HOME/.claude/skills/seal"
+  cp "$SKILL_FILE" "$HOME/.claude/skills/seal/SKILL.md"
+  echo -e "${GREEN}✓${NC} Claude Code skill installed"
 fi
 
-echo -e "${GREEN}✓${NC} /seal skill installed"
+# Codex
+if [ -d "$HOME/.agents" ] || [ -d ".agents" ]; then
+  mkdir -p "$HOME/.agents/skills/seal"
+  cp "$SKILL_FILE" "$HOME/.agents/skills/seal/SKILL.md"
+  echo -e "${GREEN}✓${NC} Codex skill installed"
+fi
+
+# Antigravity
+if [ -d "$HOME/.gemini" ] || [ -d ".agent" ]; then
+  mkdir -p "$HOME/.gemini/antigravity/skills/seal"
+  cp "$SKILL_FILE" "$HOME/.gemini/antigravity/skills/seal/SKILL.md"
+  echo -e "${GREEN}✓${NC} Antigravity skill installed"
+fi
+
+# Cursor
+if [ -d "$HOME/.cursor" ] || [ -d ".cursor" ]; then
+  mkdir -p "$HOME/.cursor/rules"
+  cp "$CURSOR_FILE" "$HOME/.cursor/rules/seal.mdc"
+  echo -e "${GREEN}✓${NC} Cursor rule installed"
+fi
+
+# Project-level installs (if inside a project)
+if [ -f "package.json" ] || [ -f "pubspec.yaml" ] || [ -f "Cargo.toml" ]; then
+  mkdir -p ".claude/skills/seal"
+  cp "$SKILL_FILE" ".claude/skills/seal/SKILL.md"
+  echo -e "${GREEN}✓${NC} Project-level Claude Code skill installed"
+fi
+
+echo -e "${GREEN}✓${NC} Skills installed for all detected runtimes"
 
 # --- Create config directory ---
 

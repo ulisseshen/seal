@@ -166,23 +166,63 @@ SEAL Runner (polling every 30s):
 │   ├── db.js           # SQLite schema, queries, task management
 │   └── notify.js       # 5-level notification system (silent → supernova)
 ├── skill/
-│   └── SKILL.md        # Claude Code /seal slash command
-├── install.sh          # One-line installer
+│   └── SKILL.md        # Claude Code / Codex / Antigravity skill
+├── skills/
+│   └── cursor/
+│       └── seal.mdc    # Cursor rule
+├── install.sh          # One-line installer (auto-detects runtimes)
 └── package.json
 
 ~/.config/seal/
 └── tasks.db            # SQLite database (auto-created on first run)
 
-~/.claude/skills/seal/
-└── SKILL.md            # Installed Claude Code skill
+# Skills installed per runtime (by install.sh):
+~/.claude/skills/seal/SKILL.md                    # Claude Code
+~/.agents/skills/seal/SKILL.md                    # Codex
+~/.gemini/antigravity/skills/seal/SKILL.md        # Antigravity
+~/.cursor/rules/seal.mdc                          # Cursor
 ```
+
+## Supported runtimes
+
+| Runtime | Skill location | Status |
+|---------|---------------|--------|
+| Claude Code | `~/.claude/skills/seal/SKILL.md` | Supported |
+| Codex | `~/.agents/skills/seal/SKILL.md` | Supported |
+| Antigravity | `~/.gemini/antigravity/skills/seal/SKILL.md` | Supported |
+| Cursor | `~/.cursor/rules/seal.mdc` | Supported |
+
+The install script auto-detects which runtimes you have and installs the skill for each one.
 
 ## Requirements
 
 - **Node.js** 18+
-- **Claude Code** CLI installed and authenticated
-- **Claude Max plan** recommended (4 concurrent sessions)
-- **macOS** for notifications (Linux: notifications degrade to terminal bell)
+- **An AI coding CLI** — Claude Code, Codex, Antigravity, or Cursor (at least one)
+- **Claude Max plan** recommended for parallel execution (4 concurrent sessions)
+- **macOS** for full notification support (Linux: notifications degrade to terminal bell)
+- **sqlite3** CLI for the `/seal` skill to read/write the task database
+
+### For persistent reminders (supernova)
+
+The SEAL runner daemon must be running in a background terminal for persistent reminders to fire. Without it, tasks are saved but won't execute or notify.
+
+```bash
+# Start the runner (keep this terminal open):
+seal-run
+
+# Or run as a background process:
+nohup node ~/projects/seal/src/runner.js > /tmp/seal.log 2>&1 &
+
+# Or set up as a launchd service (macOS):
+# See docs/launchd.md (coming soon)
+```
+
+### For task execution
+
+SEAL spawns `claude -p` to execute tasks autonomously. This requires:
+- The **Claude Code CLI** installed and authenticated (`claude --version`)
+- Your configured **MCP servers**, **skills**, and **tools** work as-is — SEAL runs on your machine, so everything Claude Code can access, SEAL can access
+- `--permission-mode auto` is used by default — Claude's safety classifier evaluates each action before executing
 
 ## Task types
 
