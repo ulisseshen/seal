@@ -1,0 +1,6 @@
+name = "seal-email-worker"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[vars]
+SEAL_WEBHOOK_URL = "https://your-tunnel.com/email"

@@ -10,35 +10,33 @@ let running = 0;
  * Execute a task by spawning claude -p with the task's meta-prompt.
  * Returns a promise that resolves when claude finishes.
  */
-export function executeTask(task) {
+export async function executeTask(task) {
+  running++;
+  await updateStatus(task.id, 'running');
+
+  const args = [
+    '-p', task.prompt,
+    '--permission-mode', task.permission_mode || 'auto',
+    '--output-format', 'text',
+  ];
+
+  if (task.project) {
+    args.push('--project', expandPath(task.project));
+  }
+
+  if (task.allowed_tools) {
+    try {
+      const tools = JSON.parse(task.allowed_tools);
+      if (tools.length > 0) {
+        args.push('--allowedTools', tools.join(','));
+      }
+    } catch {}
+  }
+
+  console.log(`[executor] Running task ${task.id}: ${task.summary}`);
+  console.log(`[executor] claude ${args.join(' ')}`);
+
   return new Promise((resolve) => {
-    running++;
-    updateStatus(task.id, 'running');
-
-    const args = [
-      '-p', task.prompt,
-      '--permission-mode', task.permission_mode || 'auto',
-      '--output-format', 'text',
-    ];
-
-    // Add project directory
-    if (task.project) {
-      args.push('--project', expandPath(task.project));
-    }
-
-    // Add allowed tools
-    if (task.allowed_tools) {
-      try {
-        const tools = JSON.parse(task.allowed_tools);
-        if (tools.length > 0) {
-          args.push('--allowedTools', tools.join(','));
-        }
-      } catch {}
-    }
-
-    console.log(`[executor] Running task ${task.id}: ${task.summary}`);
-    console.log(`[executor] claude ${args.join(' ')}`);
-
     const proc = spawn('claude', args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       env: { ...process.env },
@@ -51,23 +49,22 @@ export function executeTask(task) {
     proc.stdout.on('data', (data) => { stdout += data.toString(); });
     proc.stderr.on('data', (data) => { stderr += data.toString(); });
 
-    proc.on('close', (code) => {
+    proc.on('close', async (code) => {
       running--;
 
       if (code === 0) {
-        const result = stdout.trim().slice(0, 50000); // Cap result size
-        updateStatus(task.id, 'done', result);
+        const result = stdout.trim().slice(0, 50000);
+        await updateStatus(task.id, 'done', result);
         console.log(`[executor] Task ${task.id} completed successfully`);
 
-        // Handle recurring tasks
         if (task.recurrence) {
           try {
-            if (checkMaxRuns(task.id)) {
+            if (await checkMaxRuns(task.id)) {
               console.log(`[executor] Task ${task.id} reached max runs, marking done`);
             } else {
               const interval = cronParser.parseExpression(task.recurrence);
               const nextRun = interval.next().toISOString();
-              advanceRecurring(task.id, nextRun);
+              await advanceRecurring(task.id, nextRun);
               console.log(`[executor] Task ${task.id} next run: ${nextRun}`);
             }
           } catch (err) {
@@ -75,23 +72,22 @@ export function executeTask(task) {
           }
         }
 
-        // Notify on completion (for high priority tasks)
         if (task.priority === 'high') {
-          notify({ ...task, summary: `✅ Done: ${task.summary}` }, 'sound');
+          notify({ ...task, summary: `Done: ${task.summary}` }, 'sound');
         }
       } else {
         const error = stderr.trim().slice(0, 10000) || `Exit code ${code}`;
-        updateStatus(task.id, 'failed', error);
+        await updateStatus(task.id, 'failed', error);
         console.error(`[executor] Task ${task.id} failed:`, error.slice(0, 200));
-        notify({ ...task, summary: `❌ Failed: ${task.summary}` }, 'sound');
+        notify({ ...task, summary: `Failed: ${task.summary}` }, 'sound');
       }
 
       resolve();
     });
 
-    proc.on('error', (err) => {
+    proc.on('error', async (err) => {
       running--;
-      updateStatus(task.id, 'failed', err.message);
+      await updateStatus(task.id, 'failed', err.message);
       console.error(`[executor] Task ${task.id} spawn error:`, err.message);
       resolve();
     });

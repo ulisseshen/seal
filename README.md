@@ -156,31 +156,60 @@ SEAL Runner (polling every 30s):
   Notification sent (if high priority)
 ```
 
+## Communication channels
+
+Send tasks to SEAL from your phone when away from the computer:
+
+| Channel | How it works | Setup |
+|---------|-------------|-------|
+| **WhatsApp** | Baileys (WhatsApp Web) — send messages to yourself | Scan QR code on first run |
+| **Email** | Cloudflare Email Worker → SEAL webhook | Deploy worker + tunnel |
+| **Voice notes** | Auto-transcribed via whisper-cli | Installed with SEAL |
+| **Claude Code** | `/seal` skill | Already works |
+
+See [docs/communication-channels.md](docs/communication-channels.md) for setup details.
+
+## Multi-computer support
+
+Local SQLite by default. Add two env vars to switch to [Turso](https://turso.tech) (hosted SQLite) and sync across machines:
+
+```bash
+export SEAL_DB_URL=libsql://seal-yourname.turso.io
+export SEAL_DB_TOKEN=your-token
+```
+
+See [docs/multi-computer.md](docs/multi-computer.md) for full setup.
+
 ## Architecture
 
 ```
 ~/projects/seal/
 ├── src/
-│   ├── runner.js       # Main polling loop (tasks + reminders + supernova)
-│   ├── executor.js     # Spawns claude -p with meta-prompts, parallel execution
-│   ├── db.js           # SQLite schema, queries, task management
-│   └── notify.js       # 5-level notification system (silent → supernova)
+│   ├── runner.js        # Main loop (tasks + reminders + supernova + ingestion)
+│   ├── executor.js      # Spawns claude -p with meta-prompts, parallel execution
+│   ├── db.js            # SQLite/Turso dual-mode database (local or cloud)
+│   ├── notify.js        # 5-level notification system (silent → supernova)
+│   ├── whatsapp.js      # Baileys WhatsApp channel (QR auth, voice notes)
+│   ├── ingest-server.js # HTTP server for email webhook (POST /email)
+│   ├── transcribe.js    # whisper-cli wrapper for audio transcription
+│   └── config.js        # Ingestion config (~/.config/seal/ingest.json)
+├── cloudflare-email-worker/
+│   ├── worker.js        # Cloudflare Worker for email routing
+│   └── wrangler.toml    # Wrangler deployment config
 ├── skill/
-│   └── SKILL.md        # Claude Code / Codex / Antigravity skill
+│   └── SKILL.md         # Claude Code / Codex / Antigravity skill
 ├── skills/
 │   └── cursor/
-│       └── seal.mdc    # Cursor rule
-├── install.sh          # One-line installer (auto-detects runtimes)
+│       └── seal.mdc     # Cursor rule
+├── install.sh           # One-line installer (auto-detects runtimes)
 └── package.json
 
 ~/.config/seal/
-└── tasks.db            # SQLite database (auto-created on first run)
-
-# Skills installed per runtime (by install.sh):
-~/.claude/skills/seal/SKILL.md                    # Claude Code
-~/.agents/skills/seal/SKILL.md                    # Codex
-~/.gemini/antigravity/skills/seal/SKILL.md        # Antigravity
-~/.cursor/rules/seal.mdc                          # Cursor
+├── tasks.db             # SQLite database (local mode)
+├── ingest.json          # Ingestion config (email, whatsapp, transcription)
+├── whatsapp-auth/       # Baileys credentials (persisted after QR scan)
+└── models/
+    └── ggml-small.bin   # Whisper model for audio transcription (466MB)
 ```
 
 ## Supported runtimes
@@ -201,6 +230,8 @@ The install script auto-detects which runtimes you have and installs the skill f
 - **Claude Max plan** recommended for parallel execution (4 concurrent sessions)
 - **macOS** for full notification support (Linux: notifications degrade to terminal bell)
 - **sqlite3** CLI for the `/seal` skill to read/write the task database
+- **ffmpeg** (for voice note transcription — `brew install ffmpeg`)
+- **whisper-cli** (auto-installed via `brew install whisper-cpp`)
 
 ### For persistent reminders (supernova)
 
