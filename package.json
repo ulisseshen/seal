@@ -1,0 +1,15 @@
+{
+  "name": "seal",
+  "version": "0.1.0",
+  "description": "SEAL — Autonomous Tech Lead task runner. Discipline. Execution. No excuses.",
+  "type": "module",
+  "scripts": {
+    "start": "node src/runner.js",
+    "dev": "node --watch src/runner.js",
+    "web": "node src/web.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^12.0.0",
+    "cron-parser": "^5.0.0"
+  }
+}
