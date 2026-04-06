@@ -12,6 +12,7 @@ import { loadConfig, saveDefaultConfig } from './config.js';
 import { startIngestServer } from './ingest-server.js';
 import { pollGmail } from './ingest-gmail.js';
 import { startWhatsApp } from './whatsapp.js';
+import { startTelegram } from './telegram.js';
 
 const POLL_INTERVAL = 30_000;       // Check tasks every 30 seconds
 const SUPERNOVA_INTERVAL = 60_000;  // Check supernova re-fires every 60 seconds
@@ -23,6 +24,7 @@ const config = loadConfig();
 const emailEnabled = config.email.enabled;
 const emailMode = config.email.mode || 'gmail';
 const whatsappEnabled = config.whatsapp.enabled;
+const telegramEnabled = config.telegram?.enabled;
 
 function emailLabel() {
   if (!emailEnabled) return 'off';
@@ -37,7 +39,7 @@ console.log(`
 `);
 console.log(`[seal] Polling every ${POLL_INTERVAL / 1000}s`);
 console.log(`[seal] Max concurrent: ${getRunningSlots().max}`);
-console.log(`[seal] Ingestion: email=${emailLabel()} whatsapp=${whatsappEnabled ? 'baileys' : 'off'}`);
+console.log(`[seal] Ingestion: email=${emailLabel()} whatsapp=${whatsappEnabled ? 'baileys' : 'off'} telegram=${telegramEnabled ? 'bot' : 'off'}`);
 console.log(`[seal] Standing by...`);
 
 async function pollTasks() {
@@ -105,6 +107,12 @@ if (whatsappEnabled) {
   startWhatsApp(config).catch((err) => {
     console.error('[seal] WhatsApp failed to start:', err.message);
   });
+}
+
+// ─── Telegram ingestion ─────────────────────────────────
+
+if (telegramEnabled) {
+  startTelegram(config);
 }
 
 // ─── Main loops ─────────────────────────────────────────

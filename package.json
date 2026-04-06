@@ -15,6 +15,7 @@
     "cron-parser": "^5.0.0",
     "imapflow": "^1.2.18",
     "mailparser": "^3.9.6",
+    "node-telegram-bot-api": "^0.67.0",
     "qrcode-terminal": "^0.12.0"
   }
 }

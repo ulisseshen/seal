@@ -18,6 +18,11 @@ const DEFAULTS = {
   whatsapp: {
     enabled: false,  // Baileys — scan QR code on first run
   },
+  telegram: {
+    enabled: false,
+    token: '',             // From @BotFather
+    allowedUsers: [],      // Telegram user IDs or @usernames (empty = allow all)
+  },
   server: {
     port: 3456,  // Ingest server port (email webhook)
   },
