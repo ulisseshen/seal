@@ -2,6 +2,7 @@ import TelegramBot from 'node-telegram-bot-api';
 import { insertTask } from './db.js';
 import { transcribeBuffer } from './transcribe.js';
 import { detectProject, getKnownProjects } from './projects.js';
+import { resolveSecret } from './config.js';
 import crypto from 'crypto';
 import path from 'path';
 import os from 'os';
@@ -27,10 +28,13 @@ const pendingProject = new Map();
 export function startTelegram(config) {
   if (!config.telegram?.enabled) return null;
 
-  const { token, allowedUsers } = config.telegram;
+  const { token: configToken, allowedUsers } = config.telegram;
+
+  // Resolve token: config → env var → .secrets file
+  const token = resolveSecret(configToken, 'SEAL_TELEGRAM_TOKEN', 'telegram_token');
 
   if (!token) {
-    console.log('[telegram] Missing token. Get one from @BotFather.');
+    console.log('[telegram] Missing token. Set via config, SEAL_TELEGRAM_TOKEN env var, or .secrets file.');
     return null;
   }
 
