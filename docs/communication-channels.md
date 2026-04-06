@@ -1,6 +1,6 @@
 # Communication Channels
 
-SEAL can receive tasks from your phone when you're away from the computer. Three channels are supported: WhatsApp, Email, and Voice Notes.
+SEAL can receive tasks from your phone when you're away from the computer. Four channels are supported: Telegram, WhatsApp, Email, and Voice Notes.
 
 ## Quick Start
 
@@ -10,16 +10,61 @@ nano ~/.config/seal/ingest.json
 
 # 2. Enable the channels you want
 {
+  "telegram": { "enabled": true },
   "email":    { "enabled": true },
   "whatsapp": { "enabled": true }
 }
 
-# 3. Start SEAL
-seal-run
+# 3. Set secrets (tokens, passwords)
+# Option A: env vars
+export SEAL_TELEGRAM_TOKEN="123456:ABC-DEF..."
+export SEAL_GMAIL_PASS="xxxx xxxx xxxx xxxx"
 
-# 4. For WhatsApp: scan the QR code that appears
-# 5. For Email: deploy the Cloudflare Worker (see below)
+# Option B: secrets file (~/.config/seal/.secrets)
+echo '{"telegram_token":"123456:ABC-DEF...","gmail_app_password":"xxxx xxxx xxxx xxxx"}' > ~/.config/seal/.secrets
+chmod 600 ~/.config/seal/.secrets
+
+# 4. Start SEAL
+seal-run
 ```
+
+## Telegram (easiest)
+
+No phone number, no SIM, no tunnel. Just a bot token from @BotFather.
+
+### Setup
+
+1. Open Telegram, message **@BotFather**
+2. Send `/newbot`
+3. Name: **SEAL by Hens** (or your preferred name)
+4. Username: `seal_hens_bot` (must be unique and end with `_bot`)
+5. Copy the token
+6. Set it: `export SEAL_TELEGRAM_TOKEN="your-token"` or add to `.secrets`
+7. Set `telegram.enabled: true` in `~/.config/seal/ingest.json`
+8. Run `seal-run`
+
+### How to use
+
+Message the bot directly. Same as all channels:
+- Text → first line = summary
+- Voice note → transcribed via whisper → task
+- Project detection: `valenty: run tests` or `run tests on seal`
+- No project + multiple projects → bot asks "Which project?"
+
+### Security
+
+Set `telegram.allowedUsers` in config to restrict who can send tasks:
+
+```json
+{
+  "telegram": {
+    "enabled": true,
+    "allowedUsers": ["123456789", "@ulisseshen"]
+  }
+}
+```
+
+Empty array = allow all (only use for personal bots).
 
 ## WhatsApp (Baileys)
 
@@ -63,66 +108,56 @@ Baileys auto-reconnects on network drops. If you log out from WhatsApp (phone �
 - Only processes messages **from you** (self-chat) — ignores group messages and messages from others
 - Voice notes require `ffmpeg` and `whisper-cli` installed
 
-## Email (Cloudflare Worker)
+## Email
 
-Emails sent to your SEAL address are received by a Cloudflare Email Worker, which POSTs them to SEAL's webhook server.
+Two modes: **Gmail IMAP** (simplest, no infra) or **Cloudflare Worker** (real-time webhook).
 
-### Architecture
+### Mode A: Gmail IMAP (recommended)
+
+Polls your Gmail Sent folder for emails to your SEAL address. Zero infra needed.
 
 ```
-ulisseshen@gmail.com → seal@hens.com.br
+ulisseshen@gmail.com → sends to seal@hens.com.br
                             ↓
-                    Cloudflare Email Worker
-                            ↓ POST /email
-                    SEAL ingest server (:3456)
+                    SEAL polls Gmail Sent folder (every 5 min)
+                            ↓
+                    Finds emails TO seal@hens.com.br
                             ↓
                     Task in SQLite/Turso
 ```
 
-### Setup
+#### Setup
 
-#### 1. Deploy the Cloudflare Worker
+1. Create a Gmail App Password: https://myaccount.google.com/apppasswords
+2. Store it: `echo '{"gmail_app_password":"xxxx xxxx xxxx xxxx"}' > ~/.config/seal/.secrets && chmod 600 ~/.config/seal/.secrets`
+3. Edit `~/.config/seal/ingest.json`:
+
+```json
+{
+  "email": {
+    "enabled": true,
+    "mode": "gmail",
+    "user": "ulisseshen@gmail.com",
+    "appPassword": "secret:gmail_app_password",
+    "sealAddress": "seal@hens.com.br"
+  }
+}
+```
+
+4. Run `seal-run`
+
+### Mode B: Cloudflare Worker (real-time)
+
+For real-time ingestion without polling. Requires a Cloudflare Worker + tunnel.
 
 ```bash
 cd ~/projects/seal/cloudflare-email-worker
-
-# Edit wrangler.toml — set your tunnel URL
-# SEAL_WEBHOOK_URL = "https://your-tunnel.trycloudflare.com/email"
-
 npx wrangler deploy
 ```
 
-#### 2. Configure Cloudflare Email Routing
-
-1. Go to Cloudflare Dashboard → your domain → Email Routing
-2. Add a route: `seal@yourdomain.com` → Send to Worker → `seal-email-worker`
-
-#### 3. Set up a tunnel
-
-SEAL runs locally on port 3456. The Cloudflare Worker needs to reach it:
-
-**Option A: Cloudflare Tunnel (persistent, recommended)**
-```bash
-# Install cloudflared
-brew install cloudflare/cloudflare/cloudflared
-
-# Create a tunnel
-cloudflared tunnel create seal
-cloudflared tunnel route dns seal seal-ingest.yourdomain.com
-
-# Run it
-cloudflared tunnel run --url http://localhost:3456 seal
-```
-
-**Option B: ngrok (quick testing)**
-```bash
-ngrok http 3456
-# Copy the https URL → update wrangler.toml → redeploy
-```
-
-#### 4. Enable in config
-
-Set `email.enabled: true` in `~/.config/seal/ingest.json`
+Configure Cloudflare Email Routing: `seal@yourdomain.com` → Send to Worker.
+Set `email.mode: "webhook"` and `email.enabled: true` in config.
+Requires a tunnel (Cloudflare Tunnel or ngrok) to expose port 3456.
 
 ### Email format
 

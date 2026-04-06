@@ -162,10 +162,13 @@ Send tasks to SEAL from your phone when away from the computer:
 
 | Channel | How it works | Setup |
 |---------|-------------|-------|
+| **Telegram** | Bot via @BotFather — message your bot | Token in env var or .secrets |
 | **WhatsApp** | Baileys (WhatsApp Web) — send messages to yourself | Scan QR code on first run |
-| **Email** | Cloudflare Email Worker → SEAL webhook | Deploy worker + tunnel |
+| **Email** | Gmail IMAP polling (or Cloudflare Worker) | Gmail App Password |
 | **Voice notes** | Auto-transcribed via whisper-cli | Installed with SEAL |
 | **Claude Code** | `/seal` skill | Already works |
+
+All channels support project-aware routing. Mention a project name ("valenty: run tests") and SEAL routes automatically. No project? SEAL asks you which one.
 
 See [docs/communication-channels.md](docs/communication-channels.md) for setup details.
 
@@ -190,7 +193,10 @@ See [docs/multi-computer.md](docs/multi-computer.md) for full setup.
 │   ├── db.js            # SQLite/Turso dual-mode database (local or cloud)
 │   ├── notify.js        # 5-level notification system (silent → supernova)
 │   ├── whatsapp.js      # Baileys WhatsApp channel (QR auth, voice notes)
+│   ├── telegram.js      # Telegram bot channel (@BotFather token)
+│   ├── ingest-gmail.js  # Gmail IMAP polling for email ingestion
 │   ├── ingest-server.js # HTTP server for email webhook (POST /email)
+│   ├── projects.js      # Project detection and routing
 │   ├── transcribe.js    # whisper-cli wrapper for audio transcription
 │   └── config.js        # Ingestion config (~/.config/seal/ingest.json)
 ├── cloudflare-email-worker/
@@ -201,12 +207,15 @@ See [docs/multi-computer.md](docs/multi-computer.md) for full setup.
 ├── skills/
 │   └── cursor/
 │       └── seal.mdc     # Cursor rule
+├── site/
+│   └── index.html       # Landing page for seal.hens.com.br
 ├── install.sh           # One-line installer (auto-detects runtimes)
 └── package.json
 
 ~/.config/seal/
 ├── tasks.db             # SQLite database (local mode)
-├── ingest.json          # Ingestion config (email, whatsapp, transcription)
+├── ingest.json          # Ingestion config (email, whatsapp, telegram, transcription)
+├── .secrets             # Secrets file (chmod 600) — Gmail password, Telegram token
 ├── whatsapp-auth/       # Baileys credentials (persisted after QR scan)
 └── models/
     └── ggml-small.bin   # Whisper model for audio transcription (466MB)
