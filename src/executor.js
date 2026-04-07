@@ -14,8 +14,12 @@ export async function executeTask(task) {
   running++;
   await updateStatus(task.id, 'running');
 
+  // Phone channels (Telegram, Discord, WhatsApp) save prompt=null.
+  // Fallback: use summary + detail so claude -p has something to work with.
+  const prompt = task.prompt || [task.summary, task.detail].filter(Boolean).join('\n');
+
   const args = [
-    '-p', task.prompt,
+    '-p', prompt,
     '--permission-mode', task.permission_mode || 'auto',
     '--output-format', 'text',
   ];

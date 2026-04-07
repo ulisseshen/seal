@@ -165,6 +165,7 @@ Send tasks to SEAL from your phone when away from the computer:
 | **Telegram** | Bot via @BotFather — message your bot | Token in env var or .secrets |
 | **WhatsApp** | Baileys (WhatsApp Web) — send messages to yourself | Scan QR code on first run |
 | **Email** | Gmail IMAP polling (or Cloudflare Worker) | Gmail App Password |
+| **Discord** | Bot via Developer Portal — DM your bot | Token in env var or .secrets |
 | **Voice notes** | Auto-transcribed via whisper-cli | Installed with SEAL |
 | **Claude Code** | `/seal` skill | Already works |
 
@@ -194,6 +195,7 @@ See [docs/multi-computer.md](docs/multi-computer.md) for full setup.
 │   ├── notify.js        # 5-level notification system (silent → supernova)
 │   ├── whatsapp.js      # Baileys WhatsApp channel (QR auth, voice notes)
 │   ├── telegram.js      # Telegram bot channel (@BotFather token)
+│   ├── discord.js       # Discord bot channel (Developer Portal token)
 │   ├── ingest-gmail.js  # Gmail IMAP polling for email ingestion
 │   ├── ingest-server.js # HTTP server for email webhook (POST /email)
 │   ├── projects.js      # Project detection and routing

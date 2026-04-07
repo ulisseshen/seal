@@ -13,6 +13,8 @@ import { startIngestServer } from './ingest-server.js';
 import { pollGmail } from './ingest-gmail.js';
 import { startWhatsApp } from './whatsapp.js';
 import { startTelegram } from './telegram.js';
+import { startDiscord } from './discord.js';
+import { startWeb } from './web.js';
 
 const POLL_INTERVAL = 30_000;       // Check tasks every 30 seconds
 const SUPERNOVA_INTERVAL = 60_000;  // Check supernova re-fires every 60 seconds
@@ -25,6 +27,7 @@ const emailEnabled = config.email.enabled;
 const emailMode = config.email.mode || 'gmail';
 const whatsappEnabled = config.whatsapp.enabled;
 const telegramEnabled = config.telegram?.enabled;
+const discordEnabled = config.discord?.enabled;
 
 function emailLabel() {
   if (!emailEnabled) return 'off';
@@ -39,7 +42,8 @@ console.log(`
 `);
 console.log(`[seal] Polling every ${POLL_INTERVAL / 1000}s`);
 console.log(`[seal] Max concurrent: ${getRunningSlots().max}`);
-console.log(`[seal] Ingestion: email=${emailLabel()} whatsapp=${whatsappEnabled ? 'baileys' : 'off'} telegram=${telegramEnabled ? 'bot' : 'off'}`);
+console.log(`[seal] Ingestion: email=${emailLabel()} whatsapp=${whatsappEnabled ? 'baileys' : 'off'} telegram=${telegramEnabled ? 'bot' : 'off'} discord=${discordEnabled ? 'bot' : 'off'}`);
+console.log(`[seal] Dashboard: http://localhost:${process.env.SEAL_WEB_PORT || 3457}`);
 console.log(`[seal] Standing by...`);
 
 async function pollTasks() {
@@ -114,6 +118,16 @@ if (whatsappEnabled) {
 if (telegramEnabled) {
   startTelegram(config);
 }
+
+// ─── Discord ingestion ──────────────────────────────────
+
+if (discordEnabled) {
+  startDiscord(config);
+}
+
+// ─── Web dashboard ─────────────────────────────────────
+
+startWeb();
 
 // ─── Main loops ─────────────────────────────────────────
 

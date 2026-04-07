@@ -23,6 +23,12 @@ const DEFAULTS = {
     token: '',             // From @BotFather
     allowedUsers: [],      // Telegram user IDs or @usernames (empty = allow all)
   },
+  discord: {
+    enabled: false,
+    token: '',             // From Discord Developer Portal → Bot → Token
+    allowedUsers: [],      // Discord user IDs or usernames (empty = allow all)
+    dmOnly: true,          // Only accept DMs (ignore server messages)
+  },
   server: {
     port: 3456,  // Ingest server port (email webhook)
   },

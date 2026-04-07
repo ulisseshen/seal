@@ -1,6 +1,6 @@
 # Communication Channels
 
-SEAL can receive tasks from your phone when you're away from the computer. Four channels are supported: Telegram, WhatsApp, Email, and Voice Notes.
+SEAL can receive tasks from your phone when you're away from the computer. Five channels are supported: Telegram, Discord, WhatsApp, Email, and Voice Notes.
 
 ## Quick Start
 
@@ -11,6 +11,7 @@ nano ~/.config/seal/ingest.json
 # 2. Enable the channels you want
 {
   "telegram": { "enabled": true },
+  "discord":  { "enabled": true },
   "email":    { "enabled": true },
   "whatsapp": { "enabled": true }
 }
@@ -18,10 +19,11 @@ nano ~/.config/seal/ingest.json
 # 3. Set secrets (tokens, passwords)
 # Option A: env vars
 export SEAL_TELEGRAM_TOKEN="123456:ABC-DEF..."
+export SEAL_DISCORD_TOKEN="MTIz...your-discord-token"
 export SEAL_GMAIL_PASS="xxxx xxxx xxxx xxxx"
 
 # Option B: secrets file (~/.config/seal/.secrets)
-echo '{"telegram_token":"123456:ABC-DEF...","gmail_app_password":"xxxx xxxx xxxx xxxx"}' > ~/.config/seal/.secrets
+echo '{"telegram_token":"123456:ABC-DEF...","discord_token":"MTIz...","gmail_app_password":"xxxx xxxx xxxx xxxx"}' > ~/.config/seal/.secrets
 chmod 600 ~/.config/seal/.secrets
 
 # 4. Start SEAL
@@ -65,6 +67,56 @@ Set `telegram.allowedUsers` in config to restrict who can send tasks:
 ```
 
 Empty array = allow all (only use for personal bots).
+
+## Discord
+
+No phone number needed. Works on desktop and mobile. Many developers already use it.
+
+### Setup
+
+1. Go to [Discord Developer Portal](https://discord.com/developers/applications) → **New Application**
+2. Go to **Bot** tab → click **Reset Token** → copy the token
+3. Under **Privileged Gateway Intents**, enable **Message Content Intent**
+4. Go to **OAuth2** → **URL Generator**:
+   - Scopes: `bot`
+   - Bot Permissions: `Send Messages`, `Read Message History`
+5. Copy the generated URL → open it to invite the bot to a server you're in
+6. Set token: `export SEAL_DISCORD_TOKEN="your-token"` or add `"discord_token"` to `.secrets`
+7. Set `discord.enabled: true` in `~/.config/seal/ingest.json`
+8. Run `seal-run`
+
+### How to use
+
+DM the bot directly. Same as all channels:
+- Text → first line = summary
+- Voice message (audio attachment) → transcribed via whisper → task
+- Project detection: `valenty: run tests` or `run tests on seal`
+- No project + multiple projects → bot asks "Which project?"
+
+### Security
+
+Set `discord.allowedUsers` in config to restrict who can send tasks:
+
+```json
+{
+  "discord": {
+    "enabled": true,
+    "allowedUsers": ["123456789012345678", "yourusername"]
+  }
+}
+```
+
+Empty array = allow all (only use for personal bots).
+
+### DM-only mode
+
+By default, `dmOnly: true` — the bot only responds to direct messages. Set `dmOnly: false` to also accept messages in server channels (not recommended unless you restrict `allowedUsers`).
+
+### Important notes
+
+- The bot **must share a server** with you to receive DMs (Discord requirement)
+- **Message Content Intent** must be enabled in the Developer Portal or the bot receives empty messages
+- The bot ignores its own messages to prevent self-reply loops
 
 ## WhatsApp (Baileys)
 
