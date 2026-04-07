@@ -78,6 +78,7 @@ await db.exec(`
     permission_mode TEXT DEFAULT 'auto',
     notify_type TEXT DEFAULT 'sound' CHECK(notify_type IN ('silent','sound','sticky','nuclear','supernova')),
     notify_channel TEXT DEFAULT 'system',
+    notify_target TEXT,
     last_notified_at TEXT,
     people TEXT DEFAULT '[]',
     priority TEXT DEFAULT 'medium' CHECK(priority IN ('high','medium','low')),
@@ -93,17 +94,25 @@ await db.exec(`
   CREATE INDEX IF NOT EXISTS idx_tasks_next_run ON tasks(next_run);
 `);
 
+// Migration: add notify_target column to existing databases (SQLite doesn't support
+// IF NOT EXISTS for ADD COLUMN, so swallow the "duplicate column" error)
+try {
+  await db.exec(`ALTER TABLE tasks ADD COLUMN notify_target TEXT`);
+} catch (err) {
+  // Column already exists — that's fine
+}
+
 // ─── Public API (all async) ─────────────────────────────
 
 export async function insertTask(task) {
   return db.run(`
     INSERT INTO tasks (id, type, summary, detail, execute_at, recurrence, next_run,
-      prompt, project, allowed_tools, permission_mode, notify_type, notify_channel,
+      prompt, project, allowed_tools, permission_mode, notify_type, notify_channel, notify_target,
       people, priority, status, created, max_runs)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `, [task.id, task.type, task.summary, task.detail, task.execute_at, task.recurrence,
       task.next_run, task.prompt, task.project, task.allowed_tools, task.permission_mode,
-      task.notify_type, task.notify_channel, task.people, task.priority, task.status,
+      task.notify_type, task.notify_channel, task.notify_target || null, task.people, task.priority, task.status,
       task.created, task.max_runs]);
 }
 

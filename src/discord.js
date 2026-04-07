@@ -171,6 +171,7 @@ async function handleText(text, channelId, msg, config) {
     permission_mode: 'auto',
     notify_type: 'sound',
     notify_channel: 'discord',
+    notify_target: channelId,
     people: '[]',
     priority: 'medium',
     status: 'pending',
@@ -218,4 +219,21 @@ async function handleText(text, channelId, msg, config) {
 
 export function isDiscordConnected() {
   return client !== null && client.isReady();
+}
+
+/**
+ * Send a message to a Discord channel from outside this module (used by executor lifecycle).
+ * Returns true on success, false if not connected or send failed.
+ */
+export async function sendDiscordMessage(channelId, text) {
+  if (!client || !client.isReady() || !channelId) return false;
+  try {
+    const channel = await client.channels.fetch(channelId);
+    if (!channel) return false;
+    await channel.send(text);
+    return true;
+  } catch (err) {
+    console.error('[discord] sendMessage failed:', err.message);
+    return false;
+  }
 }

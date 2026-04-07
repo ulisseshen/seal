@@ -151,6 +151,7 @@ async function handleText(text, chatId, config) {
     permission_mode: 'auto',
     notify_type: 'sound',
     notify_channel: 'telegram',
+    notify_target: String(chatId),
     people: '[]',
     priority: 'medium',
     status: 'pending',
@@ -198,4 +199,19 @@ async function handleText(text, chatId, config) {
 
 export function isTelegramConnected() {
   return bot !== null;
+}
+
+/**
+ * Send a message to a Telegram chat from outside this module (used by executor lifecycle).
+ * Returns true on success, false if not connected or send failed.
+ */
+export async function sendTelegramMessage(chatId, text) {
+  if (!bot || !chatId) return false;
+  try {
+    await bot.sendMessage(chatId, text);
+    return true;
+  } catch (err) {
+    console.error('[telegram] sendMessage failed:', err.message);
+    return false;
+  }
 }

@@ -1,6 +1,6 @@
 import { spawn } from 'child_process';
 import { updateStatus, advanceRecurring, checkMaxRuns } from './db.js';
-import { notify } from './notify.js';
+import { notifyTaskLifecycle } from './channel-notify.js';
 import cronParser from 'cron-parser';
 
 const MAX_CONCURRENT = 4; // Leave 1 slot for your interactive session
@@ -40,6 +40,9 @@ export async function executeTask(task) {
   console.log(`[executor] Running task ${task.id}: ${task.summary}`);
   console.log(`[executor] claude ${args.join(' ')}`);
 
+  // Notify the user that we're starting (on the same channel they used + system)
+  await notifyTaskLifecycle(task, 'start');
+
   return new Promise((resolve) => {
     const proc = spawn('claude', args, {
       stdio: ['pipe', 'pipe', 'pipe'],
@@ -76,14 +79,14 @@ export async function executeTask(task) {
           }
         }
 
-        if (task.priority === 'high') {
-          notify({ ...task, summary: `Done: ${task.summary}` }, 'sound');
-        }
+        // Notify all channels: include result preview (first 800 chars)
+        const preview = result ? `\n\n${result.slice(0, 800)}${result.length > 800 ? '\n[...truncated]' : ''}` : '';
+        await notifyTaskLifecycle(task, 'done', `Done: ${task.summary}${preview}`);
       } else {
         const error = stderr.trim().slice(0, 10000) || `Exit code ${code}`;
         await updateStatus(task.id, 'failed', error);
         console.error(`[executor] Task ${task.id} failed:`, error.slice(0, 200));
-        notify({ ...task, summary: `Failed: ${task.summary}` }, 'sound');
+        await notifyTaskLifecycle(task, 'failed', `Failed: ${task.summary}\n\n${error.slice(0, 800)}`);
       }
 
       resolve();
@@ -93,6 +96,7 @@ export async function executeTask(task) {
       running--;
       await updateStatus(task.id, 'failed', err.message);
       console.error(`[executor] Task ${task.id} spawn error:`, err.message);
+      await notifyTaskLifecycle(task, 'failed', `Failed: ${task.summary}\n\nSpawn error: ${err.message}`);
       resolve();
     });
   });

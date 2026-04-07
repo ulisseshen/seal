@@ -182,6 +182,7 @@ async function processMessage(msg, config) {
     permission_mode: 'auto',
     notify_type: 'sound',
     notify_channel: 'whatsapp',
+    notify_target: jid,
     people: '[]',
     priority: 'medium',
     status: 'pending',
@@ -236,4 +237,19 @@ async function processMessage(msg, config) {
 
 export function isWhatsAppConnected() {
   return connected;
+}
+
+/**
+ * Send a message to a WhatsApp JID from outside this module (used by executor lifecycle).
+ * Returns true on success, false if not connected or send failed.
+ */
+export async function sendWhatsAppMessage(jid, text) {
+  if (!sock || !connected || !jid) return false;
+  try {
+    await sock.sendMessage(jid, { text });
+    return true;
+  } catch (err) {
+    console.error('[whatsapp] sendMessage failed:', err.message);
+    return false;
+  }
 }
