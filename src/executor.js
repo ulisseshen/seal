@@ -1,7 +1,7 @@
 import { spawn } from 'child_process';
 import { updateStatus, advanceRecurring, checkMaxRuns } from './db.js';
 import { notifyTaskLifecycle } from './channel-notify.js';
-import cronParser from 'cron-parser';
+import { CronExpressionParser } from 'cron-parser';
 
 const MAX_CONCURRENT = 4; // Leave 1 slot for your interactive session
 let running = 0;
@@ -45,7 +45,9 @@ export async function executeTask(task) {
 
   return new Promise((resolve) => {
     const proc = spawn('claude', args, {
-      stdio: ['pipe', 'pipe', 'pipe'],
+      // stdin must be 'ignore' — claude -p blocks waiting for stdin otherwise,
+      // causing the 'no stdin data received in 3s' warning and truncated runs.
+      stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env },
       timeout: 1800000, // 30 min max per task
     });
@@ -69,7 +71,7 @@ export async function executeTask(task) {
             if (await checkMaxRuns(task.id)) {
               console.log(`[executor] Task ${task.id} reached max runs, marking done`);
             } else {
-              const interval = cronParser.parseExpression(task.recurrence);
+              const interval = CronExpressionParser.parse(task.recurrence);
               const nextRun = interval.next().toISOString();
               await advanceRecurring(task.id, nextRun);
               console.log(`[executor] Task ${task.id} next run: ${nextRun}`);
@@ -86,6 +88,25 @@ export async function executeTask(task) {
         const error = stderr.trim().slice(0, 10000) || `Exit code ${code}`;
         await updateStatus(task.id, 'failed', error);
         console.error(`[executor] Task ${task.id} failed:`, error.slice(0, 200));
+
+        // A recurring task that fails once should NOT be terminal — advance to
+        // the next scheduled run so tomorrow has a chance. If it keeps failing,
+        // max_runs (when set) will eventually cap it.
+        if (task.recurrence) {
+          try {
+            if (await checkMaxRuns(task.id)) {
+              console.log(`[executor] Task ${task.id} reached max runs after failure, leaving as failed`);
+            } else {
+              const interval = CronExpressionParser.parse(task.recurrence);
+              const nextRun = interval.next().toISOString();
+              await advanceRecurring(task.id, nextRun);
+              console.log(`[executor] Task ${task.id} failed but re-queued for: ${nextRun}`);
+            }
+          } catch (err) {
+            console.error(`[executor] Failed to re-queue recurring task ${task.id} after failure:`, err.message);
+          }
+        }
+
         await notifyTaskLifecycle(task, 'failed', `Failed: ${task.summary}\n\n${error.slice(0, 800)}`);
       }
 
@@ -107,6 +128,7 @@ export function getRunningSlots() {
 }
 
 function expandPath(p) {
+  if (!p) return p;
   if (p.startsWith('~/')) return p.replace('~', process.env.HOME);
   return p;
 }

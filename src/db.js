@@ -120,7 +120,7 @@ export async function getPendingTasks(limit = 5) {
   return db.all(`
     SELECT * FROM tasks
     WHERE status = 'pending'
-      AND (execute_at IS NULL OR execute_at <= datetime('now'))
+      AND (execute_at IS NULL OR datetime(execute_at) <= datetime('now'))
       AND type IN ('task', 'ritual')
     ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, execute_at ASC
     LIMIT ?
@@ -129,7 +129,7 @@ export async function getPendingTasks(limit = 5) {
 
 export async function getPendingReminders() {
   return db.all(`
-    SELECT * FROM tasks WHERE status = 'pending' AND type = 'reminder' AND execute_at <= datetime('now')
+    SELECT * FROM tasks WHERE status = 'pending' AND type = 'reminder' AND datetime(execute_at) <= datetime('now')
   `);
 }
 
