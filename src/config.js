@@ -38,6 +38,9 @@ const DEFAULTS = {
     model: path.join(CONFIG_DIR, 'models', 'ggml-small.bin'),
     language: 'pt',
   },
+  sensors: {
+    pr_watcher: false,       // gh pr list → SEAL reminders for review-requested PRs
+  },
 };
 
 export function loadConfig() {

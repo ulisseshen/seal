@@ -5,6 +5,7 @@ import {
   getRunningCount,
   setFiring,
   updateLastNotified,
+  db,
 } from './db.js';
 import { executeTask, getRunningSlots } from './executor.js';
 import { notify } from './notify.js';
@@ -15,6 +16,9 @@ import { startWhatsApp } from './whatsapp.js';
 import { startTelegram } from './telegram.js';
 import { startDiscord } from './discord.js';
 import { startWeb } from './web.js';
+import { ensureDefaultProfiles } from './sandbox.js';
+import { loadPolicy, policyRuleCount } from './policy.js';
+import { runPrWatcher } from './sensors/pr-watcher.js';
 
 const POLL_INTERVAL = 30_000;       // Check tasks every 30 seconds
 const SUPERNOVA_INTERVAL = 60_000;  // Check supernova re-fires every 60 seconds
@@ -44,6 +48,24 @@ console.log(`[seal] Polling every ${POLL_INTERVAL / 1000}s`);
 console.log(`[seal] Max concurrent: ${getRunningSlots().max}`);
 console.log(`[seal] Ingestion: email=${emailLabel()} whatsapp=${whatsappEnabled ? 'baileys' : 'off'} telegram=${telegramEnabled ? 'bot' : 'off'} discord=${discordEnabled ? 'bot' : 'off'}`);
 console.log(`[seal] Dashboard: http://localhost:${process.env.SEAL_WEB_PORT || 3457}`);
+
+// ─── Safety + policy init ──────────────────────────────
+ensureDefaultProfiles();
+const policy = loadPolicy();
+console.log(`[seal] Policy loaded: ${policyRuleCount(policy)} rules (auto_approve=${policy.auto_approve?.length || 0} require_ack=${policy.require_ack?.length || 0} deny=${policy.deny?.length || 0})`);
+
+// One-time migration: OpenEnglish book task should run under shell-allowlisted profile.
+// Guarded to only fire when still on the default 'auto' mode so we don't race with
+// an in-flight execution that was deliberately reconfigured.
+try {
+  await db.run(
+    `UPDATE tasks SET permission_mode='shell-allowlisted' WHERE id='73a08105' AND permission_mode='auto' AND status!='running'`,
+    []
+  );
+} catch (err) {
+  console.warn('[seal] openenglish profile migration skipped:', err.message);
+}
+
 console.log(`[seal] Standing by...`);
 
 async function pollTasks() {
@@ -128,6 +150,23 @@ if (discordEnabled) {
 // ─── Web dashboard ─────────────────────────────────────
 
 startWeb();
+
+// ─── Sensors ────────────────────────────────────────────
+
+if (config.sensors?.pr_watcher === true) {
+  console.log('[seal] pr-watcher sensor enabled (every 15 min)');
+  const PR_WATCHER_INTERVAL = 15 * 60 * 1000;
+  const tickPrWatcher = async () => {
+    try {
+      await runPrWatcher();
+    } catch (err) {
+      console.error('[seal] pr-watcher error:', err.message);
+    }
+  };
+  setInterval(tickPrWatcher, PR_WATCHER_INTERVAL);
+  // First tick shortly after startup so the daemon log shows its status
+  setTimeout(tickPrWatcher, 5_000);
+}
 
 // ─── Main loops ─────────────────────────────────────────
 

@@ -1,7 +1,19 @@
 import { spawn } from 'child_process';
-import { updateStatus, advanceRecurring, checkMaxRuns } from './db.js';
+import {
+  updateStatus,
+  advanceRecurring,
+  checkMaxRuns,
+  insertTaskRun,
+  finishTaskRun,
+  setFiring,
+} from './db.js';
 import { notifyTaskLifecycle } from './channel-notify.js';
+import { notify } from './notify.js';
+import { wrapWithSandbox, profileForPermissionMode } from './sandbox.js';
+import { evaluatePolicy } from './policy.js';
 import { CronExpressionParser } from 'cron-parser';
+import path from 'path';
+import os from 'os';
 
 const MAX_CONCURRENT = 4; // Leave 1 slot for your interactive session
 let running = 0;
@@ -11,6 +23,36 @@ let running = 0;
  * Returns a promise that resolves when claude finishes.
  */
 export async function executeTask(task) {
+  // ─── Policy gate ────────────────────────────────────
+  // This runs BEFORE we mark the task as running so the concurrency
+  // slot isn't consumed by an ack-blocked task.
+  let policyResult;
+  try {
+    policyResult = evaluatePolicy(task);
+  } catch (err) {
+    console.error(`[executor] Policy evaluation failed for ${task.id}:`, err.message);
+    policyResult = { decision: 'allow', reason: 'policy-error, defaulting allow', capabilities: [] };
+  }
+
+  if (policyResult.decision === 'deny') {
+    await updateStatus(task.id, 'failed', `Denied by policy: ${policyResult.reason}`);
+    console.warn(`[executor] Task ${task.id} DENIED: ${policyResult.reason}`);
+    await notifyTaskLifecycle(task, 'failed', `Denied by policy: ${task.summary}\n${policyResult.reason}`);
+    return;
+  }
+
+  if (policyResult.decision === 'ack') {
+    await setFiring(task.id);
+    const capsList = (policyResult.capabilities || []).join(', ') || '(none declared)';
+    const msg = `⚠️ SEAL wants to run: ${task.summary}\nCapabilities: ${capsList}\nApprove with /seal:approve ${task.id} or deny with /seal:deny ${task.id}`;
+    console.warn(`[executor] Task ${task.id} needs ACK: ${policyResult.reason}`);
+    try {
+      notify({ ...task, summary: `ACK needed: ${task.summary}` }, 'supernova');
+    } catch {}
+    await notifyTaskLifecycle(task, 'start', msg);
+    return;
+  }
+
   running++;
   await updateStatus(task.id, 'running');
 
@@ -18,37 +60,66 @@ export async function executeTask(task) {
   // Fallback: use summary + detail so claude -p has something to work with.
   const prompt = task.prompt || [task.summary, task.detail].filter(Boolean).join('\n');
 
-  const args = [
+  const claudeArgs = [
     '-p', prompt,
-    '--permission-mode', task.permission_mode || 'auto',
+    '--permission-mode', task.permission_mode === 'plan' ? 'plan' : 'auto',
     '--output-format', 'text',
   ];
 
   if (task.project) {
-    args.push('--project', expandPath(task.project));
+    claudeArgs.push('--project', expandPath(task.project));
   }
 
   if (task.allowed_tools) {
     try {
       const tools = JSON.parse(task.allowed_tools);
       if (tools.length > 0) {
-        args.push('--allowedTools', tools.join(','));
+        claudeArgs.push('--allowedTools', tools.join(','));
       }
     } catch {}
   }
 
+  // ─── Sandbox wrap ───────────────────────────────────
+  const profileName = profileForPermissionMode(task.permission_mode);
+
+  // SEAL_PROJECT_ROOT is read by sandbox profiles that write under the project
+  const projectRoot = task.project
+    ? expandPath(task.project)
+    : path.join(os.homedir(), 'projects');
+
+  const { command, args, profile } = wrapWithSandbox('claude', claudeArgs, profileName, {
+    SEAL_PROJECT_ROOT: projectRoot,
+    HOME: process.env.HOME || os.homedir(),
+  });
+
   console.log(`[executor] Running task ${task.id}: ${task.summary}`);
-  console.log(`[executor] claude ${args.join(' ')}`);
+  console.log(`[executor] profile=${profileName} (${profile || 'no-sandbox'})`);
+  console.log(`[executor] ${command} ${args.join(' ')}`);
+
+  // Audit log entry
+  let runId = null;
+  try {
+    runId = await insertTaskRun({
+      task_id: task.id,
+      started_at: new Date().toISOString(),
+      profile: profileName,
+      capabilities: task.capabilities || '[]',
+    });
+  } catch (err) {
+    console.error(`[executor] insertTaskRun failed:`, err.message);
+  }
 
   // Notify the user that we're starting (on the same channel they used + system)
   await notifyTaskLifecycle(task, 'start');
 
   return new Promise((resolve) => {
-    const proc = spawn('claude', args, {
-      // stdin must be 'ignore' — claude -p blocks waiting for stdin otherwise,
-      // causing the 'no stdin data received in 3s' warning and truncated runs.
+    const proc = spawn(command, args, {
       stdio: ['ignore', 'pipe', 'pipe'],
-      env: { ...process.env },
+      env: {
+        ...process.env,
+        SEAL_PROJECT_ROOT: projectRoot,
+        HOME: process.env.HOME || os.homedir(),
+      },
       timeout: 1800000, // 30 min max per task
     });
 
@@ -61,6 +132,18 @@ export async function executeTask(task) {
     proc.on('close', async (code) => {
       running--;
 
+      // Finish audit record
+      try {
+        await finishTaskRun(runId, {
+          exit_code: code,
+          finished_at: new Date().toISOString(),
+          stdout_preview: stdout,
+          stderr_preview: stderr,
+        });
+      } catch (err) {
+        console.error(`[executor] finishTaskRun failed:`, err.message);
+      }
+
       if (code === 0) {
         const result = stdout.trim().slice(0, 50000);
         await updateStatus(task.id, 'done', result);
@@ -72,7 +155,7 @@ export async function executeTask(task) {
               console.log(`[executor] Task ${task.id} reached max runs, marking done`);
             } else {
               const interval = CronExpressionParser.parse(task.recurrence);
-              const nextRun = interval.next().toISOString();
+              const nextRun = interval.next().toDate().toISOString();
               await advanceRecurring(task.id, nextRun);
               console.log(`[executor] Task ${task.id} next run: ${nextRun}`);
             }
@@ -89,21 +172,17 @@ export async function executeTask(task) {
         await updateStatus(task.id, 'failed', error);
         console.error(`[executor] Task ${task.id} failed:`, error.slice(0, 200));
 
-        // A recurring task that fails once should NOT be terminal — advance to
-        // the next scheduled run so tomorrow has a chance. If it keeps failing,
-        // max_runs (when set) will eventually cap it.
+        // Re-queue recurring tasks even on failure so they keep their cadence
         if (task.recurrence) {
           try {
-            if (await checkMaxRuns(task.id)) {
-              console.log(`[executor] Task ${task.id} reached max runs after failure, leaving as failed`);
-            } else {
+            if (!(await checkMaxRuns(task.id))) {
               const interval = CronExpressionParser.parse(task.recurrence);
-              const nextRun = interval.next().toISOString();
+              const nextRun = interval.next().toDate().toISOString();
               await advanceRecurring(task.id, nextRun);
-              console.log(`[executor] Task ${task.id} failed but re-queued for: ${nextRun}`);
+              console.log(`[executor] Task ${task.id} re-queued after failure, next run: ${nextRun}`);
             }
           } catch (err) {
-            console.error(`[executor] Failed to re-queue recurring task ${task.id} after failure:`, err.message);
+            console.error(`[executor] Failed to re-queue cron for task ${task.id}:`, err.message);
           }
         }
 
@@ -115,6 +194,14 @@ export async function executeTask(task) {
 
     proc.on('error', async (err) => {
       running--;
+      try {
+        await finishTaskRun(runId, {
+          exit_code: -1,
+          finished_at: new Date().toISOString(),
+          stdout_preview: stdout,
+          stderr_preview: `${stderr}\n${err.message}`,
+        });
+      } catch {}
       await updateStatus(task.id, 'failed', err.message);
       console.error(`[executor] Task ${task.id} spawn error:`, err.message);
       await notifyTaskLifecycle(task, 'failed', `Failed: ${task.summary}\n\nSpawn error: ${err.message}`);

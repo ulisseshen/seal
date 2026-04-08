@@ -102,6 +102,37 @@ try {
   // Column already exists — that's fine
 }
 
+// Migration: capabilities (JSON array of strings, e.g. ["fs:~/projects:write", "shell:*"])
+try {
+  await db.exec(`ALTER TABLE tasks ADD COLUMN capabilities TEXT DEFAULT '[]'`);
+} catch (err) {
+  // Column already exists — that's fine
+}
+
+// Migration: approved_at (set when a human approves an ack-required task)
+try {
+  await db.exec(`ALTER TABLE tasks ADD COLUMN approved_at TEXT`);
+} catch (err) {
+  // Column already exists — that's fine
+}
+
+// Audit trail of individual task runs (one task can run many times if recurring)
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS task_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id TEXT NOT NULL,
+    started_at TEXT NOT NULL,
+    finished_at TEXT,
+    exit_code INTEGER,
+    profile TEXT,
+    capabilities TEXT,
+    stdout_preview TEXT,
+    stderr_preview TEXT,
+    FOREIGN KEY (task_id) REFERENCES tasks(id)
+  );
+  CREATE INDEX IF NOT EXISTS idx_task_runs_task_id ON task_runs(task_id, started_at);
+`);
+
 // ─── Public API (all async) ─────────────────────────────
 
 export async function insertTask(task) {
@@ -197,6 +228,53 @@ export async function listActive() {
 
 export async function getTaskById(id) {
   return db.get(`SELECT * FROM tasks WHERE id = ?`, [id]);
+}
+
+// ─── Task run audit log ─────────────────────────────────
+
+export async function insertTaskRun(row) {
+  const res = await db.run(`
+    INSERT INTO task_runs (task_id, started_at, profile, capabilities)
+    VALUES (?, ?, ?, ?)
+  `, [
+    row.task_id,
+    row.started_at,
+    row.profile || null,
+    row.capabilities || null,
+  ]);
+  // better-sqlite3 returns lastInsertRowid; libsql returns lastInsertRowid too
+  return res?.lastInsertRowid ?? res?.lastInsertRowId ?? null;
+}
+
+export async function finishTaskRun(id, { exit_code, finished_at, stdout_preview, stderr_preview }) {
+  if (id == null) return;
+  return db.run(`
+    UPDATE task_runs
+    SET finished_at = ?, exit_code = ?, stdout_preview = ?, stderr_preview = ?
+    WHERE id = ?
+  `, [
+    finished_at || new Date().toISOString(),
+    exit_code ?? null,
+    (stdout_preview || '').slice(0, 4000),
+    (stderr_preview || '').slice(0, 4000),
+    id,
+  ]);
+}
+
+export async function getRecentRuns(taskId, limit = 10) {
+  return db.all(`
+    SELECT * FROM task_runs WHERE task_id = ?
+    ORDER BY started_at DESC LIMIT ?
+  `, [taskId, limit]);
+}
+
+// ─── Policy approval ────────────────────────────────────
+
+export async function approveTask(id) {
+  return db.run(`
+    UPDATE tasks SET status = 'pending', approved_at = datetime('now')
+    WHERE id = ?
+  `, [id]);
 }
 
 export { db, DB_PATH };
