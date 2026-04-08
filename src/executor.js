@@ -1,4 +1,6 @@
 import { spawn } from 'child_process';
+import { existsSync } from 'fs';
+import { join } from 'path';
 import {
   updateStatus,
   advanceRecurring,
@@ -66,8 +68,22 @@ export async function executeTask(task) {
     '--output-format', 'text',
   ];
 
-  if (task.project) {
-    claudeArgs.push('--project', expandPath(task.project));
+  // task.project resolves to the subprocess cwd (where .mcp.json lives,
+  // where git commands run, where relative paths in the prompt resolve).
+  // NOTE: claude CLI has no `--project` flag — passing it returns
+  // `unknown option '--project'` and fails the spawn.
+  const cwd = task.project ? expandPath(task.project) : undefined;
+
+  // Auto-load project .mcp.json in headless mode.
+  // Uses --strict-mcp-config (same as openclaw/src/agents/cli-runner/bundle-mcp.ts)
+  // so claude loads ONLY from the explicit file, ignoring user-scope/plugin MCPs
+  // that fail silently in the daemon context and end up blocking even the
+  // explicit project config.
+  if (cwd) {
+    const projectMcp = join(cwd, '.mcp.json');
+    if (existsSync(projectMcp)) {
+      claudeArgs.push('--strict-mcp-config', '--mcp-config', projectMcp);
+    }
   }
 
   if (task.allowed_tools) {
@@ -120,6 +136,7 @@ export async function executeTask(task) {
         SEAL_PROJECT_ROOT: projectRoot,
         HOME: process.env.HOME || os.homedir(),
       },
+      cwd,
       timeout: 1800000, // 30 min max per task
     });
 
