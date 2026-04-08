@@ -1,3 +1,6 @@
 node_modules/
 store/
 *.db
+
+# Claude Code local state (agent worktrees, session data)
+.claude/
