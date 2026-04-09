@@ -2,38 +2,116 @@
 
 **Discipline. Execution. No excuses.**
 
-An autonomous task runner for Tech Leads, Engineering Managers, and management teams — built on [Claude Code](https://claude.ai/code).
+Your second brain for tech leadership — an autonomous agent that captures, orchestrates, executes, remembers, and learns.
 
-SEAL helps you manage your daily leadership routine: schedule code reviews, track team deadlines, automate recurring checks, and never miss a critical reminder. Save tasks from any Claude Code session — SEAL structures them, schedules execution via `claude -p`, runs them in parallel, and notifies you with alerts you can't ignore.
+> **You think, SEAL does. You forget, SEAL remembers. You sleep, SEAL works.**
+
+SEAL is not a todo list. It's an autonomous agent built on AI coding CLIs that acts as your operational brain — capturing bugs from team chats, creating tasks in your issue tracker, reviewing PRs autonomously, managing context across sessions, and learning from every interaction.
 
 ```bash
-# In any Claude Code session:
+# Paste a team chat with a bug report:
+/seal "People, a column visibility persistence broke in the order screen..."
+# → Extracts bug details, creates Azure DevOps task, assigns to the right dev
 
-# Team management
-/seal remind me to review João's PR by Friday
-/seal MUST prepare sprint retro notes by Thursday 3pm
+# Automated PR review with re-review loop:
+# SEAL watches PRs, reviews, votes, watches for new commits, re-reviews
+seal-run  # starts the autonomous runner
+
+# Memory — just throw things at it:
+/seal evaluate eCharts vs fl_chart for unified chart visuals
 /seal decision: we chose Riverpod over Bloc for state management
-
-# Automated checks
-/seal run tests on all Flutter projects every morning at 8am
-/seal check CI status every 30 minutes until it passes
-/seal run dart analyze on mobile-app after every deploy freeze
-
-# Daily leadership
-/seal remind me 1:1 with Ana every Tuesday at 10am
-/seal track: deploy freeze starts April 10
-/seal list
+/seal person: João is on vacation April 7-14
 ```
 
-## What SEAL does
+## Core pillars
 
-- **Leadership memory** — Save decisions, team context, deadlines, and recurring rituals. Search them anytime.
-- **Autonomous execution** — Spawns `claude -p` sessions with auto-generated meta-prompts and scoped tool permissions
-- **Parallel** — Up to 4 concurrent Claude sessions (Max plan), leaving 1 slot for your interactive session
-- **Smart scheduling** — One-time, recurring (cron), or loop-until-done tasks with date awareness
-- **Unignorable reminders** — 5 notification levels from silent to supernova (re-fires every 5 minutes until acknowledged)
-- **Team-aware** — Track people, projects, deadlines, and decisions across your entire portfolio
-- **Claude Code skill** — `/seal` slash command auto-detects project, tools, schedule, and priority from natural language
+### 1. Capture — understand any input
+Paste a Slack thread, describe a bug, mention an idea — SEAL classifies it and routes to the right action. Bug report? Creates a task in Azure DevOps. Idea? Stores as memory. Automation? Schedules execution.
+
+### 2. Orchestrate — flow engine with pluggable adapters
+YAML-defined workflows (inspired by [OpenClaw](https://github.com/openclaw/openclaw)'s Lobster) with platform-agnostic adapters. The same PR review flow works on Azure DevOps, GitHub, or GitLab — just swap the adapter.
+
+```yaml
+# flows/code-review.yaml
+steps:
+  - discover → find open PRs
+  - review → run /smart-review
+  - decide → approve or request changes
+  - watch → monitor for new commits
+  - re-review → delta review against previous findings
+  - notify → alert the dev
+```
+
+### 3. Execute — autonomous parallel sessions
+Spawns `claude -p` sessions with scoped permissions. Up to 4 concurrent tasks. Smart scheduling with cron, one-time, or loop-until-done patterns.
+
+### 4. Remember — persistent cross-session memory
+Integrated with [MemPalace](https://github.com/milla-jovovich/mempalace) for verbatim storage with vector search. 96.6% recall on LongMemEval. Every conversation, decision, and context is stored and findable — not summarized away.
+
+### 5. Learn — self-improving skills
+Inspired by [Hermes Agent](https://github.com/NousResearch/hermes-agent)'s self-improving loop. After completing complex tasks, SEAL refines its skills. Memory prefetch/sync on every turn. User modeling that builds understanding over time.
+
+### 6. Optimize — token-aware execution
+Native [RTK](https://github.com/rtk-ai/rtk) integration compresses CLI output by 60-90% before it hits the LLM context. Sessions last 3x longer. Lower costs. Better reasoning from less noise.
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────┐
+│                    SEAL Agent                        │
+│                                                      │
+│  ┌────────────┐  ┌──────────┐  ┌──────────────────┐ │
+│  │  MemPalace │  │   RTK    │  │   Flow Engine    │ │
+│  │  (memory)  │  │ (tokens) │  │   (workflows)    │ │
+│  └─────┬──────┘  └────┬─────┘  └────────┬─────────┘ │
+│        │               │                 │           │
+│  verbatim store   compress CLI    YAML pipelines     │
+│  vector recall    89% savings    step orchestration   │
+│  170 tokens       3x sessions    conditional logic    │
+│        │               │                 │           │
+│  ┌─────┴───────────────┴─────────────────┴─────────┐ │
+│  │              Adapters (pluggable)                 │ │
+│  │  Azure DevOps · GitHub · GitLab · Bitbucket      │ │
+│  └──────────────────────┬───────────────────────────┘ │
+│                         │                             │
+│  ┌──────────────────────┴───────────────────────────┐ │
+│  │           SEAL Runner (always-on daemon)          │ │
+│  │  SQLite/Turso · Cron · Policy · Sandbox · Notify │ │
+│  └──────────────────────────────────────────────────┘ │
+│                         │                             │
+│  ┌──────────────────────┴───────────────────────────┐ │
+│  │              Communication Channels               │ │
+│  │  Telegram · WhatsApp · Discord · Email · Voice   │ │
+│  └──────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────┘
+```
+
+## Skill orchestration
+
+SEAL knows your project's skills. When it detects a bug report, it calls `/smart-create-task-azure`. When it finds an open PR, it calls `/smart-review`. It's your brain routing to the right tool.
+
+| Input pattern | SEAL action |
+|--------------|-------------|
+| Bug report / chat paste | Save note + create Azure DevOps task |
+| "review PR #123" | Run `/smart-review` with flow engine |
+| "avaliar eCharts" | Save as memory-only note |
+| "run tests every morning" | Schedule executable task |
+| "remind me 1:1 with Ana" | Schedule recurring notification |
+
+## PR review flow
+
+The crown jewel. SEAL reviews PRs autonomously with a re-review loop:
+
+1. **Discover** — finds open PRs you haven't reviewed
+2. **Review** — runs your review skill (smart-review, flutter-review, etc.)
+3. **Decide** — no blockers? Approve. Blockers? Request changes.
+4. **Comment** — posts findings as inline thread comments
+5. **Watch** — monitors PR for new commits (polls every 5 min)
+6. **Re-review** — when dev pushes, re-analyzes with delta context
+7. **Resolve** — if previous findings are fixed, resolves threads and approves
+8. **Notify** — alerts the dev at every step
+
+Same flow works on Azure DevOps, GitHub, and GitLab — just change the adapter.
 
 ## Notification levels
 
@@ -45,257 +123,62 @@ SEAL helps you manage your daily leadership routine: schedule code reviews, trac
 | `nuclear` | Alert dialog + voice announcement | Blocks until clicked |
 | `supernova` | Nuclear, but re-fires every 5 minutes until acknowledged | **No** |
 
-## Install
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/ulisseshen/seal/main/install.sh | bash
-```
-
-Or manually:
-
-```bash
-git clone https://github.com/ulisseshen/seal.git ~/projects/seal
-cd ~/projects/seal && npm install
-
-# Install the Claude Code skill
-mkdir -p ~/.claude/skills/seal
-cp skill/SKILL.md ~/.claude/skills/seal/SKILL.md
-
-# Add aliases to your shell
-echo '
-# SEAL — Autonomous Tech Lead Task Runner
-alias seal="cd ~/projects/seal"
-alias seal-run="cd ~/projects/seal && node src/runner.js"
-alias cds="claude --dangerously-skip-permissions"
-' >> ~/.zshrc
-
-source ~/.zshrc
-```
-
-## Usage
-
-### Save tasks and reminders
-
-```bash
-# Automated code tasks
-/seal run dart analyze on print_widget              # one-time, runs immediately
-/seal run tests on valenty tomorrow at 9am          # scheduled
-/seal run lint fix on mage every Monday at 8am      # recurring (cron)
-/seal check CI every 30 minutes until it passes     # loop until done
-
-# Leadership reminders
-/seal remind me 1:1 with Ana every Tuesday at 10am  # recurring ritual
-/seal remind me to deploy by Friday                 # nuclear notification
-/seal MUST review security audit by Wednesday       # supernova — cannot be ignored
-
-# Team knowledge
-/seal decision: moved to monorepo, approved by CTO  # searchable decision log
-/seal person: João is on vacation April 7-14        # team context
-/seal deadline: Q2 OKR review on April 30           # deadline tracking
-```
-
-### Manage tasks
-
-```bash
-/seal list                    # show active tasks
-/seal search João             # search by person, project, or keyword
-/seal done João PR review     # mark as complete
-/seal ack deploy reminder     # acknowledge a firing supernova
-/seal history                 # show completed tasks
-```
-
-### Start the runner
-
-```bash
-# In a separate terminal:
-seal-run
-
-# Or run in background:
-nohup node ~/projects/seal/src/runner.js > /tmp/seal.log 2>&1 &
-```
-
-### Run Claude autonomously
-
-```bash
-# Start Claude with full autonomous permissions (any directory):
-cds
-```
-
-## How it works
-
-```
-You (Claude Code):
-  /seal "run tests on valenty tomorrow at 9am"
-      │
-      ▼
-  Claude structures it:
-    type: task
-    summary: "Run tests on valenty"
-    execute_at: 2026-04-05T09:00:00
-    prompt: "Run all Flutter tests and report results"
-    project: ~/projects/valenty
-    allowed_tools: ["Bash","Read","Glob","Grep"]
-    permission_mode: auto
-      │
-      ▼
-  Saved to SQLite (~/.config/seal/tasks.db)
-      │
-      ▼
-SEAL Runner (polling every 30s):
-  Is it time? → Yes
-  Slots available? → Yes (4 max, 1 running)
-      │
-      ▼
-  claude -p "Run all Flutter tests..." \
-    --project ~/projects/valenty \
-    --permission-mode auto \
-    --allowedTools Bash,Read,Glob,Grep
-      │
-      ▼
-  Result saved to SQLite
-  Notification sent (if high priority)
-```
-
-## Communication channels
-
-Send tasks to SEAL from your phone when away from the computer:
-
-| Channel | How it works | Setup |
-|---------|-------------|-------|
-| **Telegram** | Bot via @BotFather — message your bot | Token in env var or .secrets |
-| **WhatsApp** | Baileys (WhatsApp Web) — send messages to yourself | Scan QR code on first run |
-| **Email** | Gmail IMAP polling (or Cloudflare Worker) | Gmail App Password |
-| **Discord** | Bot via Developer Portal — DM your bot | Token in env var or .secrets |
-| **Voice notes** | Auto-transcribed via whisper-cli | Installed with SEAL |
-| **Claude Code** | `/seal` skill | Already works |
-
-All channels support project-aware routing. Mention a project name ("valenty: run tests") and SEAL routes automatically. No project? SEAL asks you which one.
-
-See [docs/communication-channels.md](docs/communication-channels.md) for setup details.
-
-## Multi-computer support
-
-Local SQLite by default. Add two env vars to switch to [Turso](https://turso.tech) (hosted SQLite) and sync across machines:
-
-```bash
-export SEAL_DB_URL=libsql://seal-yourname.turso.io
-export SEAL_DB_TOKEN=your-token
-```
-
-See [docs/multi-computer.md](docs/multi-computer.md) for full setup.
-
-## Architecture
-
-```
-~/projects/seal/
-├── src/
-│   ├── runner.js        # Main loop (tasks + reminders + supernova + ingestion)
-│   ├── executor.js      # Spawns claude -p with meta-prompts, parallel execution
-│   ├── db.js            # SQLite/Turso dual-mode database (local or cloud)
-│   ├── notify.js        # 5-level notification system (silent → supernova)
-│   ├── whatsapp.js      # Baileys WhatsApp channel (QR auth, voice notes)
-│   ├── telegram.js      # Telegram bot channel (@BotFather token)
-│   ├── discord.js       # Discord bot channel (Developer Portal token)
-│   ├── ingest-gmail.js  # Gmail IMAP polling for email ingestion
-│   ├── ingest-server.js # HTTP server for email webhook (POST /email)
-│   ├── projects.js      # Project detection and routing
-│   ├── transcribe.js    # whisper-cli wrapper for audio transcription
-│   └── config.js        # Ingestion config (~/.config/seal/ingest.json)
-├── cloudflare-email-worker/
-│   ├── worker.js        # Cloudflare Worker for email routing
-│   └── wrangler.toml    # Wrangler deployment config
-├── skill/
-│   └── SKILL.md         # Claude Code / Codex / Antigravity skill
-├── skills/
-│   └── cursor/
-│       └── seal.mdc     # Cursor rule
-├── site/
-│   └── index.html       # Landing page for seal.hens.com.br
-├── install.sh           # One-line installer (auto-detects runtimes)
-└── package.json
-
-~/.config/seal/
-├── tasks.db             # SQLite database (local mode)
-├── ingest.json          # Ingestion config (email, whatsapp, telegram, transcription)
-├── .secrets             # Secrets file (chmod 600) — Gmail password, Telegram token
-├── whatsapp-auth/       # Baileys credentials (persisted after QR scan)
-└── models/
-    └── ggml-small.bin   # Whisper model for audio transcription (466MB)
-```
-
-## Supported runtimes
-
-| Runtime | Skill location | Status |
-|---------|---------------|--------|
-| Claude Code | `~/.claude/skills/seal/SKILL.md` | Supported |
-| Codex | `~/.agents/skills/seal/SKILL.md` | Supported |
-| Antigravity | `~/.gemini/antigravity/skills/seal/SKILL.md` | Supported |
-| Cursor | `~/.cursor/rules/seal.mdc` | Supported |
-
-The install script auto-detects which runtimes you have and installs the skill for each one.
-
-## Requirements
-
-- **Node.js** 18+
-- **An AI coding CLI** — Claude Code, Codex, Antigravity, or Cursor (at least one)
-- **Claude Max plan** recommended for parallel execution (4 concurrent sessions)
-- **macOS** for full notification support (Linux: notifications degrade to terminal bell)
-- **sqlite3** CLI for the `/seal` skill to read/write the task database
-- **ffmpeg** (for voice note transcription — `brew install ffmpeg`)
-- **whisper-cli** (auto-installed via `brew install whisper-cpp`)
-
-### For persistent reminders (supernova)
-
-The SEAL runner daemon must be running in a background terminal for persistent reminders to fire. Without it, tasks are saved but won't execute or notify.
-
-```bash
-# Start the runner (keep this terminal open):
-seal-run
-
-# Or run as a background process:
-nohup node ~/projects/seal/src/runner.js > /tmp/seal.log 2>&1 &
-
-# Or set up as a launchd service (macOS):
-# See docs/launchd.md (coming soon)
-```
-
-### For task execution
-
-SEAL spawns `claude -p` to execute tasks autonomously. This requires:
-- The **Claude Code CLI** installed and authenticated (`claude --version`)
-- Your configured **MCP servers**, **skills**, and **tools** work as-is — SEAL runs on your machine, so everything Claude Code can access, SEAL can access
-- `--permission-mode auto` is used by default — Claude's safety classifier evaluates each action before executing
-
 ## Task types
 
 | Type | Description | Auto-executes? |
 |------|-------------|----------------|
-| `task` | Something Claude should do | Yes — via `claude -p` |
+| `task` | Something Claude should do (with prompt) | Yes — via `claude -p` |
+| `note` | Memory-only — idea, evaluation, context | No — stored for reference |
 | `reminder` | Something you need to remember | No — fires notification |
 | `ritual` | Recurring task or reminder | Yes — recalculates next run |
 | `deadline` | Project deadline or freeze | No — fires notification |
 | `person` | Info about a team member | No — searchable context |
 | `decision` | Architectural or team decision | No — searchable context |
 
-## Safety
+## Install
 
-- Tasks use `--permission-mode auto` by default — Claude's safety classifier evaluates each action
-- Client projects can be forced to read-only tools
-- Each task gets scoped `--allowedTools` based on what it needs
-- Results capped at 50KB per task
-- 30-minute timeout per task execution
-- Max 4 concurrent sessions (configurable)
+```bash
+curl -fsSL https://raw.githubusercontent.com/ulisseshen/seal/main/install.sh | bash
+```
 
-## Who is SEAL for?
+## Requirements
 
-- **Tech Leads** juggling multiple projects, PRs, and team members
-- **Engineering Managers** tracking deadlines, decisions, and 1:1s
-- **Senior Engineers** running automated checks across repos
-- **Anyone** who manages a team and codes — and needs both to work without dropping balls
+- **Node.js** 18+
+- **An AI coding CLI** — Claude Code, Codex, Antigravity, or Cursor
+- **Claude Max plan** recommended for parallel execution
+- **macOS** for full notification support (Linux: degraded notifications)
+- **sqlite3** CLI
+- Optional: **RTK** (`brew install rtk-ai/tap/rtk`) for token optimization
+- Optional: **MemPalace** for persistent memory
+- Optional: **ffmpeg** + **whisper-cli** for voice transcription
 
-## Inspired by
+## Communication channels
 
-The name SEAL comes from the Navy SEALs leadership philosophy — discipline, ownership, and relentless execution. Inspired by [Extreme Ownership](https://echelonfront.com/extreme-ownership/) by Jocko Willink and Leif Babin.
+| Channel | How it works |
+|---------|-------------|
+| **Telegram** | Bot via @BotFather |
+| **WhatsApp** | Baileys (WhatsApp Web) |
+| **Discord** | Bot via Developer Portal |
+| **Email** | Gmail IMAP or Cloudflare Worker |
+| **Voice notes** | Auto-transcribed via whisper-cli |
+| **Claude Code** | `/seal` skill |
+
+## Supported runtimes
+
+| Runtime | Status |
+|---------|--------|
+| Claude Code | Supported |
+| Codex | Supported |
+| Antigravity | Supported |
+| Cursor | Supported |
+
+## Standing on the shoulders of
+
+- **[OpenClaw](https://github.com/openclaw/openclaw)** — Flow engine (Lobster) and adapter architecture
+- **[Hermes Agent](https://github.com/NousResearch/hermes-agent)** — Self-improving skills, memory prefetch/sync, user modeling
+- **[MemPalace](https://github.com/milla-jovovich/mempalace)** — Verbatim memory with vector search (96.6% recall)
+- **[RTK](https://github.com/rtk-ai/rtk)** — Token compression for CLI output (60-90% reduction)
+- **[Extreme Ownership](https://echelonfront.com/extreme-ownership/)** — The leadership philosophy behind the name
 
 > *"There are no bad teams, only bad leaders."* — Jocko Willink
 
