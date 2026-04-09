@@ -153,6 +153,7 @@ export async function getPendingTasks(limit = 5) {
     WHERE status = 'pending'
       AND (execute_at IS NULL OR datetime(execute_at) <= datetime('now'))
       AND type IN ('task', 'ritual')
+      AND prompt IS NOT NULL AND prompt != ''
     ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, execute_at ASC
     LIMIT ?
   `, [limit]);
