@@ -171,7 +171,10 @@ export async function executeTask(task) {
             if (await checkMaxRuns(task.id)) {
               console.log(`[executor] Task ${task.id} reached max runs, marking done`);
             } else {
-              const interval = CronExpressionParser.parse(task.recurrence);
+              // Parse cron in the system's local timezone so expressions like
+              // "*/30 8-19 * * *" mean 8am-7:30pm LOCAL time, not UTC.
+              const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+              const interval = CronExpressionParser.parse(task.recurrence, { tz });
               const nextRun = interval.next().toDate().toISOString();
               await advanceRecurring(task.id, nextRun);
               console.log(`[executor] Task ${task.id} next run: ${nextRun}`);
@@ -193,7 +196,9 @@ export async function executeTask(task) {
         if (task.recurrence) {
           try {
             if (!(await checkMaxRuns(task.id))) {
-              const interval = CronExpressionParser.parse(task.recurrence);
+              // Same local-timezone handling as the success path above.
+              const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+              const interval = CronExpressionParser.parse(task.recurrence, { tz });
               const nextRun = interval.next().toDate().toISOString();
               await advanceRecurring(task.id, nextRun);
               console.log(`[executor] Task ${task.id} re-queued after failure, next run: ${nextRun}`);
