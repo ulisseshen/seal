@@ -64,9 +64,41 @@ echo -e "${GREEN}✓${NC} Source ready"
 
 # --- Install dependencies ---
 
-echo -e "${CYAN}→${NC} Installing dependencies..."
+echo -e "${CYAN}→${NC} Installing Node dependencies..."
 npm install --production 2>/dev/null
-echo -e "${GREEN}✓${NC} Dependencies installed"
+echo -e "${GREEN}✓${NC} Node dependencies installed
+
+# --- Install RTK (token compression) ---
+
+echo -e "${CYAN}→${NC} Installing RTK (token compression)..."
+if command -v rtk &> /dev/null; then
+  echo -e "${GREEN}✓${NC} RTK already installed ($(rtk --version 2>/dev/null || echo 'unknown'))"
+elif command -v brew &> /dev/null; then
+  brew install rtk 2>/dev/null && echo -e "${GREEN}✓${NC} RTK installed via Homebrew" || echo -e "${YELLOW}⚠${NC} RTK install failed — SEAL will work without token compression"
+else
+  curl -fsSL https://raw.githubusercontent.com/rtk-ai/rtk/refs/heads/master/install.sh | sh 2>/dev/null && echo -e "${GREEN}✓${NC} RTK installed" || echo -e "${YELLOW}⚠${NC} RTK install failed — SEAL will work without token compression"
+fi
+
+# --- Install MemPalace (persistent memory) ---
+
+echo -e "${CYAN}→${NC} Installing MemPalace (persistent memory)..."
+if python3 -c "import mempalace" 2>/dev/null; then
+  echo -e "${GREEN}✓${NC} MemPalace already installed"
+else
+  pip3 install mempalace 2>/dev/null && echo -e "${GREEN}✓${NC} MemPalace installed via pip" || {
+    # Fallback: install from GitHub
+    pip3 install git+https://github.com/milla-jovovich/mempalace.git 2>/dev/null && echo -e "${GREEN}✓${NC} MemPalace installed from GitHub" || echo -e "${YELLOW}⚠${NC} MemPalace install failed — SEAL will work without persistent memory"
+  }
+fi
+
+# Initialize MemPalace palace for SEAL
+PALACE_DIR="$HOME/.mempalace/seal"
+if [ ! -d "$PALACE_DIR" ]; then
+  mkdir -p "$PALACE_DIR"
+  echo -e "${GREEN}✓${NC} MemPalace palace initialized at $PALACE_DIR"
+else
+  echo -e "${GREEN}✓${NC} MemPalace palace exists at $PALACE_DIR"
+fi
 
 # --- Detect and install skills for all runtimes ---
 
@@ -145,6 +177,16 @@ fi
 echo ""
 echo -e "${GREEN}✓ SEAL installed!${NC}"
 echo ""
+
+# Status summary
+echo "Components:"
+echo ""
+command -v node &> /dev/null && echo -e "  ${GREEN}✓${NC} Node.js $(node --version)" || echo -e "  ${RED}✗${NC} Node.js"
+command -v claude &> /dev/null && echo -e "  ${GREEN}✓${NC} Claude Code CLI" || echo -e "  ${YELLOW}⚠${NC} Claude Code CLI (not found)"
+command -v rtk &> /dev/null && echo -e "  ${GREEN}✓${NC} RTK (token compression)" || echo -e "  ${YELLOW}⚠${NC} RTK (not installed)"
+python3 -c "import mempalace" 2>/dev/null && echo -e "  ${GREEN}✓${NC} MemPalace (persistent memory)" || echo -e "  ${YELLOW}⚠${NC} MemPalace (not installed)"
+echo ""
+
 echo "Commands:"
 echo ""
 echo "  seal          Navigate to SEAL project"
