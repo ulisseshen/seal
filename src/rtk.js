@@ -98,6 +98,10 @@ export function compressOutput(output, maxTokens = 2000) {
 export function enhancePrompt(prompt) {
   if (!isRtkAvailable() || !prompt) return prompt;
 
+  // Don't prepend anything when the prompt starts with "/" — it's a skill
+  // invocation and the slash must be the first thing Claude sees.
+  if (prompt.trimStart().startsWith('/')) return prompt;
+
   // Prepend RTK instruction so the spawned claude session uses RTK
   return (
     '[RTK is installed. When running shell commands, prefer RTK-wrapped versions ' +
