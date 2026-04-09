@@ -13,6 +13,8 @@ import { notifyTaskLifecycle } from './channel-notify.js';
 import { notify } from './notify.js';
 import { wrapWithSandbox, profileForPermissionMode } from './sandbox.js';
 import { evaluatePolicy } from './policy.js';
+import { prefetch, sync as memorySync } from './memory.js';
+import { enhancePrompt, compressOutput, isRtkAvailable } from './rtk.js';
 import { CronExpressionParser } from 'cron-parser';
 import path from 'path';
 import os from 'os';
@@ -60,7 +62,25 @@ export async function executeTask(task) {
 
   // Phone channels (Telegram, Discord, WhatsApp) save prompt=null.
   // Fallback: use summary + detail so claude -p has something to work with.
-  const prompt = task.prompt || [task.summary, task.detail].filter(Boolean).join('\n');
+  let prompt = task.prompt || [task.summary, task.detail].filter(Boolean).join('\n');
+
+  // ─── Memory prefetch (MemPalace) ────────────────────
+  // Recall relevant memories from previous tasks and inject as context.
+  // Uses Hermes-style <memory-context> fencing to prevent the model from
+  // treating recalled memories as user input.
+  try {
+    const memoryBlock = await prefetch(task);
+    if (memoryBlock) {
+      prompt = `${memoryBlock}\n\n${prompt}`;
+      console.log(`[executor] Injected memory context for task ${task.id}`);
+    }
+  } catch (err) {
+    console.warn(`[executor] Memory prefetch failed (continuing without):`, err.message);
+  }
+
+  // ─── RTK prompt enhancement ─────────────────────────
+  // Tell the spawned claude session to use RTK-wrapped commands for compression.
+  prompt = enhancePrompt(prompt);
 
   const claudeArgs = [
     '-p', prompt,
@@ -163,6 +183,15 @@ export async function executeTask(task) {
 
       if (code === 0) {
         const result = stdout.trim().slice(0, 50000);
+
+        // ─── Memory sync (MemPalace) — store outcome ────
+        try {
+          const compressed = compressOutput(result, 2000);
+          await memorySync(task, compressed, 'done');
+        } catch (err) {
+          console.warn(`[executor] Memory sync failed (non-blocking):`, err.message);
+        }
+
         await updateStatus(task.id, 'done', result);
         console.log(`[executor] Task ${task.id} completed successfully`);
 
@@ -189,6 +218,14 @@ export async function executeTask(task) {
         await notifyTaskLifecycle(task, 'done', `Done: ${task.summary}${preview}`);
       } else {
         const error = stderr.trim().slice(0, 10000) || `Exit code ${code}`;
+
+        // ─── Memory sync (MemPalace) — store failure ────
+        try {
+          await memorySync(task, error, 'failed');
+        } catch (err2) {
+          console.warn(`[executor] Memory sync (failure) failed:`, err2.message);
+        }
+
         await updateStatus(task.id, 'failed', error);
         console.error(`[executor] Task ${task.id} failed:`, error.slice(0, 200));
 
