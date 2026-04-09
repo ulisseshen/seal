@@ -20,6 +20,9 @@ import { ensureDefaultProfiles } from './sandbox.js';
 import { loadPolicy, policyRuleCount } from './policy.js';
 import { runPrWatcher } from './sensors/pr-watcher.js';
 import { runAzurePrReview } from './sensors/azure-pr-review.js';
+import { ensurePalace } from './memory.js';
+import { isRtkAvailable, getStats as getRtkStats } from './rtk.js';
+import { loadFlows } from './flows/engine.js';
 
 const POLL_INTERVAL = 30_000;       // Check tasks every 30 seconds
 const SUPERNOVA_INTERVAL = 60_000;  // Check supernova re-fires every 60 seconds
@@ -66,6 +69,14 @@ try {
 } catch (err) {
   console.warn('[seal] openenglish profile migration skipped:', err.message);
 }
+
+// ─── Memory + RTK + Flows init ──────────────────────────
+ensurePalace();
+const rtkEnabled = isRtkAvailable();
+const flows = loadFlows(new URL('../flows', import.meta.url).pathname);
+console.log(`[seal] Memory: MemPalace (prefetch/sync enabled)`);
+console.log(`[seal] Tokens: RTK ${rtkEnabled ? 'enabled (60-90% compression)' : 'not installed'}`);
+console.log(`[seal] Flows: ${Object.keys(flows).length} loaded (${Object.keys(flows).join(', ') || 'none'})`);
 
 console.log(`[seal] Standing by...`);
 
