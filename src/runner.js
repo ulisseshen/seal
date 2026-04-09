@@ -19,6 +19,7 @@ import { startWeb } from './web.js';
 import { ensureDefaultProfiles } from './sandbox.js';
 import { loadPolicy, policyRuleCount } from './policy.js';
 import { runPrWatcher } from './sensors/pr-watcher.js';
+import { runAzurePrReview } from './sensors/azure-pr-review.js';
 
 const POLL_INTERVAL = 30_000;       // Check tasks every 30 seconds
 const SUPERNOVA_INTERVAL = 60_000;  // Check supernova re-fires every 60 seconds
@@ -166,6 +167,22 @@ if (config.sensors?.pr_watcher === true) {
   setInterval(tickPrWatcher, PR_WATCHER_INTERVAL);
   // First tick shortly after startup so the daemon log shows its status
   setTimeout(tickPrWatcher, 5_000);
+}
+
+// Azure PR review sensor — polls Azure DevOps REST API (0 tokens),
+// creates a smart-review task only when an eligible PR is found.
+const AZURE_PR_INTERVAL = (config.sensors?.azure_pr_review_interval_min || 5) * 60 * 1000;
+if (config.sensors?.azure_pr_review !== false) {
+  console.log(`[seal] azure-pr-review sensor enabled (every ${AZURE_PR_INTERVAL / 60_000} min)`);
+  const tickAzurePr = async () => {
+    try {
+      await runAzurePrReview();
+    } catch (err) {
+      console.error('[seal] azure-pr-review error:', err.message);
+    }
+  };
+  setInterval(tickAzurePr, AZURE_PR_INTERVAL);
+  setTimeout(tickAzurePr, 8_000); // first tick after startup
 }
 
 // ─── Main loops ─────────────────────────────────────────
