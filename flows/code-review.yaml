@@ -1,0 +1,95 @@
+name: code-review
+description: Autonomous PR review loop with re-review on new commits
+version: 1
+
+defaults:
+  adapter: azure-devops
+  notify_channel: pr-comment
+  timeout: 7d
+
+steps:
+  - id: discover
+    action: adapter.list_open_prs
+    filter:
+      not_mine: true
+      not_draft: true
+      not_reviewed_by_me: true
+    output: prs
+
+  - id: review
+    action: skill.smart-review
+    input: $prs[current].url
+    output: findings
+
+  - id: decide
+    condition:
+      - if: findings.blocker_count == 0 && findings.warning_count == 0
+        goto: approve
+      - if: findings.blocker_count == 0 && findings.warning_count > 0
+        goto: suggest
+      - else:
+        goto: request-changes
+
+  - id: approve
+    action: adapter.vote
+    pr: $prs[current].id
+    value: approve
+    then:
+      - adapter.resolve_threads
+      - notify
+
+  - id: suggest
+    action: adapter.vote
+    pr: $prs[current].id
+    value: wait_for_author
+    comment: "Suggestions only — no blockers. Please review and push if you agree."
+    then:
+      - adapter.comment_threads(findings.warnings)
+      - notify
+      - watch
+
+  - id: request-changes
+    action: adapter.vote
+    pr: $prs[current].id
+    value: wait_for_author
+    comment: "Found {findings.blocker_count} blocker(s). Please address before merge."
+    then:
+      - adapter.comment_threads(findings.all)
+      - notify
+      - watch
+
+  - id: watch
+    action: adapter.watch_for_commits
+    pr: $prs[current].id
+    poll_interval: 5m
+    timeout: $defaults.timeout
+    on_new_commit: re-review
+    on_timeout: expire
+
+  - id: re-review
+    action: skill.smart-review
+    input: $prs[current].url
+    context:
+      previous_findings: $findings
+      mode: delta
+    output: new_findings
+    then:
+      - id: re-decide
+        condition:
+          - if: new_findings.resolved_all_previous
+            goto: approve
+          - else:
+            goto: request-changes
+            input: new_findings
+
+  - id: notify
+    action: adapter.notify
+    channel: $defaults.notify_channel
+    template: |
+      Review **{$decide.result}** on [{$prs[current].title}]({$prs[current].url})
+      Blockers: {findings.blocker_count} | Warnings: {findings.warning_count} | NITs: {findings.nit_count}
+
+  - id: expire
+    action: adapter.comment
+    pr: $prs[current].id
+    message: "SEAL: Review watch expired after {$defaults.timeout}. Run /smart-review to re-analyze."
