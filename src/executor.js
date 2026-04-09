@@ -64,7 +64,7 @@ export async function executeTask(task) {
 
   const claudeArgs = [
     '-p', prompt,
-    '--permission-mode', task.permission_mode === 'plan' ? 'plan' : 'auto',
+    '--permission-mode', task.permission_mode || 'auto',
     '--output-format', 'text',
   ];
 

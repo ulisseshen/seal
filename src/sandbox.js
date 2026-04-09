@@ -157,6 +157,10 @@ export function resolveProfile(profileName) {
  * @param {object} params - sandbox profile (param "KEY") bindings via -D KEY=VALUE
  */
 export function wrapWithSandbox(command, args, profileName, params = {}) {
+  // null profileName = explicit opt-out (e.g. bypassPermissions) — skip sandbox entirely.
+  if (profileName === null || profileName === undefined) {
+    return { command, args, profile: null };
+  }
   const profilePath = resolveProfile(profileName);
   if (!profilePath) {
     return { command, args, profile: null };
@@ -181,6 +185,8 @@ export function wrapWithSandbox(command, args, profileName, params = {}) {
  */
 export function profileForPermissionMode(mode) {
   switch (mode) {
+    case 'bypassPermissions':
+      return null; // No sandbox — task explicitly opted out of all restrictions
     case 'plan':
     case 'readonly':
       return 'readonly';
