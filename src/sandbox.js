@@ -88,15 +88,15 @@ const SHELL_ALLOWLISTED_PROFILE = `(version 1)
   (subpath "/usr/bin")
   (subpath "/usr/sbin")
   (subpath "/usr/local/bin")
-  (subpath "/opt/homebrew/bin")
-  (subpath "/opt/homebrew/opt")
+  (subpath "/opt/homebrew")
   (subpath (string-append (param "HOME") "/.openenglish"))
-  (subpath (string-append (param "HOME") "/.local/bin/seal-allowed"))
+  (subpath (string-append (param "HOME") "/.local/bin"))
+  (subpath (string-append (param "HOME") "/.local/share/claude"))
   (subpath (string-append (param "HOME") "/.claude"))
   (subpath (string-append (param "HOME") "/.nvm"))
   (subpath (string-append (param "HOME") "/.volta")))
 
-; Write under scratch + openenglish home (for state files)
+; Write under scratch + openenglish home + claude runtime state
 (allow file-write*
   (subpath "/tmp/seal-scratch")
   (subpath "/private/tmp/seal-scratch")
@@ -104,7 +104,10 @@ const SHELL_ALLOWLISTED_PROFILE = `(version 1)
   (subpath "/tmp")
   (subpath "/private/tmp")
   (subpath (string-append (param "HOME") "/.openenglish"))
-  (subpath (string-append (param "HOME") "/.config/seal")))
+  (subpath (string-append (param "HOME") "/.config/seal"))
+  (subpath (string-append (param "HOME") "/.local/share/claude"))
+  (subpath (string-append (param "HOME") "/.cache/claude"))
+  (subpath (string-append (param "HOME") "/.claude")))
 
 (allow network*)
 `;
@@ -123,9 +126,10 @@ export function ensureDefaultProfiles() {
   fs.mkdirSync(PROFILE_DIR, { recursive: true });
   for (const [name, body] of Object.entries(DEFAULT_PROFILES)) {
     const p = path.join(PROFILE_DIR, name);
-    if (!fs.existsSync(p)) {
+    const existing = fs.existsSync(p) ? fs.readFileSync(p, 'utf8') : null;
+    if (existing !== body) {
       fs.writeFileSync(p, body);
-      console.log(`[sandbox] Wrote default profile ${p}`);
+      console.log(`[sandbox] ${existing ? 'Updated' : 'Wrote'} profile ${p}`);
     }
   }
   return PROFILE_DIR;
