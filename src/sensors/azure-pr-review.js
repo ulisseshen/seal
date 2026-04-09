@@ -31,7 +31,9 @@ const API_VERSION = 'api-version=7.1';
 
 // The main project directory (used to create worktrees from)
 const PROJECT_DIR = process.env.SEAL_AZURE_PROJECT_DIR || '/Users/ulisseshen/projects/prs_smartesales_flutter';
-const WORKTREE_BASE = '/tmp/seal-worktrees';
+// Worktrees inside the project — claude -p works reliably here because
+// .claude/, .mcp.json, and the full environment are in the parent tree.
+const WORKTREE_BASE = path.join(PROJECT_DIR, '.seal-worktrees');
 const MAX_PARALLEL_REVIEWS = 2; // leave 2 claude slots for interactive use
 
 function genId() {
@@ -70,25 +72,35 @@ async function createWorktree(prId, sourceBranch) {
   // Fetch latest refs
   await execFileP('git', ['fetch', 'origin'], { cwd: PROJECT_DIR, timeout: 30_000 });
 
-  // Create worktree on the source branch
+  // Find latest release branch (where skills/agents are always up-to-date)
+  let latestRelease;
   try {
-    await execFileP('git', ['worktree', 'add', wtPath, `origin/${sourceBranch}`], {
+    const { stdout } = await execFileP('git', [
+      'branch', '-r', '--list', 'origin/release/*', '--sort=-version:refname',
+    ], { cwd: PROJECT_DIR, timeout: 10_000 });
+    latestRelease = stdout.trim().split('\n')[0]?.trim();
+  } catch {}
+
+  // Create worktree from latest release (not the PR's source branch).
+  // Smart-review uses git diff to analyze the PR, so it doesn't need
+  // to be on the source branch — it needs the latest skills + agents.
+  const base = latestRelease || 'origin/main';
+  try {
+    await execFileP('git', ['worktree', 'add', '--detach', wtPath, base], {
       cwd: PROJECT_DIR,
       timeout: 30_000,
     });
   } catch (err) {
-    // If branch doesn't exist remotely, try detached HEAD
-    if (err.message.includes('not a valid reference')) {
+    // Fallback: detached HEAD from current
+    if (!fs.existsSync(wtPath)) {
       await execFileP('git', ['worktree', 'add', '--detach', wtPath], {
         cwd: PROJECT_DIR,
         timeout: 30_000,
       });
-    } else {
-      throw err;
     }
   }
 
-  console.log(`[azure-pr-review] Created worktree: ${wtPath} (branch: ${sourceBranch})`);
+  console.log(`[azure-pr-review] Created worktree: ${wtPath} (base: ${base}, reviewing: ${sourceBranch})`);
   return wtPath;
 }
 
@@ -247,17 +259,11 @@ export async function runAzurePrReview() {
       execute_at: new Date().toISOString(),
       recurrence: null,
       next_run: null,
-      prompt: `/smart-review ${prUrl} --auto`,
+      prompt: `Use the Skill tool to invoke skill="smart-review" with args="${prUrl} --auto". Wait for it to complete fully. Do not interrupt or summarize early.`,
       project: wtPath, // isolated worktree, not the shared repo
-      allowed_tools: JSON.stringify([
-        'Bash', 'Read', 'Edit', 'Write', 'Glob', 'Grep', 'Task', 'Skill',
-        'mcp__azure-devops__repo_get_pull_request_by_id',
-        'mcp__azure-devops__repo_list_pull_request_threads',
-        'mcp__azure-devops__repo_list_pull_request_thread_comments',
-        'mcp__azure-devops__repo_create_pull_request_thread',
-        'mcp__azure-devops__repo_reply_to_comment',
-        'mcp__azure-devops__repo_update_pull_request_thread',
-      ]),
+      // Empty = no --allowedTools flag passed to claude.
+      // With bypassPermissions, all tools are available — no whitelist needed.
+      allowed_tools: '[]',
       permission_mode: 'bypassPermissions',
       notify_type: 'sound',
       notify_channel: 'system',

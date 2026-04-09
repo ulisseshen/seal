@@ -64,23 +64,26 @@ export async function executeTask(task) {
   // Fallback: use summary + detail so claude -p has something to work with.
   let prompt = task.prompt || [task.summary, task.detail].filter(Boolean).join('\n');
 
-  // ─── Memory prefetch (MemPalace) ────────────────────
-  // Recall relevant memories from previous tasks and inject as context.
-  // Uses Hermes-style <memory-context> fencing to prevent the model from
-  // treating recalled memories as user input.
-  try {
-    const memoryBlock = await prefetch(task);
-    if (memoryBlock) {
-      prompt = `${memoryBlock}\n\n${prompt}`;
-      console.log(`[executor] Injected memory context for task ${task.id}`);
-    }
-  } catch (err) {
-    console.warn(`[executor] Memory prefetch failed (continuing without):`, err.message);
-  }
+  // Skill invocations must NOT have anything prepended — prepended text
+  // confuses Claude's skill recognition. Skip memory and RTK for these.
+  const trimmed = prompt.trimStart();
+  const isSkillInvocation = trimmed.startsWith('/') || trimmed.startsWith('Use the Skill tool');
 
-  // ─── RTK prompt enhancement ─────────────────────────
-  // Tell the spawned claude session to use RTK-wrapped commands for compression.
-  prompt = enhancePrompt(prompt);
+  if (!isSkillInvocation) {
+    // ─── Memory prefetch (MemPalace) ────────────────────
+    try {
+      const memoryBlock = await prefetch(task);
+      if (memoryBlock) {
+        prompt = `${memoryBlock}\n\n${prompt}`;
+        console.log(`[executor] Injected memory context for task ${task.id}`);
+      }
+    } catch (err) {
+      console.warn(`[executor] Memory prefetch failed (continuing without):`, err.message);
+    }
+
+    // ─── RTK prompt enhancement ─────────────────────────
+    prompt = enhancePrompt(prompt);
+  }
 
   const claudeArgs = [
     '-p', prompt,
