@@ -1,0 +1,244 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>SEAL Dashboard</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <!-- Ambient background -->
+  <div class="ambient-bg">
+    <div class="ambient-blob blob-1"></div>
+    <div class="ambient-blob blob-2"></div>
+    <div class="ambient-blob blob-3"></div>
+  </div>
+
+  <div class="app">
+    <!-- Sidebar -->
+    <aside class="sidebar" id="sidebar">
+      <div class="sidebar-header">
+        <img class="sidebar-logo-img" src="seal-logo.png" alt="SEAL" width="32" height="32">
+        <span class="sidebar-brand">SEAL</span>
+      </div>
+      <nav class="sidebar-nav">
+        <button class="sidebar-item active" data-tab="missions" title="Missions">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></svg>
+          <span class="sidebar-label">Missions</span>
+        </button>
+        <button class="sidebar-item" data-tab="channels" title="Channels">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 01-3.46 0"/></svg>
+          <span class="sidebar-label">Channels</span>
+        </button>
+        <button class="sidebar-item" data-tab="chat" title="Chat">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M21 15a2 2 0 01-2 2H7l-4 4V5a2 2 0 012-2h14a2 2 0 012 2z"/></svg>
+          <span class="sidebar-label">Chat</span>
+        </button>
+        <button class="sidebar-item" data-tab="logs" title="Logs">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 00-2 2v16a2 2 0 002 2h12a2 2 0 002-2V8z"/><polyline points="14,2 14,8 20,8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></svg>
+          <span class="sidebar-label">Logs</span>
+        </button>
+        <button class="sidebar-item" data-tab="calendar" title="Calendar">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="4" width="18" height="18" rx="2" ry="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></svg>
+          <span class="sidebar-label">Calendar</span>
+        </button>
+      </nav>
+      <div class="sidebar-footer">
+        <div class="sidebar-stats" id="header-stats"></div>
+        <button class="sidebar-collapse-btn" id="sidebar-toggle" title="Collapse sidebar">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="15 18 9 12 15 6"/></svg>
+          <span class="sidebar-label">Collapse</span>
+        </button>
+      </div>
+    </aside>
+
+    <!-- Content -->
+    <main class="content">
+      <!-- Missions -->
+      <section class="page active" id="page-missions">
+        <div class="page-header">
+          <h2 class="page-title">Missions</h2>
+          <div class="page-actions">
+            <div class="search-box">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+              <input type="text" id="search-input" placeholder="Search missions...">
+            </div>
+            <button class="btn btn-primary" id="btn-new-mission">
+              <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
+              New Mission
+            </button>
+          </div>
+        </div>
+        <div class="filters" id="filters">
+          <button class="filter-chip active" data-filter="all">All</button>
+          <button class="filter-chip" data-filter="task">Tasks</button>
+          <button class="filter-chip" data-filter="reminder">Reminders</button>
+          <button class="filter-chip" data-filter="ritual">Rituals</button>
+          <button class="filter-chip" data-filter="deadline">Deadlines</button>
+          <button class="filter-chip" data-filter="decision">Decisions</button>
+          <button class="filter-chip" data-filter="person">People</button>
+        </div>
+        <div class="status-filters" id="status-filters">
+          <button class="status-chip active" data-status="all">All Status</button>
+          <button class="status-chip" data-status="running">Running</button>
+          <button class="status-chip" data-status="firing">Firing</button>
+          <button class="status-chip" data-status="pending">Pending</button>
+          <button class="status-chip" data-status="done">Done</button>
+          <button class="status-chip" data-status="failed">Failed</button>
+        </div>
+        <div id="missions-list" class="missions-list"></div>
+      </section>
+
+      <!-- Channels -->
+      <section class="page" id="page-channels">
+        <div class="page-header">
+          <h2 class="page-title">Notification Channels</h2>
+        </div>
+        <div id="channels-grid" class="channels-grid"></div>
+      </section>
+
+      <!-- Chat -->
+      <section class="page" id="page-chat">
+        <div class="chat-container">
+          <div class="chat-messages" id="chat-messages">
+            <div class="chat-welcome">
+              <div class="chat-welcome-icon"><img class="sidebar-logo-img" src="seal-logo.png" alt="SEAL" width="64" height="64"></div>
+              <h3>SEAL Chat</h3>
+              <p>Talk to your autonomous assistant. Configure the AI model below to get started.</p>
+            </div>
+          </div>
+          <div class="chat-input-area">
+            <input type="text" id="chat-input" placeholder="Type a message...">
+            <button class="btn btn-primary btn-send" id="btn-send">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22,2 15,22 11,13 2,9"/></svg>
+            </button>
+          </div>
+          <div class="chat-config">
+            <h4>Chat Configuration</h4>
+            <div class="config-row">
+              <label>Model</label>
+              <select id="chat-model">
+                <option value="claude">Claude</option>
+                <option value="gpt-4">GPT-4</option>
+                <option value="codex">Codex</option>
+              </select>
+            </div>
+            <div class="config-row">
+              <label>API Key</label>
+              <input type="password" id="chat-api-key" placeholder="sk-...">
+            </div>
+            <div class="config-row">
+              <label>System Prompt</label>
+              <textarea id="chat-system-prompt" rows="3" placeholder="You are SEAL..."></textarea>
+            </div>
+            <button class="btn btn-primary btn-sm" id="btn-save-chat-config">Save Config</button>
+          </div>
+        </div>
+      </section>
+
+      <!-- Logs -->
+      <section class="page" id="page-logs">
+        <div class="page-header">
+          <h2 class="page-title">Execution Logs</h2>
+          <div class="page-actions">
+            <div class="log-filters">
+              <button class="filter-chip active" data-log-status="all">All</button>
+              <button class="filter-chip" data-log-status="success">Success</button>
+              <button class="filter-chip" data-log-status="failed">Failed</button>
+            </div>
+          </div>
+        </div>
+        <div id="logs-list" class="logs-list"></div>
+      </section>
+
+      <!-- Calendar -->
+      <section class="page" id="page-calendar">
+        <div class="page-header">
+          <h2 class="page-title">7-Day Calendar</h2>
+        </div>
+        <div id="calendar-grid" class="calendar-grid"></div>
+      </section>
+    </main>
+  </div>
+
+  <!-- New Mission Modal -->
+  <div class="modal-overlay" id="modal-overlay">
+    <div class="modal">
+      <div class="modal-header">
+        <h3 id="modal-title">New Mission</h3>
+        <button class="modal-close" id="modal-close">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-group">
+          <label>Summary</label>
+          <input type="text" id="form-summary" placeholder="What needs to happen?">
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Type</label>
+            <select id="form-type">
+              <option value="task">Task</option>
+              <option value="reminder">Reminder</option>
+              <option value="ritual">Ritual</option>
+              <option value="deadline">Deadline</option>
+              <option value="decision">Decision</option>
+              <option value="person">Person</option>
+            </select>
+          </div>
+          <div class="form-group">
+            <label>Priority</label>
+            <select id="form-priority">
+              <option value="medium">Medium</option>
+              <option value="high">High</option>
+              <option value="low">Low</option>
+            </select>
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Detail</label>
+          <textarea id="form-detail" rows="3" placeholder="Additional context..."></textarea>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Recurrence (cron)</label>
+            <input type="text" id="form-recurrence" placeholder="0 9 * * 1-5">
+          </div>
+          <div class="form-group">
+            <label>Next Run</label>
+            <input type="datetime-local" id="form-next-run">
+          </div>
+        </div>
+        <div class="form-group">
+          <label>Prompt / Command</label>
+          <textarea id="form-prompt" rows="3" placeholder="Command to execute..."></textarea>
+        </div>
+        <div class="form-row">
+          <div class="form-group">
+            <label>Project</label>
+            <input type="text" id="form-project" placeholder="/path/to/project">
+          </div>
+          <div class="form-group">
+            <label>Notify Type</label>
+            <select id="form-notify-type">
+              <option value="sound">Sound</option>
+              <option value="silent">Silent</option>
+              <option value="sticky">Sticky</option>
+              <option value="nuclear">Nuclear</option>
+              <option value="supernova">Supernova</option>
+            </select>
+          </div>
+        </div>
+      </div>
+      <div class="modal-footer">
+        <button class="btn btn-ghost" id="modal-cancel">Cancel</button>
+        <button class="btn btn-primary" id="modal-save">Save Mission</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
