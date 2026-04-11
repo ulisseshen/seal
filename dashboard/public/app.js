@@ -83,6 +83,7 @@ document.querySelectorAll('.sidebar-item').forEach(tab => {
     else stopEventsPolling();
     if (tabName === 'patterns') loadPatterns();
     if (tabName === 'proposals') loadProposals();
+    if (tabName === 'skills') loadSkills();
   });
 });
 
@@ -1366,6 +1367,93 @@ document.getElementById('btn-draft-proposals')?.addEventListener('click', async 
     btn.textContent = 'Draft now';
   }
 });
+
+// --- Skills (v0.6.0 "SEAL remembers") ---
+
+async function loadSkills() {
+  const list = document.getElementById('skills-list');
+  if (!list) return;
+  list.innerHTML = '<div class="empty-state"><p>Loading…</p></div>';
+  try {
+    const res = await fetch(`${API}/api/skills`);
+    const rows = await res.json();
+    if (!Array.isArray(rows) || rows.length === 0) {
+      list.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-state-icon">&#x1F31F;</div>
+          <h3>No skills yet</h3>
+          <p>Approve a proposal with <strong>Approve + save</strong> or <strong>Modify</strong> to create your first skill.</p>
+        </div>`;
+      return;
+    }
+
+    list.innerHTML = rows.map((s) => {
+      const params = Array.isArray(s.parameters) ? s.parameters : [];
+      const paramInputs = params.map((p, i) => `
+        <input type="text" class="skill-arg" data-skill="${escapeHtml(s.name)}" data-index="${i}"
+               placeholder="${escapeHtml(p.name || ('arg ' + (i+1)))}${p.example ? ' (e.g. ' + escapeHtml(p.example) + ')' : ''}">
+      `).join('');
+      return `
+        <div class="skill-card" data-skill-id="${escapeHtml(s.id)}">
+          <div class="skill-header">
+            <h3>${escapeHtml(s.name)}</h3>
+            <span class="skill-state skill-state-${s.state}">${s.state}</span>
+            <span class="skill-stats">${s.run_count} runs · ${s.success_count} ok · ${s.failure_count} fail</span>
+          </div>
+          <p class="skill-description">${escapeHtml(s.description || '')}</p>
+          <div class="skill-run-row">
+            ${paramInputs}
+            <button class="btn btn-primary btn-sm" data-skill-run="${escapeHtml(s.name)}">Run</button>
+          </div>
+          <pre class="skill-output" data-skill-output="${escapeHtml(s.name)}" hidden></pre>
+        </div>
+      `;
+    }).join('');
+
+    list.querySelectorAll('[data-skill-run]').forEach((btn) => {
+      btn.addEventListener('click', onSkillRun);
+    });
+  } catch (err) {
+    list.innerHTML = `<div class="empty-state"><p>Failed to load skills: ${err.message}</p></div>`;
+  }
+}
+
+async function onSkillRun(e) {
+  const btn = e.currentTarget;
+  const name = btn.dataset.skillRun;
+  const card = btn.closest('.skill-card');
+  const args = Array.from(card.querySelectorAll('.skill-arg')).map((i) => i.value).filter((v) => v.length > 0);
+  const output = card.querySelector(`[data-skill-output="${name}"]`);
+
+  btn.disabled = true;
+  btn.textContent = 'Running…';
+  output.hidden = false;
+  output.textContent = '→ invoking…\n';
+
+  try {
+    const res = await fetch(`${API}/api/skills/${encodeURIComponent(name)}/run`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ args }),
+    });
+    const result = await res.json();
+    if (!res.ok) {
+      output.textContent = '⚠ ' + (result.error || `HTTP ${res.status}`);
+      return;
+    }
+    const pieces = [];
+    if (result.stdout) pieces.push(result.stdout);
+    if (result.stderr) pieces.push('--- stderr ---\n' + result.stderr);
+    pieces.push(`\n(exit ${result.exit_code}, ${result.duration_ms}ms)`);
+    output.textContent = pieces.join('\n');
+  } catch (err) {
+    output.textContent = '⚠ ' + err.message;
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Run';
+    loadSkills();
+  }
+}
 
 // --- Init ---
 

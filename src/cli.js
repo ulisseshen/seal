@@ -15,6 +15,7 @@ import { join } from 'path';
 import { spawnSync } from 'child_process';
 import { createInterface } from 'readline';
 import { setSecret, getSecret, delSecret, hasSecret, backend } from './secrets.js';
+import { listSkills, runSkill, getSkillByName } from './brain/skills.js';
 
 const SEAL_DIR = process.env.SEAL_DIR || join(process.env.HOME, '.config', 'seal');
 const CHAT_CONFIG = join(SEAL_DIR, 'chat-config.json');
@@ -327,8 +328,9 @@ async function cmdInteractive() {
 
 function help() {
   console.log(`
-${C.bold('SEAL setup')}
+${C.bold('SEAL')}
 
+  ${C.bold('Setup')}
   seal setup                             interactive menu
   seal setup status                      show configured providers/channels
   seal setup provider <name>             interactive token / select default
@@ -338,8 +340,48 @@ ${C.bold('SEAL setup')}
   seal setup channel <name> --set key=value
   seal setup channel <name> --disable
 
-${C.dim('Providers: claude, codex, gemini')}
+  ${C.bold('Skills (v0.6.0 "SEAL remembers")')}
+  seal skills                            list installed skills
+  seal run <name> [args...]              invoke a skill
+
+${C.dim('Providers: claude, codex, gemini, openai, ollama')}
 `);
+}
+
+async function cmdSkills() {
+  const rows = await listSkills({});
+  if (rows.length === 0) {
+    console.log(C.dim('  (no skills yet — approve a proposal in the dashboard to create one)'));
+    return;
+  }
+  console.log();
+  console.log(C.bold('  Skills'));
+  for (const s of rows) {
+    const stats = `${s.run_count} runs (${s.success_count} ok, ${s.failure_count} fail)`;
+    const last = s.last_run_at ? ` · last ${s.last_run_at.slice(0, 10)}` : '';
+    console.log(`    ${C.cyan(s.name.padEnd(28))} ${C.dim(s.state.padEnd(8))} ${stats}${last}`);
+    if (s.description) console.log(`      ${C.dim(s.description.slice(0, 100))}`);
+  }
+  console.log();
+}
+
+async function cmdRun(args) {
+  const [name, ...rest] = args;
+  if (!name) {
+    console.error(C.red('Usage: seal run <name> [args...]'));
+    process.exit(1);
+  }
+  const skill = await getSkillByName(name);
+  if (!skill) {
+    console.error(C.red(`skill not found: ${name}`));
+    process.exit(1);
+  }
+  console.log(C.cyan(`→ running ${skill.name}…`));
+  const result = await runSkill(name, rest);
+  if (result.stdout) process.stdout.write(result.stdout);
+  if (result.stderr) process.stderr.write(result.stderr);
+  console.log(C.dim(`  (exit ${result.exit_code}, ${result.duration_ms}ms)`));
+  process.exit(result.exit_code === 0 ? 0 : 1);
 }
 
 // --- entrypoint ---
@@ -359,6 +401,9 @@ async function main() {
     help();
     process.exit(1);
   }
+
+  if (cmd === 'skills') return cmdSkills();
+  if (cmd === 'run')    return cmdRun([sub, ...rest].filter(Boolean));
 
   if (cmd === 'help' || cmd === '-h' || cmd === '--help') { help(); return; }
 

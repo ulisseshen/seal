@@ -35,6 +35,7 @@ import {
   getPattern,
 } from '../db.js';
 import { getProvider } from '../providers/index.js';
+import { createSkillFromProposal } from './skills.js';
 
 const CONFIDENCE_THRESHOLD = 0.75;       // §3.2.3
 const EVIDENCE_THRESHOLD = 3;            // §3.2.3
@@ -148,12 +149,29 @@ export async function applyDecision(proposalId, decision, { finalScript = null, 
   }
   await setPatternState(proposal.pattern_id, newPatternState);
 
+  // v0.6.0 handoff: approved_saved/modified creates a durable skill.
+  let skill = null;
+  if (decision === 'approved_saved' || decision === 'modified') {
+    try {
+      skill = await createSkillFromProposal(
+        { ...proposal, script: effectiveScript },
+        { finalScript: decision === 'modified' ? effectiveScript : null },
+      );
+      // Once a pattern has a skill, it's "active" — the skill IS the
+      // materialized automation. Flip the pattern state forward.
+      await setPatternState(proposal.pattern_id, 'active');
+      newPatternState = 'active';
+    } catch (err) {
+      console.warn(`[brain] skill factory failed for proposal ${proposalId}:`, err.message);
+    }
+  }
+
   return {
     proposal_id: proposalId,
     decision,
     pattern_state: newPatternState,
     script: effectiveScript,
-    saves_skill: decision === 'approved_saved' || decision === 'modified',
+    skill,
   };
 }
 
