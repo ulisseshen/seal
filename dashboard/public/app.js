@@ -445,10 +445,12 @@ async function testChannel(channel) {
 
 // --- Chat ---
 
+const CHAT_SESSION = 'default';
 const chatHistory = [];
 let currentProvider = null;
 let currentModel = null;
 let chatBusy = false;
+let chatHistoryLoaded = false;
 
 async function loadChatConfig() {
   try {
@@ -475,6 +477,34 @@ async function loadChatConfig() {
     document.getElementById('chat-secrets-backend').textContent = config.secrets_backend || '';
   } catch (err) {
     console.error('Failed to load chat config:', err);
+  }
+
+  if (!chatHistoryLoaded) await loadChatHistory();
+}
+
+async function loadChatHistory() {
+  try {
+    const res = await fetch(`${API}/api/chat/history?session_id=${CHAT_SESSION}&limit=100`);
+    if (!res.ok) return;
+    const rows = await res.json();
+    chatHistory.length = 0;
+    const container = document.getElementById('chat-messages');
+    container.querySelectorAll('.chat-message, .chat-welcome').forEach((el) => el.remove());
+    for (const row of rows) {
+      if (row.role !== 'user' && row.role !== 'assistant') continue;
+      chatHistory.push({ role: row.role, content: row.content });
+      const bubble = addChatMessage('', row.role === 'user' ? 'user' : 'ai');
+      renderMarkdownInto(bubble, row.content);
+    }
+    if (rows.length === 0) {
+      const welcome = document.createElement('div');
+      welcome.className = 'chat-welcome';
+      welcome.innerHTML = '<div class="chat-welcome-icon"><img class="sidebar-logo-img" src="seal-logo.png" alt="SEAL" width="64" height="64"></div><h3>SEAL Chat</h3><p>Talk to your autonomous assistant. Configure the AI model below to get started.</p>';
+      container.appendChild(welcome);
+    }
+    chatHistoryLoaded = true;
+  } catch (err) {
+    console.error('Failed to load chat history:', err);
   }
 }
 
@@ -504,10 +534,54 @@ function addChatMessage(text, role) {
 
   const msg = document.createElement('div');
   msg.className = `chat-message ${role}`;
-  msg.textContent = text;
+  if (text) msg.textContent = text;
   container.appendChild(msg);
   container.scrollTop = container.scrollHeight;
   return msg;
+}
+
+// Minimal markdown renderer — fenced code blocks, inline code, bold, italic,
+// bullet lists, line breaks. Escapes HTML first so nothing lands in innerHTML
+// raw. Good enough for LLM chat output; not a general-purpose md library.
+function renderMarkdownInto(el, raw) {
+  if (!raw) { el.textContent = ''; return; }
+  const escape = (s) => s
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+
+  // 1. Extract fenced code blocks first so inline rules don't touch them.
+  const blocks = [];
+  let text = raw.replace(/```(\w*)\n([\s\S]*?)```/g, (_m, lang, body) => {
+    const idx = blocks.length;
+    blocks.push(`<pre><code${lang ? ` data-lang="${escape(lang)}"` : ''}>${escape(body)}</code></pre>`);
+    return `\u0000CB${idx}\u0000`;
+  });
+
+  // 2. Escape remaining text.
+  text = escape(text);
+
+  // 3. Inline rules.
+  text = text
+    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*\n]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/(^|[^*])\*([^*\n]+)\*/g, '$1<em>$2</em>');
+
+  // 4. Bullet lists: group consecutive "- " lines.
+  text = text.replace(/(^|\n)((?:- [^\n]+\n?)+)/g, (_m, lead, block) => {
+    const items = block.trim().split('\n').map((l) => `<li>${l.replace(/^- /, '')}</li>`).join('');
+    return `${lead}<ul>${items}</ul>`;
+  });
+
+  // 5. Line breaks.
+  text = text.replace(/\n/g, '<br>');
+
+  // 6. Re-inject code blocks.
+  text = text.replace(/\u0000CB(\d+)\u0000(<br>)?/g, (_m, i) => blocks[+i]);
+
+  el.innerHTML = text;
 }
 
 document.getElementById('btn-send').addEventListener('click', sendChat);
@@ -522,7 +596,8 @@ async function sendChat() {
   if (!text) return;
 
   chatHistory.push({ role: 'user', content: text });
-  addChatMessage(text, 'user');
+  const userBubble = addChatMessage('', 'user');
+  renderMarkdownInto(userBubble, text);
   input.value = '';
 
   const assistantEl = addChatMessage('', 'ai');
@@ -542,6 +617,7 @@ async function sendChat() {
         model,
         system_prompt: systemPrompt,
         messages: chatHistory,
+        session_id: CHAT_SESSION,
       }),
     });
 
@@ -595,6 +671,7 @@ async function sendChat() {
       assistantEl.textContent = `⚠ ${hadError}`;
       chatHistory.pop();
     } else {
+      renderMarkdownInto(assistantEl, accumulated);
       chatHistory.push({ role: 'assistant', content: accumulated });
     }
   } catch (err) {
