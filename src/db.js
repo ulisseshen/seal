@@ -4,10 +4,11 @@ import path from 'path';
 import os from 'os';
 import fs from 'fs';
 
-const DB_DIR = path.join(os.homedir(), '.config', 'seal');
+// Allow test isolation / custom DB location via SEAL_DB_PATH.
+// Production default: ~/.config/seal/tasks.db
+const DB_PATH = process.env.SEAL_DB_PATH || path.join(os.homedir(), '.config', 'seal', 'tasks.db');
+const DB_DIR = path.dirname(DB_PATH);
 fs.mkdirSync(DB_DIR, { recursive: true });
-
-const DB_PATH = path.join(DB_DIR, 'tasks.db');
 
 // ─── Mode detection ─────────────────────────────────────
 // Default: local SQLite (zero setup)
@@ -131,6 +132,35 @@ await db.exec(`
     FOREIGN KEY (task_id) REFERENCES tasks(id)
   );
   CREATE INDEX IF NOT EXISTS idx_task_runs_task_id ON task_runs(task_id, started_at);
+`);
+
+// ─── v0.3.0 "Eye" tables ────────────────────────────────
+// events: mechanical observations from observers (git, calendar, telegram, ...)
+// watched_repos: repos SEAL is observing for git activity
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    source TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    timestamp TEXT NOT NULL,
+    data TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_events_source_kind ON events(source, kind);
+  CREATE INDEX IF NOT EXISTS idx_events_timestamp ON events(timestamp);
+`);
+
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS watched_repos (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT UNIQUE NOT NULL,
+    name TEXT NOT NULL,
+    installed_at TEXT NOT NULL,
+    hooks_installed INTEGER NOT NULL DEFAULT 0,
+    fallback_scraper INTEGER NOT NULL DEFAULT 0,
+    last_scraped_at TEXT,
+    removed_at TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_watched_repos_active ON watched_repos(removed_at);
 `);
 
 // ─── Public API (all async) ─────────────────────────────
@@ -276,6 +306,137 @@ export async function approveTask(id) {
     UPDATE tasks SET status = 'pending', approved_at = datetime('now')
     WHERE id = ?
   `, [id]);
+}
+
+// ─── v0.3.0: events (Eye layer) ─────────────────────────
+// Mechanical observation log. Inserts are fire-and-forget — observers
+// (Stream B) call insertEvent without awaiting the result. A DB write
+// failure must NEVER bubble up and crash an observer.
+
+export async function insertEvent({ source, kind, timestamp, data }) {
+  try {
+    if (!source || !kind) {
+      console.error('[db] insertEvent: source and kind are required');
+      return null;
+    }
+    let payload;
+    try {
+      payload = JSON.stringify(data ?? {});
+    } catch (err) {
+      console.error('[db] insertEvent: failed to serialize data —', err.message);
+      return null;
+    }
+    const ts = timestamp || new Date().toISOString();
+    const res = await db.run(`
+      INSERT INTO events (source, kind, timestamp, data)
+      VALUES (?, ?, ?, ?)
+    `, [source, kind, ts, payload]);
+    return res?.lastInsertRowid ?? res?.lastInsertRowId ?? null;
+  } catch (err) {
+    console.error('[db] insertEvent failed —', err.message);
+    return null;
+  }
+}
+
+export async function queryEvents({ source, kind, since, until, limit } = {}) {
+  const clauses = [];
+  const params = [];
+  if (source) { clauses.push(`source = ?`); params.push(source); }
+  if (kind)   { clauses.push(`kind = ?`);   params.push(kind); }
+  if (since)  { clauses.push(`timestamp >= ?`); params.push(since); }
+  if (until)  { clauses.push(`timestamp <= ?`); params.push(until); }
+  const where = clauses.length ? `WHERE ${clauses.join(' AND ')}` : '';
+  const clamped = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 1000);
+  const rows = await db.all(`
+    SELECT id, source, kind, timestamp, data FROM events
+    ${where}
+    ORDER BY timestamp DESC
+    LIMIT ?
+  `, [...params, clamped]);
+  return (rows || []).map(r => {
+    let parsed = null;
+    try { parsed = JSON.parse(r.data); } catch { parsed = null; }
+    return { ...r, data: parsed };
+  });
+}
+
+// ─── v0.3.0: watched_repos ──────────────────────────────
+// Repos SEAL is actively observing. Soft-delete (removed_at) preserves
+// historical event references after a repo is removed.
+
+export async function addWatchedRepo({ path: repoPath, name, hooksInstalled = false, fallbackScraper = false }) {
+  if (!repoPath || typeof repoPath !== 'string') {
+    throw new Error('addWatchedRepo: path is required');
+  }
+  if (!path.isAbsolute(repoPath)) {
+    throw new Error(`addWatchedRepo: path must be absolute, got "${repoPath}"`);
+  }
+  const displayName = name || path.basename(repoPath);
+  const now = new Date().toISOString();
+  const hooksFlag = hooksInstalled ? 1 : 0;
+  const scraperFlag = fallbackScraper ? 1 : 0;
+
+  const existing = await db.get(`SELECT * FROM watched_repos WHERE path = ?`, [repoPath]);
+
+  if (existing) {
+    if (existing.removed_at != null) {
+      // Un-delete: clear removed_at, refresh installed_at and flags.
+      await db.run(`
+        UPDATE watched_repos
+        SET removed_at = NULL,
+            installed_at = ?,
+            name = ?,
+            hooks_installed = ?,
+            fallback_scraper = ?
+        WHERE path = ?
+      `, [now, displayName, hooksFlag, scraperFlag, repoPath]);
+    } else {
+      // Active row — just update flags (and name if provided).
+      await db.run(`
+        UPDATE watched_repos
+        SET name = ?,
+            hooks_installed = ?,
+            fallback_scraper = ?
+        WHERE path = ?
+      `, [displayName, hooksFlag, scraperFlag, repoPath]);
+    }
+  } else {
+    await db.run(`
+      INSERT INTO watched_repos (path, name, installed_at, hooks_installed, fallback_scraper)
+      VALUES (?, ?, ?, ?, ?)
+    `, [repoPath, displayName, now, hooksFlag, scraperFlag]);
+  }
+
+  return db.get(`SELECT * FROM watched_repos WHERE path = ?`, [repoPath]);
+}
+
+export async function removeWatchedRepo(repoPath) {
+  if (!repoPath) return false;
+  const now = new Date().toISOString();
+  const res = await db.run(`
+    UPDATE watched_repos SET removed_at = ?
+    WHERE path = ? AND removed_at IS NULL
+  `, [now, repoPath]);
+  // better-sqlite3 → res.changes; libsql → res.rowsAffected
+  const changes = res?.changes ?? res?.rowsAffected ?? 0;
+  return changes > 0;
+}
+
+export async function listWatchedRepos({ includeRemoved = false } = {}) {
+  if (includeRemoved) {
+    return db.all(`SELECT * FROM watched_repos ORDER BY installed_at DESC`);
+  }
+  return db.all(`
+    SELECT * FROM watched_repos
+    WHERE removed_at IS NULL
+    ORDER BY installed_at DESC
+  `);
+}
+
+export async function getWatchedRepoByPath(repoPath) {
+  if (!repoPath) return null;
+  const row = await db.get(`SELECT * FROM watched_repos WHERE path = ?`, [repoPath]);
+  return row || null;
 }
 
 export { db, DB_PATH };

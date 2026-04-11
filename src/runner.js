@@ -23,6 +23,9 @@ import { runAzurePrReview } from './sensors/azure-pr-review.js';
 import { ensurePalace } from './memory.js';
 import { isRtkAvailable, getStats as getRtkStats } from './rtk.js';
 import { loadFlows } from './flows/engine.js';
+import { eventBus } from './event-bus.js';
+import { GitObserver } from './observers/git.js';
+import { setGitIngester } from './web.js';
 
 const POLL_INTERVAL = 30_000;       // Check tasks every 30 seconds
 const SUPERNOVA_INTERVAL = 60_000;  // Check supernova re-fires every 60 seconds
@@ -44,7 +47,8 @@ function emailLabel() {
 
 console.log(`
 ╔═══════════════════════════════════════╗
-║   SEAL v0.2.0                         ║
+║   SEAL v0.3.0                         ║
+║   SEAL sees. The Eye is open.         ║
 ║   Discipline. Execution. No excuses.  ║
 ╚═══════════════════════════════════════╝
 `);
@@ -77,6 +81,37 @@ const flows = loadFlows(new URL('../flows', import.meta.url).pathname);
 console.log(`[seal] Memory: MemPalace (prefetch/sync enabled)`);
 console.log(`[seal] Tokens: RTK ${rtkEnabled ? 'enabled (60-90% compression)' : 'not installed'}`);
 console.log(`[seal] Flows: ${Object.keys(flows).length} loaded (${Object.keys(flows).join(', ') || 'none'})`);
+
+// ─── Observers (v0.3.0 — the Eye) ───────────────────────
+const gitObserver = new GitObserver(eventBus);
+setGitIngester((payload) => gitObserver.ingestHookPayload(payload));
+try {
+  await gitObserver.start();
+  console.log(`[seal] Observer: git (hook endpoint → POST /api/observe/git, drain 30s, scraper 300s)`);
+} catch (err) {
+  console.warn('[seal] GitObserver failed to start:', err.message);
+}
+
+// ─── Event retention (daily purge of events older than 90 days) ─
+async function runEventRetention() {
+  try {
+    const result = await db.run(
+      `DELETE FROM events WHERE timestamp < datetime('now', '-90 days')`,
+      []
+    );
+    // better-sqlite3 exposes .changes; libsql exposes .rowsAffected.
+    const purged = result?.changes ?? result?.rowsAffected ?? 0;
+    if (purged > 0) {
+      console.log(`[seal] Event retention: purged ${purged} events older than 90 days`);
+    }
+  } catch (err) {
+    console.warn('[seal] Event retention error:', err.message);
+  }
+}
+const RETENTION_INTERVAL_MS = 24 * 60 * 60 * 1000; // daily
+setInterval(runEventRetention, RETENTION_INTERVAL_MS);
+// First run shortly after startup so it doesn't block init.
+setTimeout(runEventRetention, 60_000);
 
 console.log(`[seal] Standing by...`);
 

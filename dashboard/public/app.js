@@ -77,6 +77,10 @@ document.querySelectorAll('.sidebar-item').forEach(tab => {
     if (tabName === 'logs') loadLogs();
     if (tabName === 'calendar') loadCalendar();
     if (tabName === 'chat') loadChatConfig();
+    if (tabName === 'workspaces') startWorkspacesTab();
+    else stopWorkspacesPolling();
+    if (tabName === 'events') startEventsTab();
+    else stopEventsPolling();
   });
 });
 
@@ -641,6 +645,334 @@ function matchesCronDay(cron, dayOfWeek) {
   }
   return false;
 }
+
+// --- Workspaces (v0.3.0 "Eye" layer) ---
+
+let workspacesPollTimer = null;
+let workspaceScanResults = [];
+
+function startWorkspacesTab() {
+  loadWorkspaces();
+  stopWorkspacesPolling();
+  workspacesPollTimer = setInterval(loadWorkspaces, 10000);
+}
+
+function stopWorkspacesPolling() {
+  if (workspacesPollTimer) {
+    clearInterval(workspacesPollTimer);
+    workspacesPollTimer = null;
+  }
+}
+
+async function loadWorkspaces() {
+  const list = document.getElementById('workspaces-list');
+  if (!list) return;
+  try {
+    const res = await fetch(`${API}/api/workspaces`);
+    const repos = await res.json();
+    renderWorkspaces(repos);
+  } catch (err) {
+    list.innerHTML = `<div class="empty-state">
+      <div class="empty-state-icon">&#x26A0;</div>
+      <h3>Could not load workspaces</h3>
+      <p>${escapeHtml(err.message)}</p>
+    </div>`;
+  }
+}
+
+function renderWorkspaces(repos) {
+  const list = document.getElementById('workspaces-list');
+  if (!Array.isArray(repos) || repos.length === 0) {
+    list.innerHTML = `<div class="empty-state">
+      <div class="empty-state-icon">&#x1F4C1;</div>
+      <h3>No workspaces watched yet</h3>
+      <p>Click "Add workspace" above to scan a parent folder for git repositories.</p>
+    </div>`;
+    return;
+  }
+
+  list.innerHTML = `
+    <table class="workspaces-table">
+      <thead>
+        <tr>
+          <th>Name</th>
+          <th>Path</th>
+          <th>Installed</th>
+          <th>Hook status</th>
+          <th></th>
+        </tr>
+      </thead>
+      <tbody>
+        ${repos.map(r => {
+          const installed = r.installed_at ? new Date(r.installed_at).toLocaleString() : '—';
+          const hooksOk = r.hooks_installed && r.has_seal_hooks;
+          const statusLabel = hooksOk ? 'installed' : (r.fallback_scraper ? 'fallback only' : 'missing');
+          const statusClass = hooksOk ? 'ok' : (r.fallback_scraper ? 'warn' : 'err');
+          return `
+            <tr>
+              <td><strong>${escapeHtml(r.name)}</strong></td>
+              <td class="ws-path" title="${escapeHtml(r.path)}">${escapeHtml(r.path)}</td>
+              <td>${escapeHtml(installed)}</td>
+              <td><span class="ws-hook-badge ${statusClass}">${statusLabel}</span></td>
+              <td class="ws-actions">
+                <button class="btn btn-danger btn-sm" onclick="removeWorkspace(${r.id})">Remove</button>
+              </td>
+            </tr>
+          `;
+        }).join('')}
+      </tbody>
+    </table>
+  `;
+}
+
+async function removeWorkspace(id) {
+  if (!confirm('Stop watching this workspace? SEAL will uninstall its git hooks (and restore any backup).')) return;
+  try {
+    const res = await fetch(`${API}/api/workspaces/${id}`, { method: 'DELETE' });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `HTTP ${res.status}`);
+    }
+    loadWorkspaces();
+  } catch (err) {
+    alert(`Failed to remove workspace: ${err.message}`);
+  }
+}
+
+// Add panel toggle
+let pickedParentPath = null;
+
+document.getElementById('btn-add-workspace')?.addEventListener('click', () => {
+  const panel = document.getElementById('workspace-add-panel');
+  panel.hidden = !panel.hidden;
+});
+
+document.getElementById('btn-cancel-add-workspace')?.addEventListener('click', () => {
+  document.getElementById('workspace-add-panel').hidden = true;
+  document.getElementById('workspace-scan-results').innerHTML = '';
+  document.getElementById('workspace-scan-actions').hidden = true;
+  document.getElementById('workspace-scan-status').textContent = '';
+  document.getElementById('workspace-picked-path').hidden = true;
+  document.getElementById('workspace-picked-path').textContent = '';
+  pickedParentPath = null;
+  workspaceScanResults = [];
+});
+
+document.getElementById('btn-pick-folder')?.addEventListener('click', async () => {
+  const statusEl = document.getElementById('workspace-scan-status');
+  const pickedEl = document.getElementById('workspace-picked-path');
+  try {
+    const res = await fetch(`${API}/api/pick-folder`, { method: 'POST' });
+    const data = await res.json();
+    if (data.cancelled) return;
+    if (!res.ok || !data.path) throw new Error(data.error || 'pick failed');
+    pickedParentPath = data.path;
+    pickedEl.textContent = data.path;
+    pickedEl.hidden = false;
+    await scanWorkspaces(data.path);
+  } catch (err) {
+    statusEl.textContent = `Picker failed: ${err.message}`;
+  }
+});
+
+async function scanWorkspaces(parentPath) {
+  if (!parentPath) return;
+  const resultsEl = document.getElementById('workspace-scan-results');
+  const actionsEl = document.getElementById('workspace-scan-actions');
+  const statusEl = document.getElementById('workspace-scan-status');
+  resultsEl.innerHTML = '<div class="ws-scan-loading">Scanning…</div>';
+  statusEl.textContent = '';
+  actionsEl.hidden = true;
+
+  try {
+    const res = await fetch(`${API}/api/workspaces/scan`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ parent_path: parentPath }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      throw new Error(err.error || `HTTP ${res.status}`);
+    }
+    const data = await res.json();
+    workspaceScanResults = data.repos || [];
+    if (workspaceScanResults.length === 0) {
+      resultsEl.innerHTML = `<div class="ws-scan-empty">No git repositories found directly under <code>${escapeHtml(parentPath)}</code>.</div>`;
+      return;
+    }
+    resultsEl.innerHTML = workspaceScanResults.map((r, i) => `
+      <label class="ws-scan-row${r.already_watched ? ' watching' : ''}">
+        <input type="checkbox" data-idx="${i}" ${r.already_watched ? 'disabled' : ''}>
+        <span class="ws-scan-name">${escapeHtml(r.name)}</span>
+        <span class="ws-scan-path">${escapeHtml(r.path)}</span>
+        ${r.already_watched ? '<span class="ws-scan-tag">watching</span>' : ''}
+      </label>
+    `).join('');
+    actionsEl.hidden = false;
+  } catch (err) {
+    resultsEl.innerHTML = `<div class="ws-scan-error">Scan failed: ${escapeHtml(err.message)}</div>`;
+  }
+}
+
+document.getElementById('btn-watch-selected')?.addEventListener('click', async () => {
+  const checked = document.querySelectorAll('#workspace-scan-results input[type=checkbox]:checked');
+  const paths = Array.from(checked).map(cb => workspaceScanResults[parseInt(cb.dataset.idx, 10)].path);
+  if (paths.length === 0) return;
+  const statusEl = document.getElementById('workspace-scan-status');
+  statusEl.textContent = `Installing hooks in ${paths.length} repo(s)…`;
+  try {
+    const res = await fetch(`${API}/api/workspaces/bulk`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ paths }),
+    });
+    const data = await res.json();
+    const ok = (data.added || []).length;
+    const failed = (data.failed || []).length;
+    statusEl.textContent = `Added ${ok}${failed ? `, ${failed} failed` : ''}.`;
+    if (failed > 0) {
+      const lines = data.failed.map(f => `${f.path}: ${f.error}`).join('\n');
+      console.warn('[workspaces] failed:', lines);
+    }
+    loadWorkspaces();
+  } catch (err) {
+    statusEl.textContent = `Bulk install failed: ${err.message}`;
+  }
+});
+
+// --- Events (v0.3.0 "Eye" layer) ---
+
+let eventsPollTimer = null;
+let lastEventsPayload = [];
+
+function startEventsTab() {
+  loadEvents();
+  stopEventsPolling();
+  eventsPollTimer = setInterval(loadEvents, 5000);
+}
+
+function stopEventsPolling() {
+  if (eventsPollTimer) {
+    clearInterval(eventsPollTimer);
+    eventsPollTimer = null;
+  }
+}
+
+async function loadEvents() {
+  const list = document.getElementById('events-list');
+  if (!list) return;
+  const params = new URLSearchParams();
+  const source = document.getElementById('events-source').value;
+  const kind = document.getElementById('events-kind').value;
+  const since = document.getElementById('events-since').value;
+  const limit = document.getElementById('events-limit').value || '100';
+  if (source) params.set('source', source);
+  if (kind) params.set('kind', kind);
+  if (since) params.set('since', new Date(since).toISOString());
+  params.set('limit', limit);
+
+  try {
+    const res = await fetch(`${API}/api/events?${params.toString()}`);
+    const events = await res.json();
+    lastEventsPayload = events;
+    refreshEventDropdowns(events);
+    renderEvents(events);
+  } catch (err) {
+    list.innerHTML = `<div class="empty-state">
+      <div class="empty-state-icon">&#x26A0;</div>
+      <h3>Could not load events</h3>
+      <p>${escapeHtml(err.message)}</p>
+    </div>`;
+  }
+}
+
+function refreshEventDropdowns(events) {
+  const sourceSel = document.getElementById('events-source');
+  const kindSel = document.getElementById('events-kind');
+  const currentSource = sourceSel.value;
+  const currentKind = kindSel.value;
+
+  const sources = Array.from(new Set(events.map(e => e.source))).sort();
+  sourceSel.innerHTML = '<option value="">All</option>' +
+    sources.map(s => `<option value="${escapeHtml(s)}"${s === currentSource ? ' selected' : ''}>${escapeHtml(s)}</option>`).join('');
+
+  // Kinds cascade from selected source.
+  const filteredForKinds = currentSource ? events.filter(e => e.source === currentSource) : events;
+  const kinds = Array.from(new Set(filteredForKinds.map(e => e.kind))).sort();
+  kindSel.innerHTML = '<option value="">All</option>' +
+    kinds.map(k => `<option value="${escapeHtml(k)}"${k === currentKind ? ' selected' : ''}>${escapeHtml(k)}</option>`).join('');
+}
+
+function renderEvents(events) {
+  const list = document.getElementById('events-list');
+  const search = document.getElementById('events-search').value.toLowerCase().trim();
+
+  let filtered = events;
+  if (search) {
+    filtered = filtered.filter(e => {
+      try {
+        return JSON.stringify(e.data).toLowerCase().includes(search);
+      } catch {
+        return false;
+      }
+    });
+  }
+
+  if (filtered.length === 0) {
+    list.innerHTML = `<div class="empty-state">
+      <div class="empty-state-icon">&#x1F441;</div>
+      <h3>No events yet</h3>
+      <p>Events will appear here as SEAL observers (git, calendar, ...) emit them.</p>
+    </div>`;
+    return;
+  }
+
+  list.innerHTML = `
+    <table class="events-table">
+      <thead>
+        <tr>
+          <th>Timestamp</th>
+          <th>Source</th>
+          <th>Kind</th>
+          <th>Data</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${filtered.map(e => {
+          let summary = '';
+          let full = '';
+          try {
+            full = JSON.stringify(e.data, null, 2);
+            const oneLine = JSON.stringify(e.data);
+            summary = oneLine && oneLine.length > 80 ? oneLine.slice(0, 80) + '…' : (oneLine || '');
+          } catch {
+            full = String(e.data);
+            summary = full.slice(0, 80);
+          }
+          const ts = e.timestamp ? new Date(e.timestamp).toLocaleString() : '';
+          return `
+            <tr class="event-row" onclick="this.classList.toggle('expanded')">
+              <td class="event-ts">${escapeHtml(ts)}</td>
+              <td><span class="event-source">${escapeHtml(e.source)}</span></td>
+              <td><span class="event-kind">${escapeHtml(e.kind)}</span></td>
+              <td>
+                <span class="event-summary">${escapeHtml(summary)}</span>
+                <pre class="event-full">${escapeHtml(full)}</pre>
+              </td>
+            </tr>
+          `;
+        }).join('')}
+      </tbody>
+    </table>
+  `;
+}
+
+// Filter wiring (re-render from cached payload, no extra fetch).
+document.getElementById('events-search')?.addEventListener('input', () => renderEvents(lastEventsPayload));
+document.getElementById('events-source')?.addEventListener('change', () => loadEvents());
+document.getElementById('events-kind')?.addEventListener('change', () => renderEvents(lastEventsPayload));
+document.getElementById('events-since')?.addEventListener('change', () => loadEvents());
+document.getElementById('events-limit')?.addEventListener('change', () => loadEvents());
 
 // --- Init ---
 
