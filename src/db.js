@@ -223,6 +223,52 @@ await db.exec(`
   CREATE INDEX IF NOT EXISTS idx_scratch_kind ON memory_scratch(kind);
 `);
 
+// v0.5.0 "SEAL proposes" — proposals + decisions (permission gate).
+// See docs/AGENT-SYSTEM-DESIGN.md §3.3, §3.4, §6. A proposal is a
+// draft automation the Brain wrote from an observing pattern. The
+// decisions table is the audit log of every approve/deny/modify so
+// future proposals can learn from them (§3.7).
+
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS proposals (
+    id             TEXT PRIMARY KEY,
+    pattern_id     TEXT NOT NULL,
+    name           TEXT NOT NULL,
+    script         TEXT NOT NULL,
+    explanation    TEXT NOT NULL,
+    risks          TEXT NOT NULL DEFAULT '[]',
+    parameters     TEXT NOT NULL DEFAULT '[]',
+    invocation     TEXT,
+    provider       TEXT,
+    model          TEXT,
+    delivered_via  TEXT NOT NULL DEFAULT 'dashboard',
+    delivered_at   TEXT NOT NULL,
+    expires_at     TEXT NOT NULL,
+    decision       TEXT,
+    decided_at     TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_proposals_pattern ON proposals(pattern_id);
+  CREATE INDEX IF NOT EXISTS idx_proposals_pending
+    ON proposals(decided_at) WHERE decided_at IS NULL;
+  CREATE INDEX IF NOT EXISTS idx_proposals_expires ON proposals(expires_at);
+`);
+
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS decisions (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    pattern_id      TEXT NOT NULL,
+    proposal_id     TEXT NOT NULL,
+    decision        TEXT NOT NULL
+                    CHECK(decision IN ('approved_once','approved_saved','modified','denied','suppressed','expired','auto_escalated')),
+    original_script TEXT,
+    final_script    TEXT,
+    user_notes      TEXT,
+    decided_at      TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_decisions_pattern ON decisions(pattern_id);
+  CREATE INDEX IF NOT EXISTS idx_decisions_proposal ON decisions(proposal_id);
+`);
+
 // v0.4.0 "SEAL notices" — pattern detector storage.
 // See docs/AGENT-SYSTEM-DESIGN.md §3.2.2. The detector writes here,
 // the proposal engine (v0.5.0) reads from here, the dashboard renders
@@ -727,6 +773,106 @@ export async function setPatternState(id, state) {
     UPDATE patterns SET state = ?, proposed_at = COALESCE(?, proposed_at)
     WHERE id = ?
   `, [state, proposedAt, id]);
+}
+
+export async function getPattern(id) {
+  const row = await db.get(`SELECT * FROM patterns WHERE id = ?`, [id]);
+  if (!row) return null;
+  let meta = null;
+  try { meta = JSON.parse(row.metadata); } catch {}
+  return { ...row, metadata: meta };
+}
+
+// ─── Proposal queries (v0.5.0 "SEAL proposes") ──────────
+
+export async function insertProposal(p) {
+  const now = new Date().toISOString();
+  const expires = new Date(Date.now() + (p.ttl_ms ?? 7 * 24 * 60 * 60 * 1000)).toISOString();
+  return db.run(`
+    INSERT INTO proposals (id, pattern_id, name, script, explanation, risks, parameters,
+                           invocation, provider, model, delivered_via, delivered_at, expires_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `, [
+    p.id, p.pattern_id, p.name, p.script, p.explanation,
+    JSON.stringify(p.risks ?? []),
+    JSON.stringify(p.parameters ?? []),
+    p.invocation ?? null, p.provider ?? null, p.model ?? null,
+    p.delivered_via ?? 'dashboard', now, expires,
+  ]);
+}
+
+export async function listProposals({ decided, limit = 100 } = {}) {
+  let sql = `SELECT * FROM proposals`;
+  const params = [];
+  if (decided === false) sql += ` WHERE decided_at IS NULL`;
+  else if (decided === true) sql += ` WHERE decided_at IS NOT NULL`;
+  sql += ` ORDER BY delivered_at DESC LIMIT ?`;
+  params.push(Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500));
+  const rows = await db.all(sql, params);
+  return (rows || []).map((r) => ({
+    ...r,
+    risks: safeJson(r.risks, []),
+    parameters: safeJson(r.parameters, []),
+  }));
+}
+
+export async function getProposal(id) {
+  const row = await db.get(`SELECT * FROM proposals WHERE id = ?`, [id]);
+  if (!row) return null;
+  return { ...row, risks: safeJson(row.risks, []), parameters: safeJson(row.parameters, []) };
+}
+
+export async function setProposalDecision(id, decision, finalScript = null) {
+  const now = new Date().toISOString();
+  if (finalScript === null) {
+    return db.run(`
+      UPDATE proposals SET decision = ?, decided_at = ? WHERE id = ?
+    `, [decision, now, id]);
+  }
+  return db.run(`
+    UPDATE proposals SET decision = ?, decided_at = ?, script = ? WHERE id = ?
+  `, [decision, now, finalScript, id]);
+}
+
+export async function insertDecision(d) {
+  const now = new Date().toISOString();
+  return db.run(`
+    INSERT INTO decisions (pattern_id, proposal_id, decision, original_script, final_script, user_notes, decided_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `, [
+    d.pattern_id, d.proposal_id, d.decision,
+    d.original_script ?? null, d.final_script ?? null, d.user_notes ?? null, now,
+  ]);
+}
+
+export async function countProposalsCreatedSince(sinceIso) {
+  const row = await db.get(`
+    SELECT COUNT(*) as c FROM proposals WHERE delivered_at >= ?
+  `, [sinceIso]);
+  return row?.c ?? 0;
+}
+
+export async function expireOldProposals() {
+  const now = new Date().toISOString();
+  const rows = await db.all(`
+    SELECT id, pattern_id, script FROM proposals
+    WHERE decided_at IS NULL AND expires_at < ?
+  `, [now]);
+  for (const r of rows) {
+    await db.run(`UPDATE proposals SET decision = 'expired', decided_at = ? WHERE id = ?`, [now, r.id]);
+    await db.run(`
+      INSERT INTO decisions (pattern_id, proposal_id, decision, original_script, decided_at)
+      VALUES (?, ?, 'expired', ?, ?)
+    `, [r.pattern_id, r.id, r.script, now]);
+    // Pattern returns to observing so the detector can re-promote later.
+    await db.run(`UPDATE patterns SET state = 'observing' WHERE id = ?`, [r.pattern_id]);
+  }
+  return rows.length;
+}
+
+function safeJson(s, fallback) {
+  if (!s) return fallback;
+  try { return JSON.parse(s); } catch { return fallback; }
 }
 
 export { db, DB_PATH };

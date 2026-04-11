@@ -16,8 +16,11 @@ import {
   insertMemory,
   listPatterns,
   setPatternState,
+  listProposals,
+  getProposal,
 } from '../src/db.js';
 import { runDetectors } from '../src/brain/detector.js';
+import { runProposer, applyDecision } from '../src/brain/proposer.js';
 import { installSealHooks, uninstallSealHooks, hasSealHooks } from './hooks-installer.js';
 import { getProvider, listProviders } from '../src/providers/index.js';
 import { hasSecret, backend as secretsBackend } from '../src/secrets.js';
@@ -591,6 +594,54 @@ app.post('/api/patterns/scan', async (_req, res) => {
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// --- API: Proposals (v0.5.0 "SEAL proposes") ---
+
+app.get('/api/proposals', async (req, res) => {
+  const { decided, limit } = req.query;
+  try {
+    const filter = {};
+    if (decided === 'false') filter.decided = false;
+    else if (decided === 'true') filter.decided = true;
+    if (limit) filter.limit = parseInt(limit, 10) || 100;
+    const rows = await listProposals(filter);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/proposals/:id', async (req, res) => {
+  try {
+    const p = await getProposal(req.params.id);
+    if (!p) return res.status(404).json({ error: 'not found' });
+    res.json(p);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/proposals/draft', async (_req, res) => {
+  try {
+    const result = await runProposer();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/proposals/:id/decision', async (req, res) => {
+  const { decision, final_script: finalScript, user_notes: userNotes } = req.body || {};
+  try {
+    const result = await applyDecision(req.params.id, decision, {
+      finalScript: finalScript ?? null,
+      userNotes: userNotes ?? null,
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
   }
 });
 

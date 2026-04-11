@@ -57,6 +57,10 @@
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h10M4 18h6"/><circle cx="18" cy="12" r="2"/><circle cx="14" cy="18" r="2"/></svg>
           <span class="sidebar-label">Patterns</span>
         </button>
+        <button class="sidebar-item" data-tab="proposals" title="Proposals">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 01-2 2H5a2 2 0 01-2-2V5a2 2 0 012-2h11"/></svg>
+          <span class="sidebar-label">Proposals</span>
+        </button>
       </nav>
       <div class="sidebar-footer">
         <div class="sidebar-stats" id="header-stats"></div>
@@ -252,6 +256,26 @@
           No automation runs from here yet — patterns become proposals in v0.5.0.
         </p>
         <div id="patterns-list" class="patterns-list"></div>
+      </section>
+
+      <!-- Proposals (v0.5.0 "SEAL proposes") -->
+      <section class="page" id="page-proposals">
+        <div class="page-header">
+          <h2 class="page-title">Pending Proposals</h2>
+          <div class="page-actions">
+            <div class="log-filters">
+              <button class="filter-chip active" data-proposal-filter="pending">Pending</button>
+              <button class="filter-chip" data-proposal-filter="decided">Decided</button>
+              <button class="filter-chip" data-proposal-filter="all">All</button>
+            </div>
+            <button class="btn btn-primary btn-sm" id="btn-draft-proposals">Draft now</button>
+          </div>
+        </div>
+        <p class="page-subtitle">
+          The LLM drafts automations from observed patterns. Approving the plan approves every future match — there's no escalation ladder.
+          Max 3 proposals per day. 7-day TTL.
+        </p>
+        <div id="proposals-list" class="proposals-list"></div>
       </section>
     </main>
   </div>
