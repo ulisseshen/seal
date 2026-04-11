@@ -153,6 +153,48 @@ SEAL supports five LLM backends behind a single interface — chat, proposal dra
 
 API keys live in the **macOS Keychain** (service `seal`) or a `chmod 600` fallback at `~/.config/seal/secrets.json`. They are never written into `chat-config.json` or any world-readable file.
 
+## Channels
+
+Two flavors of channel, and they're not the same thing:
+
+1. **Input channels** are how you *talk to* SEAL — drop a bug report, a test message, a thought, a voice note, or arbitrary JSON at the ingest loop.
+2. **Approval channels** are where SEAL *asks you back* — pending proposals, unmatched ingest events, and any `ask_user` step a running flow hits.
+
+On day one, both roles are fully covered by the **dashboard**. The mobile / messaging channels listed below exist in the codebase and can receive inputs today, but their *approval* UX (inline keyboard buttons for approve/deny/modify) is wired at the channel level and waits for a follow-up commit to surface proposals through them. Until then, approvals happen in the dashboard Proposals and Ingest tabs.
+
+### Input — talk to SEAL
+
+| Channel | Status | How it works |
+|---------|--------|--------------|
+| **Dashboard Chat tab** | ✅ working | Live-streaming chat against any configured provider. Markdown rendering, persisted history (`chat_messages` FTS5), provider switcher. Fastest feedback loop. |
+| **`POST /api/ingest`** | ✅ working | REST endpoint. Drop `{source, data}` and SEAL runs the ingest router (match → run, or interpret → queue for teaching). Curl-friendly, scriptable. |
+| **`/seal` skill inside Claude Code / Codex / Antigravity / Cursor** | ✅ working | `install.sh` copies the skill into the runtime's skill directory. Invoke with `/seal <natural language>` — creates tasks, reminders, notes, rituals. Works from any editor session. |
+| **Telegram bot** | 🟡 receive only | Bot token via `@BotFather`, configured in `~/.config/seal/ingest.json`. Incoming messages become SEAL tasks. Inline approval buttons not wired yet. |
+| **Discord bot** | 🟡 receive only | Developer Portal bot, DM-only by default. Same status as Telegram. |
+| **WhatsApp (Baileys)** | 🟡 receive only | Scans a QR on first run. Text-only — WhatsApp has no buttons, so approvals will eventually use keyword replies (`/seal approve 42`). |
+| **Gmail** | 🟡 receive only | IMAP polling *or* a Cloudflare Worker webhook. Emails sent to your SEAL address become tasks. |
+| **Voice notes** | 🟡 receive only | Drop an audio file, `whisper-cli` transcribes it, SEAL ingests the text. |
+| **Shell ingest** (v0.12.0) | 🔲 planned | Opt-in `.zshrc` hook for shell-event patterns. |
+
+### Approval — SEAL asks you back
+
+SEAL only raises a hand when something isn't approved-and-confident. When that happens, the request needs to reach you on a channel you're willing to check. The approval surfaces today:
+
+| Surface | Status | What you approve there |
+|---------|--------|------------------------|
+| **Dashboard → Proposals tab** | ✅ working | LLM-drafted automations from observed patterns. Five decision buttons: Approve + save · Once only · Modify · Deny · Suppress. Edit the script inline before approving. 7-day TTL visible per card. |
+| **Dashboard → Ingest tab** | ✅ working | Unmatched events with the LLM's interpretation + a drafted handler (match criteria + `flow.yaml`). Two buttons: Approve handler (→ skill is born and all future similar events run through it automatically) · Ignore. |
+| **Dashboard → Missions tab** | ✅ working | Policy-blocked tasks (`status: firing`) wait here for your explicit ack. The existing v0.2.0 permission gate. |
+| **macOS notifications** | ✅ working | `nuclear` / `supernova` levels fire alert dialogs and re-fire until acknowledged — the "you **will** see this" escalation. |
+| **Telegram / Discord inline keyboard** | 🔲 planned | The design doc calls for approve/deny/modify buttons on proposal delivery. Wired for notification delivery already; proposal delivery is the follow-up. |
+| **WhatsApp keyword reply** | 🔲 planned | `/seal approve 42` / `/seal deny 42` since WhatsApp has no buttons. |
+
+### The short version
+
+- **Want to poke SEAL right now** → Dashboard Chat tab or `curl POST /api/ingest`.
+- **Want to approve pending work** → Dashboard Proposals or Ingest tab. That's the single source of truth until messaging-app buttons are wired.
+- **Want mobile reach** → Telegram / Discord / WhatsApp / Gmail are already receiving. You'll use the dashboard on your phone's browser to approve, which works fine — the dashboard is responsive.
+
 ## Dashboard
 
 `seal open` launches the dashboard at `http://localhost:3333`. Tabs:
