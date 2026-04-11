@@ -11,6 +11,8 @@ import {
   queryEvents,
 } from '../src/db.js';
 import { installSealHooks, uninstallSealHooks, hasSealHooks } from './hooks-installer.js';
+import { getProvider, listProviders } from '../src/providers/index.js';
+import { hasSecret, backend as secretsBackend } from '../src/secrets.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -208,13 +210,28 @@ app.post('/api/channels/test', (req, res) => {
 
 const chatConfigPath = join(SEAL_DIR, 'chat-config.json');
 
+function readChatConfig() {
+  if (existsSync(chatConfigPath)) {
+    try { return JSON.parse(readFileSync(chatConfigPath, 'utf-8')); } catch {}
+  }
+  return { provider: 'claude', model: null, system_prompt: 'You are SEAL, a personal tech-lead assistant.' };
+}
+
 app.get('/api/chat-config', (_req, res) => {
   try {
-    if (existsSync(chatConfigPath)) {
-      res.json(JSON.parse(readFileSync(chatConfigPath, 'utf-8')));
-    } else {
-      res.json({ model: 'claude', api_key: '', system_prompt: 'You are SEAL, a personal tech-lead assistant.' });
-    }
+    const cfg = readChatConfig();
+    // Report which providers are configured (without exposing secrets)
+    const providers = listProviders().map((name) => {
+      const p = getProvider(name);
+      return { name, available: p.available(), is_default: cfg.provider === name };
+    });
+    res.json({
+      provider: cfg.provider,
+      model: cfg.model,
+      system_prompt: cfg.system_prompt,
+      providers,
+      secrets_backend: secretsBackend(),
+    });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -222,8 +239,12 @@ app.get('/api/chat-config', (_req, res) => {
 
 app.put('/api/chat-config', (req, res) => {
   try {
-    writeFileSync(chatConfigPath, JSON.stringify(req.body, null, 2));
-    res.json(req.body);
+    const current = readChatConfig();
+    const next = { ...current, ...req.body };
+    // Never store api_key here — secret store owns that
+    delete next.api_key;
+    writeFileSync(chatConfigPath, JSON.stringify(next, null, 2));
+    res.json(next);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
@@ -426,6 +447,58 @@ app.get('/api/events', async (req, res) => {
     res.json(events);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// --- API: Chat (SSE streaming) ---
+
+app.post('/api/chat', async (req, res) => {
+  const cfg = readChatConfig();
+  const providerName = req.body.provider || cfg.provider || 'claude';
+  // cfg.model is only meaningful when the request uses the default provider.
+  const cfgModel = providerName === cfg.provider ? cfg.model : null;
+  const model = req.body.model || cfgModel || undefined;
+  const systemPrompt = req.body.system_prompt || cfg.system_prompt;
+  const messages = Array.isArray(req.body.messages) ? req.body.messages : null;
+
+  if (!messages || messages.length === 0) {
+    return res.status(400).json({ error: 'messages[] required' });
+  }
+
+  let provider;
+  try {
+    provider = getProvider(providerName, { model });
+  } catch (err) {
+    return res.status(400).json({ error: err.message });
+  }
+
+  if (!provider.available()) {
+    return res.status(400).json({
+      error: `${providerName} is not configured. Run: seal setup provider ${providerName}`,
+    });
+  }
+
+  res.setHeader('Content-Type', 'text/event-stream');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
+  res.setHeader('Connection', 'keep-alive');
+  res.flushHeaders?.();
+
+  const sse = (event, data) => {
+    res.write(`event: ${event}\n`);
+    res.write(`data: ${JSON.stringify(data)}\n\n`);
+  };
+
+  sse('start', { provider: providerName, model });
+
+  try {
+    for await (const chunk of provider.stream(messages, systemPrompt)) {
+      sse('chunk', { text: chunk });
+    }
+    sse('done', {});
+  } catch (err) {
+    sse('error', { message: err.message });
+  } finally {
+    res.end();
   }
 });
 

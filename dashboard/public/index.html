@@ -127,21 +127,21 @@
           <div class="chat-config">
             <h4>Chat Configuration</h4>
             <div class="config-row">
-              <label>Model</label>
-              <select id="chat-model">
-                <option value="claude">Claude</option>
-                <option value="gpt-4">GPT-4</option>
-                <option value="codex">Codex</option>
-              </select>
+              <label>Provider</label>
+              <select id="chat-provider"></select>
             </div>
             <div class="config-row">
-              <label>API Key</label>
-              <input type="password" id="chat-api-key" placeholder="sk-...">
+              <label>Model</label>
+              <input type="text" id="chat-model-input" placeholder="(provider default)">
             </div>
             <div class="config-row">
               <label>System Prompt</label>
               <textarea id="chat-system-prompt" rows="3" placeholder="You are SEAL..."></textarea>
             </div>
+            <p class="config-hint">
+              API keys live in your OS keychain (<span id="chat-secrets-backend">keychain</span>).
+              Configure credentials with: <code>seal setup provider &lt;name&gt;</code>
+            </p>
             <button class="btn btn-primary btn-sm" id="btn-save-chat-config">Save Config</button>
           </div>
         </div>
