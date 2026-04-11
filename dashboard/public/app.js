@@ -82,6 +82,7 @@ document.querySelectorAll('.sidebar-item').forEach(tab => {
     if (tabName === 'events') startEventsTab();
     else stopEventsPolling();
     if (tabName === 'patterns') loadPatterns();
+    if (tabName === 'proposals') loadProposals();
   });
 });
 
@@ -1238,6 +1239,131 @@ document.getElementById('btn-scan-patterns')?.addEventListener('click', async (e
   } finally {
     btn.disabled = false;
     btn.textContent = 'Scan now';
+  }
+});
+
+// --- Proposals (v0.5.0 "SEAL proposes") ---
+
+let currentProposalFilter = 'pending';
+
+async function loadProposals() {
+  const list = document.getElementById('proposals-list');
+  if (!list) return;
+  list.innerHTML = '<div class="empty-state"><p>Loading…</p></div>';
+  try {
+    let qs = '';
+    if (currentProposalFilter === 'pending') qs = '?decided=false';
+    else if (currentProposalFilter === 'decided') qs = '?decided=true';
+    const res = await fetch(`${API}/api/proposals${qs}`);
+    const rows = await res.json();
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      list.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-state-icon">&#x1F4AC;</div>
+          <h3>No proposals yet</h3>
+          <p>SEAL drafts proposals from observed patterns every 15 minutes. Click <strong>Draft now</strong> to run the drafter on demand.</p>
+        </div>`;
+      return;
+    }
+
+    list.innerHTML = rows.map(renderProposalCard).join('');
+    // Hook up decision buttons after render
+    list.querySelectorAll('[data-proposal-action]').forEach((btn) => {
+      btn.addEventListener('click', onProposalAction);
+    });
+  } catch (err) {
+    list.innerHTML = `<div class="empty-state"><p>Failed to load proposals: ${err.message}</p></div>`;
+  }
+}
+
+function renderProposalCard(p) {
+  const decided = p.decided_at ? true : false;
+  const risks = Array.isArray(p.risks) ? p.risks : [];
+  const riskHtml = risks.length
+    ? `<div class="proposal-risks"><strong>⚠ Risks:</strong> ${risks.map(escapeHtml).join('; ')}</div>`
+    : '';
+  const decisionHtml = decided
+    ? `<div class="proposal-decided">Decision: <strong>${p.decision}</strong> · ${fmtRelative(p.decided_at)}</div>`
+    : `<div class="proposal-actions">
+         <button class="btn btn-success btn-sm" data-proposal-action="approved_saved" data-id="${p.id}">✅ Approve + save</button>
+         <button class="btn btn-ghost btn-sm" data-proposal-action="approved_once" data-id="${p.id}">🔁 Once only</button>
+         <button class="btn btn-ghost btn-sm" data-proposal-action="modified" data-id="${p.id}">✏️ Modify</button>
+         <button class="btn btn-ghost btn-sm" data-proposal-action="denied" data-id="${p.id}">❌ Deny</button>
+         <button class="btn btn-ghost btn-sm" data-proposal-action="suppressed" data-id="${p.id}">🚫 Suppress</button>
+       </div>`;
+
+  return `
+    <div class="proposal-card ${decided ? 'decided' : ''}" data-proposal-id="${p.id}">
+      <div class="proposal-header">
+        <h3>${escapeHtml(p.name)}</h3>
+        <span class="proposal-provider">${p.provider || '—'}${p.model ? ' · ' + escapeHtml(p.model) : ''}</span>
+        <span class="proposal-ttl">${decided ? 'decided' : 'expires ' + fmtRelative(p.expires_at)}</span>
+      </div>
+      <p class="proposal-explanation">${escapeHtml(p.explanation)}</p>
+      ${p.invocation ? `<div class="proposal-invocation"><code>${escapeHtml(p.invocation)}</code></div>` : ''}
+      <pre class="proposal-script"><code>${escapeHtml(p.script)}</code></pre>
+      ${riskHtml}
+      ${decisionHtml}
+    </div>
+  `;
+}
+
+async function onProposalAction(e) {
+  const btn = e.currentTarget;
+  const id = btn.dataset.id;
+  const action = btn.dataset.proposalAction;
+
+  let finalScript = null;
+  if (action === 'modified') {
+    const card = btn.closest('.proposal-card');
+    const current = card.querySelector('.proposal-script code').textContent;
+    finalScript = window.prompt('Edit the script before approving:', current);
+    if (finalScript === null) return;
+  }
+
+  btn.disabled = true;
+  btn.textContent = 'Working…';
+  try {
+    const res = await fetch(`${API}/api/proposals/${id}/decision`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ decision: action, final_script: finalScript }),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      alert('Decision failed: ' + (err.error || res.status));
+      return;
+    }
+    await loadProposals();
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.querySelectorAll('[data-proposal-filter]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('[data-proposal-filter]').forEach((b) => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentProposalFilter = btn.dataset.proposalFilter;
+    loadProposals();
+  });
+});
+
+document.getElementById('btn-draft-proposals')?.addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  btn.textContent = 'Drafting…';
+  try {
+    const res = await fetch(`${API}/api/proposals/draft`, { method: 'POST' });
+    const result = await res.json();
+    if (result.skipped === 'fatigue') {
+      alert('Proposal fatigue gate hit — max 3 per day.');
+    }
+    await loadProposals();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Draft now';
   }
 });
 

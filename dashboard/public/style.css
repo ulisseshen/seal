@@ -1639,3 +1639,98 @@ body {
   font-size: 11px;
   color: var(--text-muted);
 }
+
+/* --- Proposals tab (v0.5.0 "SEAL proposes") --- */
+
+.proposals-list {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.proposal-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 16px 18px;
+}
+
+.proposal-card.decided {
+  opacity: 0.6;
+}
+
+.proposal-header {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 8px;
+  flex-wrap: wrap;
+}
+
+.proposal-header h3 {
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+}
+
+.proposal-provider,
+.proposal-ttl {
+  font-size: 11px;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+.proposal-explanation {
+  color: var(--text);
+  font-size: 13px;
+  line-height: 1.5;
+  margin: 0 0 10px;
+}
+
+.proposal-invocation {
+  margin: 6px 0 10px;
+}
+
+.proposal-invocation code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  background: rgba(0, 0, 0, 0.3);
+  padding: 3px 8px;
+  border-radius: 4px;
+}
+
+.proposal-script {
+  background: rgba(0, 0, 0, 0.4);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 10px 12px;
+  margin: 8px 0;
+  overflow-x: auto;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12.5px;
+  line-height: 1.5;
+  max-height: 400px;
+}
+
+.proposal-risks {
+  background: rgba(255, 180, 0, 0.08);
+  border: 1px solid rgba(255, 180, 0, 0.25);
+  border-radius: var(--radius-sm);
+  padding: 8px 12px;
+  font-size: 12.5px;
+  color: #ffd089;
+  margin: 8px 0 12px;
+}
+
+.proposal-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 12px;
+}
+
+.proposal-decided {
+  margin-top: 12px;
+  font-size: 12px;
+  color: var(--text-muted);
+}

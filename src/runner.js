@@ -27,6 +27,7 @@ import { eventBus } from './event-bus.js';
 import { GitObserver } from './observers/git.js';
 import { setGitIngester } from './web.js';
 import { startDetectorLoop } from './brain/detector.js';
+import { startProposerLoop } from './brain/proposer.js';
 
 const POLL_INTERVAL = 30_000;       // Check tasks every 30 seconds
 const SUPERNOVA_INTERVAL = 60_000;  // Check supernova re-fires every 60 seconds
@@ -117,8 +118,14 @@ setTimeout(runEventRetention, 60_000);
 // v0.4.0 "SEAL notices" — pattern detector slow-path scheduler.
 // Runs every 15m in the background, scanning the events table that
 // v0.3.0's Eye layer fills. Writes candidates to the `patterns` table
-// where v0.5.0's proposal engine will promote them to 'proposed'.
+// where v0.5.0's proposal engine promotes them to 'proposed'.
 startDetectorLoop();
+
+// v0.5.0 "SEAL proposes" — proposal engine. Reads observing patterns
+// past the confidence/evidence thresholds, drafts automations via the
+// LLM provider abstraction, and writes proposal rows for the TL to
+// approve/deny in the dashboard. Rate-limited to 3/day, 7-day TTL.
+startProposerLoop();
 
 console.log(`[seal] Standing by...`);
 
