@@ -155,8 +155,42 @@ echo -e "${GREEN}✓${NC} Skills installed for all detected runtimes"
 mkdir -p "$CONFIG_DIR"
 echo -e "${GREEN}✓${NC} Config directory ready ($CONFIG_DIR)"
 
-# --- Add shell aliases ---
+# --- Install the `seal` binary ---
+# Prefer /usr/local/bin (on PATH by default on macOS) with a sudo-free
+# fallback to ~/.local/bin. Also scrub any legacy shell functions / aliases
+# from older SEAL installs so they don't shadow the real binary.
 
+CLI_SRC="$INSTALL_DIR/src/cli.js"
+chmod +x "$CLI_SRC" 2>/dev/null || true
+
+link_seal() {
+  local target_dir="$1"
+  local target_path="$target_dir/seal"
+  mkdir -p "$target_dir" 2>/dev/null || return 1
+  # If a stale seal file/symlink is there, replace it.
+  if [ -L "$target_path" ] || [ -f "$target_path" ]; then
+    rm -f "$target_path" 2>/dev/null || return 1
+  fi
+  ln -s "$CLI_SRC" "$target_path" 2>/dev/null || return 1
+  echo "$target_path"
+}
+
+SEAL_BIN=""
+if [ -w "/usr/local/bin" ]; then
+  SEAL_BIN="$(link_seal /usr/local/bin || true)"
+fi
+if [ -z "$SEAL_BIN" ]; then
+  SEAL_BIN="$(link_seal "$HOME/.local/bin" || true)"
+fi
+
+if [ -n "$SEAL_BIN" ]; then
+  echo -e "${GREEN}✓${NC} Installed ${CYAN}seal${NC} at $SEAL_BIN"
+else
+  echo -e "${YELLOW}⚠${NC} Could not symlink seal — falling back to manual alias"
+fi
+
+# Scrub legacy shell integration so old function / alias forms don't shadow
+# the new binary. Safe to run repeatedly.
 SHELL_CONFIG=""
 if [[ "$SHELL" == *"zsh"* ]]; then
   SHELL_CONFIG="$HOME/.zshrc"
@@ -165,31 +199,31 @@ elif [[ "$SHELL" == *"bash"* ]]; then
   [ ! -f "$SHELL_CONFIG" ] && SHELL_CONFIG="$HOME/.bash_profile"
 fi
 
-if [ -n "$SHELL_CONFIG" ]; then
-  # Remove legacy alias form if present, then write the function form
-  if grep -q 'alias seal=' "$SHELL_CONFIG" 2>/dev/null; then
-    # Strip the old SEAL block (alias seal=, seal-run, cds)
-    sed -i.bak '/^# SEAL — Autonomous Tech Lead Task Runner$/,/^alias cds=/d' "$SHELL_CONFIG" 2>/dev/null || true
-    echo -e "${GREEN}✓${NC} Removed legacy SEAL aliases"
+if [ -n "$SHELL_CONFIG" ] && [ -f "$SHELL_CONFIG" ]; then
+  # Remove any previous "# SEAL — Autonomous Tech Lead Task Runner" block,
+  # regardless of whether it's the alias form or the function form.
+  if grep -q 'SEAL — Autonomous Tech Lead Task Runner' "$SHELL_CONFIG" 2>/dev/null; then
+    # macOS sed: -i '' BSD-style, Linux sed: -i GNU-style. Use a temp file.
+    awk '
+      /^# SEAL — Autonomous Tech Lead Task Runner$/ { skip=1; next }
+      skip && /^(alias|seal\(\)|\})/ { next }
+      skip && /^$/ { skip=0; next }
+      skip { next }
+      { print }
+    ' "$SHELL_CONFIG" > "$SHELL_CONFIG.seal-tmp" && mv "$SHELL_CONFIG.seal-tmp" "$SHELL_CONFIG"
+    echo -e "${GREEN}✓${NC} Removed legacy SEAL shell integration from $SHELL_CONFIG"
   fi
 
-  if ! grep -q 'SEAL — Autonomous Tech Lead Task Runner' "$SHELL_CONFIG" 2>/dev/null; then
-    cat >> "$SHELL_CONFIG" << EOF
+  # If seal binary ended up in ~/.local/bin, make sure it's on PATH.
+  if [ -n "$SEAL_BIN" ] && [[ "$SEAL_BIN" == "$HOME/.local/bin/"* ]]; then
+    if ! grep -q '\.local/bin' "$SHELL_CONFIG" 2>/dev/null; then
+      cat >> "$SHELL_CONFIG" << 'EOF'
 
-# SEAL — Autonomous Tech Lead Task Runner
-seal() {
-  if [ \$# -eq 0 ]; then
-    cd "$INSTALL_DIR"
-  else
-    node "$INSTALL_DIR/src/cli.js" "\$@"
-  fi
-}
-alias seal-run="cd $INSTALL_DIR && node src/runner.js"
-alias cds="claude --dangerously-skip-permissions"
+# SEAL — ensure ~/.local/bin is on PATH
+export PATH="$HOME/.local/bin:$PATH"
 EOF
-    echo -e "${GREEN}✓${NC} Shell integration added to $SHELL_CONFIG"
-  else
-    echo -e "${GREEN}✓${NC} Shell integration already configured"
+      echo -e "${GREEN}✓${NC} Added ~/.local/bin to PATH in $SHELL_CONFIG"
+    fi
   fi
 fi
 
@@ -210,11 +244,14 @@ echo ""
 
 echo "Commands:"
 echo ""
-echo "  seal                   Navigate to SEAL project"
-echo "  seal setup             Configure providers (claude, codex, gemini) and channels"
-echo "  seal setup status      Show current configuration"
-echo "  seal-run               Start the autonomous runner"
-echo "  cds                    Start Claude with --dangerously-skip-permissions"
+echo "  seal setup             Configure providers (claude, codex, gemini, openai, ollama)"
+echo "  seal start             Start runner + dashboard in the background"
+echo "  seal stop              Stop background services"
+echo "  seal ps                Show running services"
+echo "  seal logs runner -f    Tail runner log"
+echo "  seal open              Open the dashboard in the browser"
+echo "  seal skills            List installed skills"
+echo "  seal run <name>        Invoke a skill"
 echo ""
 echo "In Claude Code:"
 echo ""
@@ -222,14 +259,14 @@ echo "  /seal run tests on my-project tomorrow at 9am"
 echo "  /seal remind me to review PR by Friday"
 echo "  /seal list"
 echo ""
-echo -e "${CYAN}Next step:${NC} configure a chat provider"
+echo -e "${CYAN}Next steps:${NC}"
 echo ""
-echo "  seal setup                              # interactive"
-echo "  seal setup provider gemini --token ...  # or via flags"
-echo "  seal setup provider codex --login       # delegate to codex CLI"
+echo "  seal setup                              # configure a chat provider"
+echo "  seal start                              # start the runner + dashboard"
+echo "  seal open                               # open http://localhost:3333"
 echo ""
-if [ -n "$SHELL_CONFIG" ]; then
-  echo "Reload your shell:"
+if [ -n "$SHELL_CONFIG" ] && [ -n "$SEAL_BIN" ] && [[ "$SEAL_BIN" == "$HOME/.local/bin/"* ]]; then
+  echo "Reload your shell so ~/.local/bin is on PATH:"
   echo "  source $SHELL_CONFIG"
+  echo ""
 fi
-echo ""

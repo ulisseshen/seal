@@ -1,25 +1,54 @@
 #!/usr/bin/env node
-// SEAL setup CLI
-// Usage:
-//   seal setup                              interactive menu
-//   seal setup status                       show configured providers/channels
-//   seal setup provider <name>              interactive token prompt
-//   seal setup provider <name> --token X [--model Y] [--default]
-//   seal setup provider codex --login       delegate to `codex login`
-//   seal setup provider <name> --remove
-//   seal setup channel <name>               interactive
-//   seal setup channel <name> --set key=value [key=value ...]
+// SEAL — unified CLI entry point.
+//
+// All SEAL operations are driven through this binary. It is installed
+// as /usr/local/bin/seal (or ~/.local/bin/seal) during install.sh.
+//
+// Daemon management commands spawn background processes with detached
+// stdio, PID files under ~/.config/seal/, and log files that `seal logs`
+// tails. The daemon itself is src/runner.js; the dashboard is
+// dashboard/server.js — both discovered relative to this file.
 
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'fs';
-import { join } from 'path';
-import { spawnSync } from 'child_process';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, openSync, readdirSync, unlinkSync, statSync } from 'fs';
+import { join, dirname } from 'path';
+import { spawnSync, spawn } from 'child_process';
 import { createInterface } from 'readline';
+import { fileURLToPath } from 'url';
 import { setSecret, getSecret, delSecret, hasSecret, backend } from './secrets.js';
 import { listSkills, runSkill, getSkillByName } from './brain/skills.js';
+
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const PROJECT_ROOT = join(__dirname, '..');
+const RUNNER_PATH = join(__dirname, 'runner.js');
+const DASHBOARD_PATH = join(PROJECT_ROOT, 'dashboard', 'server.js');
 
 const SEAL_DIR = process.env.SEAL_DIR || join(process.env.HOME, '.config', 'seal');
 const CHAT_CONFIG = join(SEAL_DIR, 'chat-config.json');
 const CHANNELS_CONFIG = join(SEAL_DIR, 'channels.json');
+const RUN_DIR = join(SEAL_DIR, 'run');
+const LOG_DIR = join(SEAL_DIR, 'logs');
+
+// Daemon registry: name → paths + description used by all daemon commands.
+const DAEMONS = {
+  runner: {
+    label: 'runner (task loop, detectors, proposer, observers)',
+    script: RUNNER_PATH,
+    pidFile: join(RUN_DIR, 'runner.pid'),
+    logFile: join(LOG_DIR, 'runner.log'),
+  },
+  dashboard: {
+    label: 'dashboard (http://localhost:3333)',
+    script: DASHBOARD_PATH,
+    pidFile: join(RUN_DIR, 'dashboard.pid'),
+    logFile: join(LOG_DIR, 'dashboard.log'),
+  },
+};
+
+function ensureRuntimeDirs() {
+  mkdirSync(RUN_DIR, { recursive: true });
+  mkdirSync(LOG_DIR, { recursive: true });
+}
 
 const PROVIDERS = {
   claude:  { label: 'Claude (via claude CLI)',       defaultModel: 'claude-opus-4-6',  authMode: 'cli-managed' },
@@ -328,7 +357,15 @@ async function cmdInteractive() {
 
 function help() {
   console.log(`
-${C.bold('SEAL')}
+${C.bold('SEAL')} — autonomous Tech Lead assistant
+
+  ${C.bold('Daemon')}
+  seal start [runner|dashboard]          start background services (default: both)
+  seal stop  [runner|dashboard]          stop background services (default: both)
+  seal restart [runner|dashboard]        stop + start
+  seal ps                                show running services + PIDs
+  seal logs [runner|dashboard] [-f]      tail service logs
+  seal open                              open the dashboard in the browser
 
   ${C.bold('Setup')}
   seal setup                             interactive menu
@@ -345,7 +382,185 @@ ${C.bold('SEAL')}
   seal run <name> [args...]              invoke a skill
 
 ${C.dim('Providers: claude, codex, gemini, openai, ollama')}
+${C.dim('Config:    ' + SEAL_DIR)}
+${C.dim('Install:   ' + PROJECT_ROOT)}
 `);
+}
+
+// ─── Daemon management ────────────────────────────────
+
+function readPidFile(pidFile) {
+  if (!existsSync(pidFile)) return null;
+  try {
+    const raw = readFileSync(pidFile, 'utf-8').trim();
+    const pid = parseInt(raw, 10);
+    return Number.isFinite(pid) ? pid : null;
+  } catch { return null; }
+}
+
+function isAlive(pid) {
+  if (!pid) return false;
+  try { process.kill(pid, 0); return true; }
+  catch { return false; }
+}
+
+function clearStalePidFile(pidFile) {
+  const pid = readPidFile(pidFile);
+  if (pid && !isAlive(pid)) {
+    try { unlinkSync(pidFile); } catch {}
+    return true;
+  }
+  return false;
+}
+
+function resolveDaemonName(arg) {
+  if (!arg || arg === 'all') return ['runner', 'dashboard'];
+  if (DAEMONS[arg]) return [arg];
+  throw new Error(`Unknown daemon "${arg}". Options: runner, dashboard, all`);
+}
+
+function startDaemon(name) {
+  const d = DAEMONS[name];
+  if (!d) throw new Error(`Unknown daemon: ${name}`);
+
+  clearStalePidFile(d.pidFile);
+  const existing = readPidFile(d.pidFile);
+  if (existing && isAlive(existing)) {
+    console.log(`  ${C.yellow('•')} ${name} already running (pid ${existing})`);
+    return { name, pid: existing, state: 'already-running' };
+  }
+
+  ensureRuntimeDirs();
+  const out = openSync(d.logFile, 'a');
+  const err = openSync(d.logFile, 'a');
+
+  const child = spawn(process.execPath, [d.script], {
+    cwd: PROJECT_ROOT,
+    detached: true,
+    stdio: ['ignore', out, err],
+    env: { ...process.env, SEAL_DIR },
+  });
+  child.unref();
+  writeFileSync(d.pidFile, String(child.pid));
+  console.log(`  ${C.green('✓')} ${name} started (pid ${child.pid})  ${C.dim('→ ' + d.logFile)}`);
+  return { name, pid: child.pid, state: 'started' };
+}
+
+function stopDaemon(name) {
+  const d = DAEMONS[name];
+  if (!d) throw new Error(`Unknown daemon: ${name}`);
+
+  const pid = readPidFile(d.pidFile);
+  if (!pid) {
+    console.log(`  ${C.dim('•')} ${name} not running`);
+    return { name, state: 'not-running' };
+  }
+  if (!isAlive(pid)) {
+    try { unlinkSync(d.pidFile); } catch {}
+    console.log(`  ${C.dim('•')} ${name} stale pid file cleaned (${pid})`);
+    return { name, state: 'stale' };
+  }
+
+  try {
+    process.kill(pid, 'SIGTERM');
+    // Small grace window then force-kill if still alive.
+    const deadline = Date.now() + 4000;
+    while (isAlive(pid) && Date.now() < deadline) {
+      spawnSync('sleep', ['0.1']);
+    }
+    if (isAlive(pid)) {
+      process.kill(pid, 'SIGKILL');
+    }
+    try { unlinkSync(d.pidFile); } catch {}
+    console.log(`  ${C.green('✓')} ${name} stopped (was pid ${pid})`);
+    return { name, pid, state: 'stopped' };
+  } catch (err) {
+    console.log(`  ${C.red('✗')} ${name} kill failed: ${err.message}`);
+    return { name, pid, state: 'error', error: err.message };
+  }
+}
+
+function cmdStart(args) {
+  const names = resolveDaemonName(args[0]);
+  console.log();
+  console.log(C.bold('  Starting…'));
+  for (const name of names) startDaemon(name);
+  console.log();
+}
+
+function cmdStop(args) {
+  const names = resolveDaemonName(args[0]);
+  console.log();
+  console.log(C.bold('  Stopping…'));
+  for (const name of names) stopDaemon(name);
+  console.log();
+}
+
+async function cmdRestart(args) {
+  cmdStop(args);
+  // Tiny pause so TCP ports release cleanly
+  spawnSync('sleep', ['0.3']);
+  cmdStart(args);
+}
+
+function cmdPs() {
+  ensureRuntimeDirs();
+  console.log();
+  console.log(C.bold('  SEAL services'));
+  for (const [name, d] of Object.entries(DAEMONS)) {
+    clearStalePidFile(d.pidFile);
+    const pid = readPidFile(d.pidFile);
+    const alive = isAlive(pid);
+    const status = alive ? C.green('running') : C.dim('stopped');
+    const pidStr = alive ? C.dim(`pid ${pid}`) : '';
+    console.log(`    ${C.cyan(name.padEnd(10))} ${status.padEnd(18)} ${pidStr}`);
+    console.log(`      ${C.dim(d.label)}`);
+    if (existsSync(d.logFile)) {
+      try {
+        const size = statSync(d.logFile).size;
+        console.log(`      ${C.dim('log: ' + d.logFile + ' (' + humanSize(size) + ')')}`);
+      } catch {}
+    }
+  }
+  console.log();
+}
+
+function humanSize(bytes) {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
+  return `${(bytes / 1024 / 1024).toFixed(1)}MB`;
+}
+
+function cmdLogs(args) {
+  const { flags, positional } = parseFlags(args);
+  const name = positional[0] || 'runner';
+  const d = DAEMONS[name];
+  if (!d) {
+    console.error(C.red(`Unknown daemon "${name}". Options: runner, dashboard`));
+    process.exit(1);
+  }
+  if (!existsSync(d.logFile)) {
+    console.log(C.dim(`  (no log file yet — run \`seal start ${name}\` first)`));
+    return;
+  }
+  const follow = flags.f || flags.follow;
+  const args2 = follow ? ['-n', '200', '-F', d.logFile] : ['-n', '200', d.logFile];
+  // Hand off to tail; user's Ctrl+C ends the follow.
+  const child = spawn('tail', args2, { stdio: 'inherit' });
+  child.on('exit', (code) => process.exit(code ?? 0));
+}
+
+function cmdOpen() {
+  const url = process.env.SEAL_DASHBOARD_URL || 'http://localhost:3333';
+  const opener = process.platform === 'darwin' ? 'open'
+                : process.platform === 'win32' ? 'start'
+                : 'xdg-open';
+  const r = spawnSync(opener, [url], { stdio: 'ignore' });
+  if (r.status !== 0) {
+    console.log(C.yellow(`Open manually: ${url}`));
+  } else {
+    console.log(C.green(`✓ opened ${url}`));
+  }
 }
 
 async function cmdSkills() {
@@ -404,6 +619,14 @@ async function main() {
 
   if (cmd === 'skills') return cmdSkills();
   if (cmd === 'run')    return cmdRun([sub, ...rest].filter(Boolean));
+
+  // Daemon management
+  if (cmd === 'start')    return cmdStart([sub, ...rest].filter(Boolean));
+  if (cmd === 'stop')     return cmdStop([sub, ...rest].filter(Boolean));
+  if (cmd === 'restart')  return cmdRestart([sub, ...rest].filter(Boolean));
+  if (cmd === 'ps')       return cmdPs();
+  if (cmd === 'logs')     return cmdLogs([sub, ...rest].filter(Boolean));
+  if (cmd === 'open')     return cmdOpen();
 
   if (cmd === 'help' || cmd === '-h' || cmd === '--help') { help(); return; }
 
