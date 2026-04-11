@@ -24,6 +24,21 @@ seal open               # http://localhost:3333
 
 The ethical rule — *"it acts like me, but it is not me"* — is what separates SEAL from every other agent framework. SEAL learns, drafts, and executes on your behalf, but every output is labeled, every action traces back to an explicit approval, and nothing irreversible happens without you clicking a button once.
 
+## What it does
+
+Six capability pillars. Each one maps to a concrete component already shipped:
+
+- **Capture** — Routes any unknown data (email, chat, event, arbitrary JSON) into a teaching conversation. *(v0.10.0 ingest loop · `POST /api/ingest`)*
+- **Orchestrate** — Declarative YAML flow engine **or** imperative shell scripts as skill backends. Step types: `llm.ask`, `shell.run`, `ask_user.prompt`, adapter calls. *(v0.7.0 flow engine · v0.6.0 skill factory)*
+- **Execute** — Sandboxed skill runner. Two invocation paths:
+  - **Manual** — you type `seal run <name>` or click Run in the dashboard.
+  - **Auto** — once SEAL has learned a pattern and you approve the handler, every future similar event *runs the skill automatically without re-asking*. An email that matches the `newclient-proposal-review` handler just runs through the flow and notifies you; a git event that matches a `data_match` skill fires through the same pipeline. The single approval moment pays for every future run. *(v0.6.0 script runner · v0.10.0 handler router)*
+- **Remember** — Typed SQLite FTS5 memory layer. Four kinds (user / feedback / project / reference) following Claude Code's frontmatter pattern, plus daily scratch notes that a dreaming sweep consolidates into durable memories. *(memory layer commit · the Brain's context on every turn)*
+- **Learn** — Observes your git activity, detects sequence and naming patterns, and drafts safe automations through the LLM for you to approve. Max 3 proposals per day, 7-day TTL, five decision shapes. *(v0.4.0 detector · v0.5.0 proposer)*
+- **Optimize** — Token-aware execution. RTK compresses CLI output 60–90% before it hits the LLM context. The memory layer is pure `better-sqlite3` + FTS5 — no Python subprocess, no fallback chains. *(RTK integration · native memory layer)*
+
+The loop is the payoff: **Learn → (approve once) → Execute automatically forever.** You teach SEAL once per pattern. After that it just does the thing.
+
 ## The two loops
 
 ### Observe — "SEAL notices what I do"
