@@ -53,13 +53,20 @@ class FlowContext {
     this.history = [];         // execution trace
     this.startedAt = new Date();
 
-    // Instantiate adapter
-    const adapterName = flow.defaults?.adapter || 'azure-devops';
-    const AdapterClass = ADAPTERS[adapterName];
-    if (!AdapterClass) throw new Error(`Unknown adapter: ${adapterName}`);
-    this.adapter = new AdapterClass(adapterConfig);
-
-    console.log(`[flow-engine] Context created for "${flow.name}" with adapter "${adapterName}"`);
+    // Instantiate adapter lazily. v0.7.0 flow-backed skills use llm/shell/
+    // ask_user/set steps that don't need an SCM adapter — instantiating
+    // one at boot would force config the skill doesn't use. Only flows
+    // that explicitly declare `defaults.adapter` get an adapter.
+    const adapterName = flow.defaults?.adapter || null;
+    if (adapterName) {
+      const AdapterClass = ADAPTERS[adapterName];
+      if (!AdapterClass) throw new Error(`Unknown adapter: ${adapterName}`);
+      this.adapter = new AdapterClass(adapterConfig);
+      console.log(`[flow-engine] Context created for "${flow.name}" with adapter "${adapterName}"`);
+    } else {
+      this.adapter = null;
+      console.log(`[flow-engine] Context created for "${flow.name}" (no adapter)`);
+    }
   }
 
   set(key, value) {
@@ -96,6 +103,26 @@ async function executeStep(step, ctx) {
 
     case 'skill':
       result = await executeSkillAction(method, step, ctx);
+      break;
+
+    // v0.7.0 step types — see AGENT-SYSTEM-DESIGN.md §3.8
+
+    case 'llm':
+      result = await executeLlmStep(method, step, ctx);
+      break;
+
+    case 'shell':
+      result = await executeShellStep(method, step, ctx);
+      break;
+
+    case 'ask_user':
+      result = await executeAskUserStep(method, step, ctx);
+      break;
+
+    case 'set':
+      // Trivial helper: set.<key> — writes the resolved step.value into ctx.state.<key>
+      result = resolveVarDeep(step.value, ctx);
+      if (method) ctx.set(method, result);
       break;
 
     default:
@@ -181,6 +208,119 @@ async function executeSkillAction(skillName, step, ctx) {
       else resolve(stdout.trim());
     });
   });
+}
+
+// ─── v0.7.0 step executors ────────────────────────────
+//
+// These four step types turn the flow engine from "pipeline of adapter
+// and skill calls" into a first-class backend for declarative automations:
+//   llm.ask      — send a prompt, capture the response
+//   shell.run    — run a shell command and capture stdout/stderr/exit
+//   ask_user.*   — pause the flow with a pending question until answered
+//   set.<key>    — set a ctx variable (no dispatch needed)
+//
+// The LLM step uses SEAL's provider abstraction, so claude/codex/gemini/
+// openai/ollama all work interchangeably. The shell step is sandboxed
+// via wrapWithSandbox so flow skills inherit task policy.
+
+async function executeLlmStep(_method, step, ctx) {
+  const { getProvider } = await import('../providers/index.js');
+  const { readFileSync, existsSync } = await import('node:fs');
+  const { join } = await import('node:path');
+
+  const sealDir = process.env.SEAL_DIR || join(process.env.HOME, '.config', 'seal');
+  let cfg = { provider: 'claude', model: null, system_prompt: null };
+  const cfgPath = join(sealDir, 'chat-config.json');
+  if (existsSync(cfgPath)) {
+    try { cfg = { ...cfg, ...JSON.parse(readFileSync(cfgPath, 'utf-8')) }; } catch {}
+  }
+
+  const providerName = step.provider || cfg.provider || 'claude';
+  const model = step.model || cfg.model || undefined;
+  const systemPrompt = step.system || cfg.system_prompt || null;
+  const userPrompt = resolveTemplate(step.prompt || '', ctx);
+
+  if (!userPrompt) throw new Error(`llm step "${step.id}" requires a prompt`);
+
+  const provider = getProvider(providerName, { model });
+  if (!provider.available()) {
+    throw new Error(`llm step "${step.id}": provider ${providerName} not configured`);
+  }
+
+  let out = '';
+  for await (const chunk of provider.stream([{ role: 'user', content: userPrompt }], systemPrompt)) {
+    out += chunk;
+  }
+
+  // If the step declares parse_json, extract the first JSON object we can find.
+  if (step.parse_json) {
+    const direct = tryParse(out.trim());
+    if (direct != null) return direct;
+    const fenced = out.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (fenced) {
+      const parsed = tryParse(fenced[1].trim());
+      if (parsed != null) return parsed;
+    }
+    const braceStart = out.indexOf('{');
+    const braceEnd = out.lastIndexOf('}');
+    if (braceStart >= 0 && braceEnd > braceStart) {
+      const parsed = tryParse(out.slice(braceStart, braceEnd + 1));
+      if (parsed != null) return parsed;
+    }
+    throw new Error(`llm step "${step.id}": could not parse JSON from model output`);
+  }
+
+  return out.trim();
+}
+
+async function executeShellStep(_method, step, ctx) {
+  const { spawn } = await import('node:child_process');
+  const { wrapWithSandbox } = await import('../sandbox.js');
+
+  const cmd = resolveTemplate(step.cmd || step.run || '', ctx);
+  if (!cmd) throw new Error(`shell step "${step.id}" requires cmd`);
+
+  const profile = step.sandbox_profile || null;
+  let command = 'bash';
+  let args = ['-c', cmd];
+  if (profile) {
+    try {
+      const wrapped = wrapWithSandbox('bash', ['-c', cmd], profile);
+      if (wrapped?.command) { command = wrapped.command; args = wrapped.args; }
+    } catch (err) {
+      console.warn(`[flow-engine] sandbox wrap failed for shell step "${step.id}": ${err.message}`);
+    }
+  }
+
+  return new Promise((resolve, reject) => {
+    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+    let stdout = '';
+    let stderr = '';
+    child.stdout.on('data', (d) => { stdout += d.toString('utf-8'); });
+    child.stderr.on('data', (d) => { stderr += d.toString('utf-8'); });
+    child.on('close', (code) => {
+      const result = { exit_code: code ?? -1, stdout, stderr };
+      if (step.fail_on_error !== false && code !== 0) {
+        return reject(new Error(`shell step "${step.id}" exited ${code}: ${stderr.slice(0, 200)}`));
+      }
+      resolve(result);
+    });
+  });
+}
+
+async function executeAskUserStep(_method, step, ctx) {
+  // Pauses the flow by throwing a tagged marker. Callers (runFlow and
+  // the ingest loop) catch this marker and persist a pending question.
+  // v0.10.0 "SEAL asks back" builds the actual teaching loop around this.
+  const question = resolveTemplate(step.question || 'SEAL needs guidance.', ctx);
+  const options = step.options || [];
+  const pending = { __seal_pending: true, step_id: step.id, question, options };
+  ctx.set(step.output || '__pending', pending);
+  return pending;
+}
+
+function tryParse(s) {
+  try { return JSON.parse(s); } catch { return null; }
 }
 
 // ─── Watch Loop ───────────────────────────────────────
