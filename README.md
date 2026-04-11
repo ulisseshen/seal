@@ -4,8 +4,11 @@
 
 > **Shadow. Eye. Brain. Hands.**
 > *It acts like me, but it is not me.*
+> *Ask carefully once → act confidently forever.*
 
 SEAL is an autonomous Tech-Lead assistant. It watches your git activity, notices the patterns you repeat, drafts safe automations, asks you once, and then handles every future similar thing on its own. It also routes unknown data — an email, a message, a chat line — into a *"I don't recognize this, teach me"* loop that turns into a reusable handler after a single conversation.
+
+**SEAL only acts on things it's confident about and that you approved it to care about.** When a pattern isn't clear enough, a proposal isn't safe enough, or incoming data doesn't match any teaching you've given it, SEAL stops and asks. The rule is simple: high confidence + prior approval → act; anything less → raise a hand. No surprise side effects, no silent escalations, no "I thought you meant…".
 
 ```bash
 seal start              # runner + dashboard in the background
@@ -22,7 +25,14 @@ seal open               # http://localhost:3333
 | 🧠 **Brain** | Detector + LLM | Notices patterns. Interprets inputs. Drafts plans. **Never decides alone.** |
 | 🖐️ **Hands** | Skill Factory + Flow Engine | Runs the automations you approved. Sandboxed. Every run is traceable to an approval. |
 
-The ethical rule — *"it acts like me, but it is not me"* — is what separates SEAL from every other agent framework. SEAL learns, drafts, and executes on your behalf, but every output is labeled, every action traces back to an explicit approval, and nothing irreversible happens without you clicking a button once.
+The ethical rule — *"it acts like me, but it is not me"* — is what separates SEAL from every other agent framework. SEAL learns, drafts, and executes on your behalf, but every output is labeled, every action traces back to an explicit approval, and nothing irreversible happens without you clicking a button once. **When in doubt, SEAL asks. It never guesses.**
+
+The "ask" gates are concrete, not decorative:
+
+- **Pattern detector** — only promotes a pattern to a proposal when `confidence >= 0.75 AND evidence_count >= 3`. Weak patterns stay observing and never reach you.
+- **Proposer** — never auto-approves. Every drafted automation sits in the Proposals tab until you click one of the five decision buttons. 7-day TTL, max 3 per day.
+- **Ingest router** — data that matches a taught handler runs automatically; anything unmatched lands in the Ingest queue with an LLM-drafted interpretation + handler proposal for you to approve or ignore.
+- **Drafted scripts themselves** — the proposal prompt explicitly forbids auto-commit, auto-push, auto-send, and any irreversible default. Scripts echo commands, use `read -p` confirmations, save-as-draft instead of send, and surface risks in the Risk block of the proposal card.
 
 ## What it does
 
@@ -30,9 +40,10 @@ Six capability pillars. Each one maps to a concrete component already shipped:
 
 - **Capture** — Routes any unknown data (email, chat, event, arbitrary JSON) into a teaching conversation. *(v0.10.0 ingest loop · `POST /api/ingest`)*
 - **Orchestrate** — Declarative YAML flow engine **or** imperative shell scripts as skill backends. Step types: `llm.ask`, `shell.run`, `ask_user.prompt`, adapter calls. *(v0.7.0 flow engine · v0.6.0 skill factory)*
-- **Execute** — Sandboxed skill runner. Two invocation paths:
+- **Execute** — Sandboxed skill runner with three invocation paths:
   - **Manual** — you type `seal run <name>` or click Run in the dashboard.
-  - **Auto** — once SEAL has learned a pattern and you approve the handler, every future similar event *runs the skill automatically without re-asking*. An email that matches the `newclient-proposal-review` handler just runs through the flow and notifies you; a git event that matches a `data_match` skill fires through the same pipeline. The single approval moment pays for every future run. *(v0.6.0 script runner · v0.10.0 handler router)*
+  - **Auto (approved + confident)** — once SEAL has learned a pattern and you approve the handler, every future similar event *runs the skill automatically without re-asking*. An email that matches the `newclient-proposal-review` handler fires through its flow and notifies you; a git event that matches a `data_match` handler runs the same way. The single approval moment pays for every future run.
+  - **Ask (unsure or unauthorized)** — if a pattern is below the confidence threshold, an incoming event doesn't match any taught handler, or a drafted script contains a risk the TL hasn't explicitly approved, SEAL **doesn't run**. It drops the situation into Proposals or the Ingest queue and waits for you. The pillar is *"high confidence + prior approval → act; anything less → ask"*. *(v0.6.0 script runner · v0.10.0 handler router · the Permission Gate in every pipeline)*
 - **Remember** — Typed SQLite FTS5 memory layer. Four kinds (user / feedback / project / reference) following Claude Code's frontmatter pattern, plus daily scratch notes that a dreaming sweep consolidates into durable memories. *(memory layer commit · the Brain's context on every turn)*
 - **Learn** — Observes your git activity, detects sequence and naming patterns, and drafts safe automations through the LLM for you to approve. Max 3 proposals per day, 7-day TTL, five decision shapes. *(v0.4.0 detector · v0.5.0 proposer)*
 - **Optimize** — Token-aware execution. RTK compresses CLI output 60–90% before it hits the LLM context. The memory layer is pure `better-sqlite3` + FTS5 — no Python subprocess, no fallback chains. *(RTK integration · native memory layer)*
