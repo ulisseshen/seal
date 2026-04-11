@@ -223,6 +223,42 @@ await db.exec(`
   CREATE INDEX IF NOT EXISTS idx_scratch_kind ON memory_scratch(kind);
 `);
 
+// v0.10.0 "SEAL asks back" — ingest loop storage.
+// See docs/AGENT-SYSTEM-DESIGN.md §3.9. Two tables:
+//  - handler_matchers: indexed match criteria per handler skill,
+//    so incoming events don't scan every skill in the db.
+//  - ingest_queue: unmatched data waiting for the TL to teach SEAL
+//    how to handle it. Becomes a handler skill once the TL approves.
+
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS handler_matchers (
+    skill_id   TEXT NOT NULL,
+    source     TEXT NOT NULL,
+    priority   INTEGER NOT NULL DEFAULT 0,
+    criteria   TEXT NOT NULL,
+    PRIMARY KEY (skill_id, source)
+  );
+  CREATE INDEX IF NOT EXISTS idx_handler_matchers_source ON handler_matchers(source, priority DESC);
+`);
+
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS ingest_queue (
+    id                INTEGER PRIMARY KEY AUTOINCREMENT,
+    source            TEXT NOT NULL,
+    received_at       TEXT NOT NULL,
+    data              TEXT NOT NULL,
+    interpretation    TEXT,
+    suggested_actions TEXT,
+    suggested_handler TEXT,
+    state             TEXT NOT NULL DEFAULT 'pending'
+                      CHECK(state IN ('pending','interpreted','taught','ignored','failed')),
+    handler_skill_id  TEXT,
+    decided_at        TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_ingest_state ON ingest_queue(state);
+  CREATE INDEX IF NOT EXISTS idx_ingest_source ON ingest_queue(source);
+`);
+
 // v0.6.0 "SEAL remembers" — skill factory storage.
 // See docs/AGENT-SYSTEM-DESIGN.md §3.5, §6. Approved proposals become
 // rows here and get persisted to ~/.config/seal/skills/<name>/ on disk.
@@ -982,6 +1018,92 @@ export async function recordSkillRun(id, { success }) {
 export async function setSkillState(id, state) {
   const now = new Date().toISOString();
   return db.run(`UPDATE skills SET state = ?, updated_at = ? WHERE id = ?`, [state, now, id]);
+}
+
+// ─── Ingest queries (v0.10.0 "SEAL asks back") ────────
+
+export async function upsertHandlerMatcher({ skill_id, source, priority = 0, criteria }) {
+  return db.run(`
+    INSERT INTO handler_matchers (skill_id, source, priority, criteria)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(skill_id, source) DO UPDATE SET
+      priority = excluded.priority,
+      criteria = excluded.criteria
+  `, [skill_id, source, priority, JSON.stringify(criteria || {})]);
+}
+
+export async function listHandlerMatchersForSource(source) {
+  const rows = await db.all(`
+    SELECT hm.skill_id, hm.source, hm.priority, hm.criteria,
+           s.name, s.script_path, s.state
+    FROM handler_matchers hm
+    JOIN skills s ON s.id = hm.skill_id
+    WHERE hm.source = ? AND s.state = 'active'
+    ORDER BY hm.priority DESC, s.created_at ASC
+  `, [source]);
+  return (rows || []).map((r) => ({
+    ...r,
+    criteria: safeJson(r.criteria, {}),
+  }));
+}
+
+export async function insertIngest({ source, data, interpretation = null, suggestedActions = null, suggestedHandler = null }) {
+  const now = new Date().toISOString();
+  const res = await db.run(`
+    INSERT INTO ingest_queue (source, received_at, data, interpretation, suggested_actions, suggested_handler)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `, [
+    source, now, JSON.stringify(data ?? {}),
+    interpretation,
+    suggestedActions ? JSON.stringify(suggestedActions) : null,
+    suggestedHandler ? JSON.stringify(suggestedHandler) : null,
+  ]);
+  return res?.lastInsertRowid ?? res?.lastInsertRowId ?? null;
+}
+
+export async function getIngest(id) {
+  const row = await db.get(`SELECT * FROM ingest_queue WHERE id = ?`, [id]);
+  if (!row) return null;
+  return {
+    ...row,
+    data: safeJson(row.data, {}),
+    suggested_actions: safeJson(row.suggested_actions, []),
+    suggested_handler: safeJson(row.suggested_handler, null),
+  };
+}
+
+export async function listIngest({ state, limit = 50 } = {}) {
+  let sql = `SELECT * FROM ingest_queue`;
+  const params = [];
+  if (state) { sql += ` WHERE state = ?`; params.push(state); }
+  sql += ` ORDER BY received_at DESC LIMIT ?`;
+  params.push(Math.min(Math.max(parseInt(limit, 10) || 50, 1), 500));
+  const rows = await db.all(sql, params);
+  return (rows || []).map((r) => ({
+    ...r,
+    data: safeJson(r.data, {}),
+    suggested_actions: safeJson(r.suggested_actions, []),
+    suggested_handler: safeJson(r.suggested_handler, null),
+  }));
+}
+
+export async function updateIngest(id, patch) {
+  const sets = [];
+  const params = [];
+  for (const k of ['interpretation', 'state', 'handler_skill_id', 'decided_at']) {
+    if (patch[k] !== undefined) { sets.push(`${k} = ?`); params.push(patch[k]); }
+  }
+  if (patch.suggested_actions !== undefined) {
+    sets.push(`suggested_actions = ?`);
+    params.push(JSON.stringify(patch.suggested_actions));
+  }
+  if (patch.suggested_handler !== undefined) {
+    sets.push(`suggested_handler = ?`);
+    params.push(JSON.stringify(patch.suggested_handler));
+  }
+  if (sets.length === 0) return null;
+  params.push(id);
+  return db.run(`UPDATE ingest_queue SET ${sets.join(', ')} WHERE id = ?`, params);
 }
 
 export { db, DB_PATH };

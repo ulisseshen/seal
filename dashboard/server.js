@@ -22,6 +22,7 @@ import {
 import { runDetectors } from '../src/brain/detector.js';
 import { runProposer, applyDecision } from '../src/brain/proposer.js';
 import { listSkills, runSkill, getSkillByName, readSkillRunHistory } from '../src/brain/skills.js';
+import { runIngest, approveIngestTeaching, ignoreIngest, listIngestQueue } from '../src/brain/ingest.js';
 import { installSealHooks, uninstallSealHooks, hasSealHooks } from './hooks-installer.js';
 import { getProvider, listProviders } from '../src/providers/index.js';
 import { hasSecret, backend as secretsBackend } from '../src/secrets.js';
@@ -592,6 +593,52 @@ app.get('/api/patterns', async (req, res) => {
 app.post('/api/patterns/scan', async (_req, res) => {
   try {
     const result = await runDetectors();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- API: Ingest (v0.10.0 "SEAL asks back") ---
+
+app.post('/api/ingest', async (req, res) => {
+  const { source, data } = req.body || {};
+  if (!source) return res.status(400).json({ error: 'source is required' });
+  try {
+    const result = await runIngest({ source, data: data || {} });
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/ingest/queue', async (req, res) => {
+  try {
+    const rows = await listIngestQueue({
+      state: req.query.state || undefined,
+      limit: parseInt(req.query.limit, 10) || 50,
+    });
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/ingest/queue/:id/teach', async (req, res) => {
+  try {
+    const result = await approveIngestTeaching(parseInt(req.params.id, 10), {
+      override: req.body?.override || null,
+      userNotes: req.body?.user_notes || null,
+    });
+    res.json(result);
+  } catch (err) {
+    res.status(400).json({ error: err.message });
+  }
+});
+
+app.post('/api/ingest/queue/:id/ignore', async (req, res) => {
+  try {
+    const result = await ignoreIngest(parseInt(req.params.id, 10));
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
