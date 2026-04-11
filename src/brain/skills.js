@@ -21,11 +21,13 @@ import {
 } from 'node:fs';
 import { join } from 'node:path';
 import { homedir } from 'node:os';
+import { parse as parseYaml } from 'yaml';
 
 import {
   insertSkill, getSkillByName, getSkillById, listSkills, recordSkillRun,
 } from '../db.js';
 import { wrapWithSandbox } from '../sandbox.js';
+import { runFlow } from '../flows/engine.js';
 
 const SKILLS_DIR = join(process.env.SEAL_DIR || join(homedir(), '.config', 'seal'), 'skills');
 
@@ -35,20 +37,31 @@ const SKILLS_DIR = join(process.env.SEAL_DIR || join(homedir(), '.config', 'seal
  * Persist an approved proposal as a skill. Idempotent per slug: if a
  * skill with the same slug already exists, append a numeric suffix so
  * both survive ("release" + "release-2").
+ *
+ * Backend detection (v0.7.0): if proposal.backend === 'flow' or the
+ * proposal.script looks like a flow-yaml document (starts with
+ * "name:" and has a "steps:" key), the skill is persisted as
+ * flow.yaml instead of script.sh. Otherwise we write a shell script.
  */
 export async function createSkillFromProposal(proposal, { finalScript = null } = {}) {
   const slug = slugify(proposal.name);
   const unique = await uniqueSlug(slug);
   const dir = join(SKILLS_DIR, unique);
 
-  const scriptSource = finalScript ?? proposal.script;
-  const scriptPath = join(dir, 'script.sh');
+  const source = finalScript ?? proposal.script;
+  const isFlow = looksLikeFlowYaml(proposal.backend, source);
+  const backendFile = isFlow ? 'flow.yaml' : 'script.sh';
+  const backendPath = join(dir, backendFile);
   const readmePath = join(dir, 'README.md');
   const metaPath = join(dir, 'skill.json');
   const runsPath = join(dir, 'runs.jsonl');
 
   mkdirSync(dir, { recursive: true });
-  writeFileSync(scriptPath, ensureShebang(scriptSource), { mode: 0o700 });
+  if (isFlow) {
+    writeFileSync(backendPath, source);
+  } else {
+    writeFileSync(backendPath, ensureShebang(source), { mode: 0o700 });
+  }
   writeFileSync(readmePath, buildReadme(proposal, unique));
   writeFileSync(runsPath, ''); // touch
 
@@ -58,6 +71,7 @@ export async function createSkillFromProposal(proposal, { finalScript = null } =
   const meta = {
     id,
     name: unique,
+    backend: isFlow ? 'flow' : 'script',
     description: proposal.explanation,
     invocation: proposal.invocation || `/seal ${unique}`,
     parameters: proposal.parameters ?? [],
@@ -75,7 +89,7 @@ export async function createSkillFromProposal(proposal, { finalScript = null } =
     id,
     name: unique,
     description: proposal.explanation,
-    script_path: scriptPath,
+    script_path: backendPath,
     pattern_id: proposal.pattern_id,
     proposal_id: proposal.id,
     parameters: proposal.parameters ?? [],
@@ -84,8 +98,15 @@ export async function createSkillFromProposal(proposal, { finalScript = null } =
     sandbox_profile: 'project-write',
   });
 
-  console.log(`[skills] created skill "${unique}" at ${dir}`);
-  return { id, name: unique, dir };
+  console.log(`[skills] created skill "${unique}" (${isFlow ? 'flow' : 'script'}) at ${dir}`);
+  return { id, name: unique, dir, backend: meta.backend };
+}
+
+function looksLikeFlowYaml(backendHint, src) {
+  if (backendHint === 'flow') return true;
+  if (typeof src !== 'string') return false;
+  // Cheap heuristic: YAML flow docs start with a name: line and declare steps:
+  return /^\s*name:/m.test(src) && /^\s*steps:/m.test(src) && !src.startsWith('#!');
 }
 
 // ─── Runner ────────────────────────────────────────
@@ -104,11 +125,17 @@ export async function runSkill(identifier, args = [], opts = {}) {
   if (!skill) throw new Error(`skill not found: ${identifier}`);
   if (skill.state !== 'active') throw new Error(`skill "${skill.name}" is ${skill.state}`);
 
+  // Dispatch based on the file extension of the backend file.
+  if (skill.script_path.endsWith('.yaml') || skill.script_path.endsWith('.yml')) {
+    return runFlowSkill(skill, args, opts);
+  }
+  return runScriptSkill(skill, args, opts);
+}
+
+function runScriptSkill(skill, args, opts) {
   const cwd = opts.cwd || process.cwd();
   const env = { ...process.env, ...(opts.env || {}) };
 
-  // Sandbox wrap. The existing sandbox.js knows how to apply profile rules.
-  // For skill runs we use the skill's own profile (or project-write default).
   const profile = skill.sandbox_profile || 'project-write';
   const { command, args: wrappedArgs } = wrapWithSandboxSafely('bash', [skill.script_path, ...args], profile);
 
@@ -131,6 +158,53 @@ export async function runSkill(identifier, args = [], opts = {}) {
       resolve({ exit_code: code ?? -1, stdout, stderr, duration_ms });
     });
   });
+}
+
+async function runFlowSkill(skill, args, _opts) {
+  const started = Date.now();
+  let stdout = '';
+  let stderr = '';
+  let exit_code = 0;
+
+  try {
+    const raw = readFileSync(skill.script_path, 'utf-8');
+    const flow = parseYaml(raw);
+    if (!flow || !Array.isArray(flow.steps)) {
+      throw new Error(`flow.yaml missing steps[]`);
+    }
+    // Seed flow defaults with positional args for {args.0} / {args.1} style templating.
+    flow.defaults = {
+      ...(flow.defaults || {}),
+      args: args.reduce((acc, v, i) => ({ ...acc, [i]: v }), {}),
+      now: new Date().toISOString(),
+    };
+
+    const ctx = await runFlow(flow);
+    // Serialize the final context into a readable report for the caller.
+    const finalState = Object.fromEntries(
+      Object.entries(ctx.state || {}).map(([k, v]) => [k, summarize(v)]),
+    );
+    stdout = JSON.stringify({ final: finalState, steps: ctx.history?.length ?? 0 }, null, 2);
+  } catch (err) {
+    stderr = err.message;
+    exit_code = 1;
+  }
+
+  const duration_ms = Date.now() - started;
+  await finalizeRun(skill, {
+    success: exit_code === 0, exit_code, stdout, stderr, duration_ms, args,
+  });
+  return { exit_code, stdout, stderr, duration_ms };
+}
+
+function summarize(v, depth = 0) {
+  if (v == null) return v;
+  if (typeof v === 'string') return v.length > 400 ? v.slice(0, 400) + '…' : v;
+  if (typeof v !== 'object' || depth > 2) return v;
+  if (Array.isArray(v)) return v.slice(0, 10).map((x) => summarize(x, depth + 1));
+  const out = {};
+  for (const [k, vv] of Object.entries(v)) out[k] = summarize(vv, depth + 1);
+  return out;
 }
 
 async function finalizeRun(skill, result) {
