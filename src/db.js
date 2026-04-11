@@ -170,6 +170,99 @@ await db.exec(`
   CREATE INDEX IF NOT EXISTS idx_watched_repos_active ON watched_repos(removed_at);
 `);
 
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS chat_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL DEFAULT 'default',
+    role TEXT NOT NULL CHECK(role IN ('user','assistant','system')),
+    content TEXT NOT NULL,
+    provider TEXT,
+    model TEXT,
+    created_at TEXT NOT NULL
+  );
+  CREATE INDEX IF NOT EXISTS idx_chat_messages_session ON chat_messages(session_id, id);
+`);
+
+// ─── Memory layer (typed durable + ephemeral scratch + FTS5) ───
+// Design synthesized from Claude Code (typed frontmatter), Hermes
+// (prefetch/sync lifecycle), and OpenClaw (dreaming sweep). See
+// docs/AGENT-SYSTEM-DESIGN.md §"Memory Layer" for the rationale.
+
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS memories (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    type         TEXT NOT NULL CHECK(type IN ('user','feedback','project','reference')),
+    name         TEXT NOT NULL,
+    description  TEXT NOT NULL,
+    content      TEXT NOT NULL,
+    project      TEXT,
+    source       TEXT NOT NULL DEFAULT 'auto' CHECK(source IN ('explicit','auto','consolidated')),
+    created_at   INTEGER NOT NULL,
+    updated_at   INTEGER NOT NULL,
+    last_used_at INTEGER,
+    use_count    INTEGER NOT NULL DEFAULT 0,
+    pinned       INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE INDEX IF NOT EXISTS idx_memories_type_project ON memories(type, project);
+  CREATE INDEX IF NOT EXISTS idx_memories_last_used ON memories(last_used_at);
+  CREATE INDEX IF NOT EXISTS idx_memories_pinned ON memories(pinned) WHERE pinned = 1;
+`);
+
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS memory_scratch (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    day             TEXT NOT NULL,
+    kind            TEXT NOT NULL,
+    ref_type        TEXT,
+    ref_id          TEXT,
+    content         TEXT NOT NULL,
+    created_at      INTEGER NOT NULL,
+    consolidated_at INTEGER
+  );
+  CREATE INDEX IF NOT EXISTS idx_scratch_day ON memory_scratch(day, consolidated_at);
+  CREATE INDEX IF NOT EXISTS idx_scratch_kind ON memory_scratch(kind);
+`);
+
+// FTS5 is only available on local better-sqlite3; libSQL cloud builds
+// disable the extension. Guard the virtual tables behind the mode check.
+if (!db.isCloud) {
+  await db.exec(`
+    CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
+      name, description, content,
+      content='memories', content_rowid='id',
+      tokenize='porter unicode61'
+    );
+
+    CREATE TRIGGER IF NOT EXISTS memories_ai AFTER INSERT ON memories BEGIN
+      INSERT INTO memories_fts(rowid, name, description, content)
+      VALUES (new.id, new.name, new.description, new.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS memories_ad AFTER DELETE ON memories BEGIN
+      INSERT INTO memories_fts(memories_fts, rowid, name, description, content)
+      VALUES ('delete', old.id, old.name, old.description, old.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS memories_au AFTER UPDATE ON memories BEGIN
+      INSERT INTO memories_fts(memories_fts, rowid, name, description, content)
+      VALUES ('delete', old.id, old.name, old.description, old.content);
+      INSERT INTO memories_fts(rowid, name, description, content)
+      VALUES (new.id, new.name, new.description, new.content);
+    END;
+
+    CREATE VIRTUAL TABLE IF NOT EXISTS chat_messages_fts USING fts5(
+      content,
+      content='chat_messages', content_rowid='id',
+      tokenize='porter unicode61'
+    );
+    CREATE TRIGGER IF NOT EXISTS chat_messages_ai AFTER INSERT ON chat_messages BEGIN
+      INSERT INTO chat_messages_fts(rowid, content) VALUES (new.id, new.content);
+    END;
+    CREATE TRIGGER IF NOT EXISTS chat_messages_ad AFTER DELETE ON chat_messages BEGIN
+      INSERT INTO chat_messages_fts(chat_messages_fts, rowid, content)
+      VALUES ('delete', old.id, old.content);
+    END;
+  `);
+}
+
 // ─── Public API (all async) ─────────────────────────────
 
 export async function insertTask(task) {
@@ -444,6 +537,110 @@ export async function getWatchedRepoByPath(repoPath) {
   if (!repoPath) return null;
   const row = await db.get(`SELECT * FROM watched_repos WHERE path = ?`, [repoPath]);
   return row || null;
+}
+
+// ─── Memory queries ────────────────────────────────────
+// Typed durable memories + ephemeral scratch + FTS5 recall.
+
+export async function insertMemory({ type, name, description, content, project = null, source = 'auto' }) {
+  const now = Date.now();
+  return db.run(`
+    INSERT INTO memories (type, name, description, content, project, source, created_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+  `, [type, name, description, content, project, source, now, now]);
+}
+
+export async function insertScratch({ kind, refType = null, refId = null, content }) {
+  const now = Date.now();
+  const day = new Date().toISOString().slice(0, 10);
+  return db.run(`
+    INSERT INTO memory_scratch (day, kind, ref_type, ref_id, content, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `, [day, kind, refType, refId, content, now]);
+}
+
+export async function searchMemoriesFts(query, limit = 5) {
+  if (db.isCloud) return []; // FTS5 local-only
+  return db.all(`
+    SELECT m.id, m.type, m.name, m.description, m.content, m.project
+    FROM memories_fts
+    JOIN memories m ON memories_fts.rowid = m.id
+    WHERE memories_fts MATCH ?
+    ORDER BY bm25(memories_fts)
+    LIMIT ?
+  `, [query, limit]);
+}
+
+export async function searchChatMessagesFts(query, limit = 3) {
+  if (db.isCloud) return [];
+  return db.all(`
+    SELECT cm.id, cm.role, cm.content, cm.session_id, cm.created_at
+    FROM chat_messages_fts
+    JOIN chat_messages cm ON chat_messages_fts.rowid = cm.id
+    WHERE chat_messages_fts MATCH ?
+    ORDER BY bm25(chat_messages_fts)
+    LIMIT ?
+  `, [query, limit]);
+}
+
+export async function pinnedMemories(project) {
+  if (project) {
+    return db.all(`
+      SELECT id, type, name, description, content, project
+      FROM memories
+      WHERE pinned = 1 AND (project IS NULL OR project = ?)
+    `, [project]);
+  }
+  return db.all(`
+    SELECT id, type, name, description, content, project
+    FROM memories WHERE pinned = 1
+  `);
+}
+
+export async function touchMemory(id) {
+  return db.run(`
+    UPDATE memories SET last_used_at = ?, use_count = use_count + 1 WHERE id = ?
+  `, [Date.now(), id]);
+}
+
+export async function listMemories({ type, project, limit = 50 } = {}) {
+  const where = [];
+  const params = [];
+  if (type)    { where.push('type = ?');    params.push(type); }
+  if (project) { where.push('project = ?'); params.push(project); }
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  params.push(limit);
+  return db.all(`
+    SELECT id, type, name, description, content, project, source,
+           created_at, updated_at, last_used_at, use_count, pinned
+    FROM memories ${clause}
+    ORDER BY pinned DESC, last_used_at DESC NULLS LAST, created_at DESC
+    LIMIT ?
+  `, params);
+}
+
+// ─── Chat message queries ──────────────────────────────
+
+export async function insertChatMessage({ sessionId = 'default', role, content, provider = null, model = null }) {
+  const now = new Date().toISOString();
+  return db.run(`
+    INSERT INTO chat_messages (session_id, role, content, provider, model, created_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+  `, [sessionId, role, content, provider, model, now]);
+}
+
+export async function listChatMessages({ sessionId = 'default', limit = 100 } = {}) {
+  return db.all(`
+    SELECT id, session_id, role, content, provider, model, created_at
+    FROM chat_messages
+    WHERE session_id = ?
+    ORDER BY id ASC
+    LIMIT ?
+  `, [sessionId, limit]);
+}
+
+export async function clearChatMessages(sessionId = 'default') {
+  return db.run(`DELETE FROM chat_messages WHERE session_id = ?`, [sessionId]);
 }
 
 export { db, DB_PATH };

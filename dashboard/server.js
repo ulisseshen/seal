@@ -9,6 +9,11 @@ import {
   listWatchedRepos,
   getWatchedRepoByPath,
   queryEvents,
+  insertChatMessage,
+  listChatMessages,
+  clearChatMessages,
+  listMemories,
+  insertMemory,
 } from '../src/db.js';
 import { installSealHooks, uninstallSealHooks, hasSealHooks } from './hooks-installer.js';
 import { getProvider, listProviders } from '../src/providers/index.js';
@@ -450,7 +455,7 @@ app.get('/api/events', async (req, res) => {
   }
 });
 
-// --- API: Chat (SSE streaming) ---
+// --- API: Chat (SSE streaming + persistence) ---
 
 app.post('/api/chat', async (req, res) => {
   const cfg = readChatConfig();
@@ -460,6 +465,7 @@ app.post('/api/chat', async (req, res) => {
   const model = req.body.model || cfgModel || undefined;
   const systemPrompt = req.body.system_prompt || cfg.system_prompt;
   const messages = Array.isArray(req.body.messages) ? req.body.messages : null;
+  const sessionId = req.body.session_id || 'default';
 
   if (!messages || messages.length === 0) {
     return res.status(400).json({ error: 'messages[] required' });
@@ -478,6 +484,16 @@ app.post('/api/chat', async (req, res) => {
     });
   }
 
+  // Persist the latest user turn BEFORE streaming (so it survives a crash).
+  const latest = messages[messages.length - 1];
+  if (latest?.role === 'user') {
+    try {
+      await insertChatMessage({ sessionId, role: 'user', content: latest.content, provider: providerName, model });
+    } catch (err) {
+      console.warn('[chat] persist user turn failed:', err.message);
+    }
+  }
+
   res.setHeader('Content-Type', 'text/event-stream');
   res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
@@ -488,17 +504,82 @@ app.post('/api/chat', async (req, res) => {
     res.write(`data: ${JSON.stringify(data)}\n\n`);
   };
 
-  sse('start', { provider: providerName, model });
+  sse('start', { provider: providerName, model, session_id: sessionId });
 
+  let accumulated = '';
   try {
     for await (const chunk of provider.stream(messages, systemPrompt)) {
+      accumulated += chunk;
       sse('chunk', { text: chunk });
     }
     sse('done', {});
+    if (accumulated) {
+      try {
+        await insertChatMessage({ sessionId, role: 'assistant', content: accumulated, provider: providerName, model });
+      } catch (err) {
+        console.warn('[chat] persist assistant turn failed:', err.message);
+      }
+    }
   } catch (err) {
     sse('error', { message: err.message });
   } finally {
     res.end();
+  }
+});
+
+// --- API: Chat history ---
+
+app.get('/api/chat/history', async (req, res) => {
+  const sessionId = req.query.session_id || 'default';
+  const limit = Math.min(parseInt(req.query.limit, 10) || 100, 500);
+  try {
+    const rows = await listChatMessages({ sessionId, limit });
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.delete('/api/chat/history', async (req, res) => {
+  const sessionId = req.query.session_id || 'default';
+  try {
+    await clearChatMessages(sessionId);
+    res.json({ cleared: true, session_id: sessionId });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- API: Memories ---
+
+app.get('/api/memories', async (req, res) => {
+  const { type, project, limit } = req.query;
+  try {
+    const rows = await listMemories({
+      type: type || undefined,
+      project: project || undefined,
+      limit: parseInt(limit, 10) || 50,
+    });
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/memories', async (req, res) => {
+  const { type, name, description, content, project } = req.body || {};
+  const valid = ['user', 'feedback', 'project', 'reference'];
+  if (!valid.includes(type)) {
+    return res.status(400).json({ error: `type must be one of ${valid.join(', ')}` });
+  }
+  if (!name || !description || !content) {
+    return res.status(400).json({ error: 'name, description, and content are required' });
+  }
+  try {
+    await insertMemory({ type, name, description, content, project: project || null, source: 'explicit' });
+    res.status(201).json({ created: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
   }
 });
 
