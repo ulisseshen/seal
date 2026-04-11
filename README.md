@@ -2,128 +2,216 @@
 
 **Discipline. Execution. No excuses.**
 
-Your second brain for tech leadership — an autonomous agent that captures, orchestrates, executes, remembers, and learns.
+> **Shadow. Eye. Brain. Hands.**
+> *It acts like me, but it is not me.*
 
-> **You think, SEAL does. You forget, SEAL remembers. You sleep, SEAL works.**
-
-SEAL is not a todo list. It's an autonomous agent built on AI coding CLIs that acts as your operational brain — capturing bugs from team chats, creating tasks in your issue tracker, reviewing PRs autonomously, managing context across sessions, and learning from every interaction.
+SEAL is an autonomous Tech-Lead assistant. It watches your git activity, notices the patterns you repeat, drafts safe automations, asks you once, and then handles every future similar thing on its own. It also routes unknown data — an email, a message, a chat line — into a *"I don't recognize this, teach me"* loop that turns into a reusable handler after a single conversation.
 
 ```bash
-# Paste a team chat with a bug report:
-/seal "People, a column visibility persistence broke in the order screen..."
-# → Extracts bug details, creates Azure DevOps task, assigns to the right dev
-
-# Automated PR review with re-review loop:
-# SEAL watches PRs, reviews, votes, watches for new commits, re-reviews
-seal-run  # starts the autonomous runner
-
-# Memory — just throw things at it:
-/seal evaluate eCharts vs fl_chart for unified chart visuals
-/seal decision: we chose Riverpod over Bloc for state management
-/seal person: João is on vacation April 7-14
+seal start              # runner + dashboard in the background
+seal open               # http://localhost:3333
+# That's it. Use your machine. SEAL watches and proposes.
 ```
 
-## Core pillars
+## The four parts
 
-### 1. Capture — understand any input
-Paste a Slack thread, describe a bug, mention an idea — SEAL classifies it and routes to the right action. Bug report? Creates a task in Azure DevOps. Idea? Stores as memory. Automation? Schedules execution.
+| Part | What it is | What it does |
+|------|------------|--------------|
+| 👤 **Shadow** | The identity | Follows you silently. Mirrors your shape. Never acts without your nod. |
+| 👁️ **Eye** | Observers | Sees what you do (git hooks, shell, file events) and what arrives for you (email, chat, calendar). |
+| 🧠 **Brain** | Detector + LLM | Notices patterns. Interprets inputs. Drafts plans. **Never decides alone.** |
+| 🖐️ **Hands** | Skill Factory + Flow Engine | Runs the automations you approved. Sandboxed. Every run is traceable to an approval. |
 
-### 2. Orchestrate — flow engine with pluggable adapters
-YAML-defined workflows (inspired by [OpenClaw](https://github.com/openclaw/openclaw)'s Lobster) with platform-agnostic adapters. The same PR review flow works on Azure DevOps, GitHub, or GitLab — just swap the adapter.
+The ethical rule — *"it acts like me, but it is not me"* — is what separates SEAL from every other agent framework. SEAL learns, drafts, and executes on your behalf, but every output is labeled, every action traces back to an explicit approval, and nothing irreversible happens without you clicking a button once.
 
-```yaml
-# flows/code-review.yaml
-steps:
-  - discover → find open PRs
-  - review → run /smart-review
-  - decide → approve or request changes
-  - watch → monitor for new commits
-  - re-review → delta review against previous findings
-  - notify → alert the dev
+## The two loops
+
+### Observe — "SEAL notices what I do"
+
+```
+ git hooks → events → patterns → proposals → [approve once] → skill → future auto-runs
 ```
 
-### 3. Execute — autonomous parallel sessions
-Spawns `claude -p` sessions with scoped permissions. Up to 4 concurrent tasks. Smart scheduling with cron, one-time, or loop-until-done patterns.
+- **v0.3.0 "SEAL sees"** — passive observation. Git hooks installed per repo, events persisted 90 days, no inference.
+- **v0.4.0 "SEAL notices"** — sequence detector (`A → B within 10m`) and naming detector (branch/tag regex library).
+- **v0.5.0 "SEAL proposes"** — LLM drafts a shell/flow automation for patterns past the confidence threshold. Five decisions: approve + save / approve once / modify / deny / suppress. Max 3 per day. 7-day TTL.
+- **v0.6.0 "SEAL remembers"** — approved proposals become persistent skills under `~/.config/seal/skills/<name>/`. Invoke from CLI, dashboard, or chat.
+- **v0.7.0 "SEAL follows steps"** — skills can be declarative YAML flows instead of shell scripts. Step types: `llm.ask`, `shell.run`, `ask_user.prompt`, `set.<key>`.
 
-### 4. Remember — persistent cross-session memory
-Integrated with [MemPalace](https://github.com/milla-jovovich/mempalace) for verbatim storage with vector search. 96.6% recall on LongMemEval. Every conversation, decision, and context is stored and findable — not summarized away.
+### Ingest — "SEAL asks what to do with this"
 
-### 5. Learn — self-improving skills
-Inspired by [Hermes Agent](https://github.com/NousResearch/hermes-agent)'s self-improving loop. After completing complex tasks, SEAL refines its skills. Memory prefetch/sync on every turn. User modeling that builds understanding over time.
+```
+ email/chat/event → handler match? → yes: run. no: LLM interprets → TL teaches once → handler born
+```
 
-### 6. Optimize — token-aware execution
-Native [RTK](https://github.com/rtk-ai/rtk) integration compresses CLI output by 60-90% before it hits the LLM context. Sessions last 3x longer. Lower costs. Better reasoning from less noise.
+- **v0.10.0 "SEAL asks back"** — data arriving at SEAL that no handler matches is parked in an `ingest_queue`. The LLM drafts a complete handler proposal (match criteria + `flow.yaml`). You approve once, the handler skill is born, and every future similar event runs through it automatically.
+
+Both loops go through the same **Brain → Permission Gate → Hands** pipeline. The Permission Gate is a human clicking a button. Once. No escalation ladder.
+
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ulisseshen/seal/main/install.sh | bash
+```
+
+The installer:
+
+- Clones the repo to `~/projects/seal` (or `$SEAL_INSTALL_DIR`)
+- Runs `npm install`
+- Installs [RTK](https://github.com/rtk-ai/rtk) (token compression) via brew or curl
+- Installs [MemPalace](https://github.com/milla-jovovich/mempalace) optionally (native SQLite FTS5 memory layer is the default)
+- Copies the `/seal` skill into Claude Code, Codex, Antigravity, and Cursor runtimes it detects
+- **Symlinks `seal` into `/usr/local/bin` (or `~/.local/bin`)** — a real binary, not a shell alias
+- Scrubs any prior SEAL shell aliases from your `.zshrc` / `.bashrc`
+
+## Quickstart
+
+```bash
+# 1. Configure a chat provider (interactive menu, or use flags)
+seal setup                              # interactive
+seal setup provider gemini --token X    # token-based
+seal setup provider codex --login       # delegates to codex login
+seal setup status                       # summary
+
+# 2. Start the services in the background
+seal start                              # runner + dashboard
+seal ps                                 # verify both are running
+seal open                               # http://localhost:3333
+
+# 3. Give the Eye something to watch
+#    → Dashboard → Workspaces tab → "Add workspace" → pick a git folder
+#    (installs git hooks so commits/branches/tags flow into the events table)
+
+# 4. Poke the ingest loop without waiting for real events
+#    → Dashboard → Ingest tab → "drop test data" form
+```
+
+SEAL is now watching. As you work, the detector builds up patterns. Every ~15 minutes the proposer looks at what's ready, drafts up to 3 proposals per day, and drops them in the **Proposals** tab with approve / deny / modify buttons. Approved proposals become skills you can invoke from `seal run <name>`.
+
+## CLI command surface
+
+```
+Daemon
+  seal start [runner|dashboard]       start background services (default: both)
+  seal stop  [runner|dashboard]       stop background services
+  seal restart [runner|dashboard]     stop + start
+  seal ps                             show running services + PIDs
+  seal logs [runner|dashboard] [-f]   tail service logs
+  seal open                           open the dashboard in the browser
+
+Setup
+  seal setup                          interactive menu
+  seal setup status                   show configured providers/channels
+  seal setup provider <name>          interactive token / select default
+  seal setup provider <name> --token X [--model Y]
+  seal setup provider codex --login   delegate to `codex login`
+  seal setup provider <name> --remove
+  seal setup channel <name> --set key=value
+
+Skills
+  seal skills                         list installed skills
+  seal run <name> [args...]           invoke a skill
+```
+
+## Chat providers
+
+SEAL supports five LLM backends behind a single interface — chat, proposal drafting, and ingest teaching all use the same abstraction:
+
+| Provider | Auth | Notes |
+|----------|------|-------|
+| **Claude** | `claude /login` | Delegates to the Claude Code CLI. Default model: `claude-opus-4-6`. |
+| **Codex** | `seal setup provider codex --login` | Delegates to the `codex login` CLI. Default: `gpt-5`. |
+| **Gemini** | `seal setup provider gemini --token <key>` | HTTP SSE against the Google Generative Language API. Default: `gemini-2.5-pro`. 1M context is the natural fit for the Brain's watcher role. |
+| **OpenAI** | `seal setup provider openai --token <sk-...>` | HTTP SSE against `/v1/chat/completions`. Default: `gpt-4.1-mini`. |
+| **Ollama** | `seal setup provider ollama --host http://...` | Local NDJSON stream. No credentials. Default: `llama3.1`. |
+
+API keys live in the **macOS Keychain** (service `seal`) or a `chmod 600` fallback at `~/.config/seal/secrets.json`. They are never written into `chat-config.json` or any world-readable file.
+
+## Dashboard
+
+`seal open` launches the dashboard at `http://localhost:3333`. Tabs:
+
+- **Missions** — the existing task queue (tasks, reminders, rituals, deadlines, decisions, people).
+- **Channels** — notification targets (Telegram, Discord, Slack, system).
+- **Chat** — live streaming chat against any configured provider. Markdown rendering, SQLite persistence, provider switcher.
+- **Logs** — execution log of every task run.
+- **Calendar** — 7-day view of scheduled tasks.
+- **Workspaces** — git repos SEAL is watching. Native folder picker, one-click hook install.
+- **Events** — live read-only tail of the events table (git commits, branches, tags, merges, pushes).
+- **Patterns** — detected sequence + naming patterns with confidence scores. "Scan now" button.
+- **Proposals** — LLM-drafted automations awaiting your approval. Five decision buttons.
+- **Skills** — installed library. Per-skill run form, run history, counters.
+- **Ingest** — unknown data queue, LLM interpretation, drafted handler, approve-to-create.
+
+## Storage layout
+
+```
+~/.config/seal/
+  tasks.db           SQLite (tasks, events, patterns, proposals, decisions,
+                     skills, handler_matchers, ingest_queue, memories, chat_messages)
+  secrets.json       fallback secret store (macOS uses Keychain instead)
+  chat-config.json   {provider, model, system_prompt}
+  channels.json      notification channel config
+  ingest.json        inbound channel config (telegram/whatsapp/discord/gmail)
+  run/               PID files for running daemons
+  logs/              daemon log files
+  skills/<name>/     installed skills
+    ├── skill.json
+    ├── script.sh      or flow.yaml
+    ├── README.md
+    └── runs.jsonl
+```
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────┐
-│                    SEAL Agent                        │
-│                                                      │
-│  ┌────────────┐  ┌──────────┐  ┌──────────────────┐ │
-│  │  MemPalace │  │   RTK    │  │   Flow Engine    │ │
-│  │  (memory)  │  │ (tokens) │  │   (workflows)    │ │
-│  └─────┬──────┘  └────┬─────┘  └────────┬─────────┘ │
-│        │               │                 │           │
-│  verbatim store   compress CLI    YAML pipelines     │
-│  vector recall    89% savings    step orchestration   │
-│  170 tokens       3x sessions    conditional logic    │
-│        │               │                 │           │
-│  ┌─────┴───────────────┴─────────────────┴─────────┐ │
-│  │              Adapters (pluggable)                 │ │
-│  │  Azure DevOps · GitHub · GitLab · Bitbucket      │ │
-│  └──────────────────────┬───────────────────────────┘ │
-│                         │                             │
-│  ┌──────────────────────┴───────────────────────────┐ │
-│  │           SEAL Runner (always-on daemon)          │ │
-│  │  SQLite/Turso · Cron · Policy · Sandbox · Notify │ │
-│  └──────────────────────────────────────────────────┘ │
-│                         │                             │
-│  ┌──────────────────────┴───────────────────────────┐ │
-│  │              Communication Channels               │ │
-│  │  Telegram · WhatsApp · Discord · Email · Voice   │ │
-│  └──────────────────────────────────────────────────┘ │
-└─────────────────────────────────────────────────────┘
+┌─────────────────────────────────────────────────────────────────┐
+│                          SEAL (seal binary)                      │
+│                                                                  │
+│  ┌──────────┐  ┌──────────┐  ┌──────────────┐  ┌─────────────┐ │
+│  │ Observers│  │   Brain  │  │ Skill Factory│  │  Dashboard  │ │
+│  │  (Eye)   │─▶│ Detector │─▶│  + Flow Eng. │◀─┤ + REST API  │ │
+│  │          │  │ Proposer │  │    (Hands)   │  │             │ │
+│  │ git.js   │  │ Ingest   │  │              │  │ Express     │ │
+│  │ + hooks  │  │          │  │              │  │             │ │
+│  └────┬─────┘  └─────┬────┘  └──────┬───────┘  └──────┬──────┘ │
+│       │              │              │                  │        │
+│       └──────────────┴──────────────┴──────────────────┘        │
+│                            │                                     │
+│  ┌─────────────────────────┴───────────────────────────────┐    │
+│  │                    SQLite (tasks.db)                    │    │
+│  │  events · patterns · proposals · decisions · skills     │    │
+│  │  handler_matchers · ingest_queue · memories (FTS5)      │    │
+│  │  chat_messages (FTS5) · watched_repos · tasks           │    │
+│  └─────────────────────────────────────────────────────────┘    │
+│                            │                                     │
+│  ┌─────────────────────────┴───────────────────────────────┐    │
+│  │              Provider Abstraction (unified stream API)  │    │
+│  │   Claude · Codex · Gemini · OpenAI · Ollama             │    │
+│  └──────────────────────────────────────────────────────────┘    │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
-## Skill orchestration
+## Requirements
 
-SEAL knows your project's skills. When it detects a bug report, it calls `/smart-create-task-azure`. When it finds an open PR, it calls `/smart-review`. It's your brain routing to the right tool.
+- **Node.js** 18+
+- **An AI coding CLI** (optional) — Claude Code, Codex, Antigravity, or Cursor — if you want `/seal` skill invocation from inside an assistant
+- **macOS** for full notification + Keychain support (Linux: degraded notifications, file-based secret fallback)
+- **`sqlite3`** CLI — only needed by the legacy `/seal` skill; the daemon uses `better-sqlite3` natively
+- Optional: **RTK** for token compression on task execution
+- Optional: **`ffmpeg` + `whisper-cli`** for voice-note transcription
 
-| Input pattern | SEAL action |
-|--------------|-------------|
-| Bug report / chat paste | Save note + create Azure DevOps task |
-| "review PR #123" | Run `/smart-review` with flow engine |
-| "avaliar eCharts" | Save as memory-only note |
-| "run tests every morning" | Schedule executable task |
-| "remind me 1:1 with Ana" | Schedule recurring notification |
+## Memory layer
 
-## PR review flow
+SEAL's Brain pulls context before every task using a three-layer recall:
 
-The crown jewel. SEAL reviews PRs autonomously with a re-review loop:
+- **Pinned memories** — typed (`user` / `feedback` / `project` / `reference`) from Claude Code's frontmatter pattern, always loaded for the task's project
+- **FTS5 memory search** — top-5 semantic-ish matches over the `memories` table, porter-stemmed
+- **FTS5 chat recall** — top-3 matches over the persistent chat history
 
-1. **Discover** — finds open PRs you haven't reviewed
-2. **Review** — runs your review skill (smart-review, flutter-review, etc.)
-3. **Decide** — no blockers? Approve. Blockers? Request changes.
-4. **Comment** — posts findings as inline thread comments
-5. **Watch** — monitors PR for new commits (polls every 5 min)
-6. **Re-review** — when dev pushes, re-analyzes with delta context
-7. **Resolve** — if previous findings are fixed, resolves threads and approves
-8. **Notify** — alerts the dev at every step
+The sync side writes task outcomes into `memory_scratch` as daily ephemeral notes. A future dreaming sweep consolidates recurring scratch into durable memories — the OpenClaw pattern.
 
-Same flow works on Azure DevOps, GitHub, and GitLab — just change the adapter.
-
-## Notification levels
-
-| Level | What happens | Can be ignored? |
-|-------|-------------|-----------------|
-| `silent` | Logs to SQLite only | Yes |
-| `sound` | macOS notification + sound | Yes |
-| `sticky` | Persistent notification + terminal bell | Harder |
-| `nuclear` | Alert dialog + voice announcement | Blocks until clicked |
-| `supernova` | Nuclear, but re-fires every 5 minutes until acknowledged | **No** |
-
-## Task types
+## Task types (v0.2.0, still supported)
 
 | Type | Description | Auto-executes? |
 |------|-------------|----------------|
@@ -135,33 +223,26 @@ Same flow works on Azure DevOps, GitHub, and GitLab — just change the adapter.
 | `person` | Info about a team member | No — searchable context |
 | `decision` | Architectural or team decision | No — searchable context |
 
-## Install
+## Notification levels
 
-```bash
-curl -fsSL https://raw.githubusercontent.com/ulisseshen/seal/main/install.sh | bash
-```
+| Level | What happens | Can be ignored? |
+|-------|-------------|-----------------|
+| `silent` | Logs to SQLite only | Yes |
+| `sound` | macOS notification + sound | Yes |
+| `sticky` | Persistent notification + terminal bell | Harder |
+| `nuclear` | Alert dialog + voice announcement | Blocks until clicked |
+| `supernova` | Nuclear, but re-fires every 5 minutes until acknowledged | **No** |
 
-## Requirements
+## Standing on the shoulders of
 
-- **Node.js** 18+
-- **An AI coding CLI** — Claude Code, Codex, Antigravity, or Cursor
-- **Claude Max plan** recommended for parallel execution
-- **macOS** for full notification support (Linux: degraded notifications)
-- **sqlite3** CLI
-- Optional: **RTK** (`brew install rtk-ai/tap/rtk`) for token optimization
-- Optional: **MemPalace** for persistent memory
-- Optional: **ffmpeg** + **whisper-cli** for voice transcription
+- **[Claude Code](https://code.claude.com)** — typed-frontmatter memory pattern (user / feedback / project / reference)
+- **[Hermes Agent](https://github.com/NousResearch/hermes-agent)** — prefetch-before-turn / sync-after-turn memory lifecycle, capacity-forced consolidation
+- **[OpenClaw](https://github.com/openclaw/openclaw)** — daily-notes → durable promotion ("dreaming sweep")
+- **[MemPalace](https://github.com/milla-jovovich/mempalace)** — verbatim memory with vector search (SEAL's native FTS5 layer replaces the Python subprocess)
+- **[RTK](https://github.com/rtk-ai/rtk)** — token compression for CLI output
+- **[Extreme Ownership](https://echelonfront.com/extreme-ownership/)** — the leadership philosophy behind the name
 
-## Communication channels
-
-| Channel | How it works |
-|---------|-------------|
-| **Telegram** | Bot via @BotFather |
-| **WhatsApp** | Baileys (WhatsApp Web) |
-| **Discord** | Bot via Developer Portal |
-| **Email** | Gmail IMAP or Cloudflare Worker |
-| **Voice notes** | Auto-transcribed via whisper-cli |
-| **Claude Code** | `/seal` skill |
+> *"There are no bad teams, only bad leaders."* — Jocko Willink
 
 ## Supported runtimes
 
@@ -171,16 +252,6 @@ curl -fsSL https://raw.githubusercontent.com/ulisseshen/seal/main/install.sh | b
 | Codex | Supported |
 | Antigravity | Supported |
 | Cursor | Supported |
-
-## Standing on the shoulders of
-
-- **[OpenClaw](https://github.com/openclaw/openclaw)** — Flow engine (Lobster) and adapter architecture
-- **[Hermes Agent](https://github.com/NousResearch/hermes-agent)** — Self-improving skills, memory prefetch/sync, user modeling
-- **[MemPalace](https://github.com/milla-jovovich/mempalace)** — Verbatim memory with vector search (96.6% recall)
-- **[RTK](https://github.com/rtk-ai/rtk)** — Token compression for CLI output (60-90% reduction)
-- **[Extreme Ownership](https://echelonfront.com/extreme-ownership/)** — The leadership philosophy behind the name
-
-> *"There are no bad teams, only bad leaders."* — Jocko Willink
 
 ## License
 
