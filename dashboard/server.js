@@ -1,8 +1,16 @@
 import express from 'express';
 import Database from 'better-sqlite3';
 import { fileURLToPath } from 'url';
-import { dirname, join } from 'path';
-import { readFileSync, writeFileSync, existsSync } from 'fs';
+import { dirname, join, isAbsolute } from 'path';
+import { readFileSync, writeFileSync, existsSync, readdirSync, statSync } from 'fs';
+import {
+  addWatchedRepo,
+  removeWatchedRepo,
+  listWatchedRepos,
+  getWatchedRepoByPath,
+  queryEvents,
+} from '../src/db.js';
+import { installSealHooks, uninstallSealHooks, hasSealHooks } from './hooks-installer.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -216,6 +224,206 @@ app.put('/api/chat-config', (req, res) => {
   try {
     writeFileSync(chatConfigPath, JSON.stringify(req.body, null, 2));
     res.json(req.body);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- API: Workspaces (v0.3.0 "Eye" layer) ---
+// Repos SEAL is watching for git activity. Add/list/remove + scan a parent
+// directory for candidate child repos. All hook install/uninstall is
+// synchronous and reversible — see dashboard/hooks-installer.js.
+
+app.post('/api/pick-folder', async (_req, res) => {
+  if (process.platform !== 'darwin') {
+    return res.status(501).json({ error: 'Native folder picker is only supported on macOS' });
+  }
+  const { spawn } = await import('node:child_process');
+  const script = 'POSIX path of (choose folder with prompt "Select a parent folder for SEAL to watch")';
+  const child = spawn('osascript', ['-e', script]);
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (d) => { stdout += d; });
+  child.stderr.on('data', (d) => { stderr += d; });
+  child.on('close', (code) => {
+    if (code === 0) {
+      const picked = stdout.trim().replace(/\/$/, '');
+      return res.json({ path: picked });
+    }
+    if (/User canceled/i.test(stderr)) {
+      return res.json({ cancelled: true });
+    }
+    return res.status(500).json({ error: stderr.trim() || `osascript exited ${code}` });
+  });
+});
+
+app.post('/api/workspaces/scan', async (req, res) => {
+  const { parent_path: parentPath } = req.body || {};
+  if (!parentPath || typeof parentPath !== 'string') {
+    return res.status(400).json({ error: 'parent_path is required' });
+  }
+  if (!isAbsolute(parentPath)) {
+    return res.status(400).json({ error: 'parent_path must be absolute' });
+  }
+  if (!existsSync(parentPath)) {
+    return res.status(404).json({ error: `parent_path does not exist: ${parentPath}` });
+  }
+  try {
+    const watched = await listWatchedRepos();
+    const watchedPaths = new Set(watched.map(r => r.path));
+
+    let entries = [];
+    try {
+      entries = readdirSync(parentPath, { withFileTypes: true });
+    } catch (err) {
+      return res.status(500).json({ error: `cannot read parent_path: ${err.message}` });
+    }
+
+    const repos = [];
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      const childPath = join(parentPath, entry.name);
+      const gitDir = join(childPath, '.git');
+      if (!existsSync(gitDir)) continue;
+      // Some checkouts have .git as a file (worktrees) — accept dir or file.
+      let valid = false;
+      try { valid = statSync(gitDir) ? true : false; } catch { valid = false; }
+      if (!valid) continue;
+
+      repos.push({
+        path: childPath,
+        name: entry.name,
+        already_watched: watchedPaths.has(childPath),
+        has_seal_hooks: hasSealHooks(childPath),
+      });
+    }
+
+    res.json({ parent_path: parentPath, repos });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/workspaces', async (_req, res) => {
+  try {
+    const repos = await listWatchedRepos();
+    const enriched = repos.map(r => ({
+      ...r,
+      has_seal_hooks: hasSealHooks(r.path),
+    }));
+    res.json(enriched);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+async function addOneWorkspace(repoPath) {
+  if (!repoPath || typeof repoPath !== 'string') {
+    throw new Error('path is required');
+  }
+  if (!isAbsolute(repoPath)) {
+    throw new Error('path must be absolute');
+  }
+  if (!existsSync(repoPath)) {
+    throw new Error(`path does not exist: ${repoPath}`);
+  }
+
+  let installResult = null;
+  let installError = null;
+  try {
+    installResult = installSealHooks(repoPath);
+  } catch (err) {
+    installError = err.message;
+  }
+
+  const installedOk =
+    installResult && installResult.installed.length > 0 && installResult.errors.length === 0;
+
+  const row = await addWatchedRepo({
+    path: repoPath,
+    hooksInstalled: installedOk,
+    fallbackScraper: !installedOk,
+  });
+
+  return {
+    ...row,
+    has_seal_hooks: hasSealHooks(repoPath),
+    install_error: installError || (installResult?.errors?.length ? installResult.errors : null),
+    installed_hooks: installResult?.installed || [],
+  };
+}
+
+app.post('/api/workspaces', async (req, res) => {
+  const { path: repoPath } = req.body || {};
+  try {
+    const row = await addOneWorkspace(repoPath);
+    res.status(201).json(row);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/workspaces/bulk', async (req, res) => {
+  const { paths } = req.body || {};
+  if (!Array.isArray(paths)) {
+    return res.status(400).json({ error: 'paths must be an array' });
+  }
+  const added = [];
+  const failed = [];
+  for (const repoPath of paths) {
+    try {
+      const row = await addOneWorkspace(repoPath);
+      added.push(row);
+    } catch (err) {
+      failed.push({ path: repoPath, error: err.message });
+    }
+  }
+  res.json({ added, failed });
+});
+
+app.delete('/api/workspaces/:id', async (req, res) => {
+  try {
+    const id = parseInt(req.params.id, 10);
+    if (!Number.isFinite(id)) {
+      return res.status(400).json({ error: 'invalid id' });
+    }
+    const all = await listWatchedRepos({ includeRemoved: true });
+    const repo = all.find(r => r.id === id);
+    if (!repo) return res.status(404).json({ error: 'workspace not found' });
+
+    let uninstall = null;
+    try {
+      uninstall = uninstallSealHooks(repo.path);
+    } catch (err) {
+      uninstall = { removed: [], restored: [], errors: [{ message: err.message }] };
+    }
+
+    const ok = await removeWatchedRepo(repo.path);
+    if (!ok) {
+      // Already removed — still report success so the UI can refresh.
+      return res.json({ removed: true, already_removed: true, uninstall });
+    }
+    res.json({ removed: true, uninstall });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- API: Events (v0.3.0 "Eye" layer) ---
+// Read-only live tail of the events table. No actions, no buttons in v0.3.0.
+
+app.get('/api/events', async (req, res) => {
+  try {
+    const { source, kind, since, until, limit } = req.query;
+    const lim = Math.min(Math.max(parseInt(limit, 10) || 100, 1), 1000);
+    const events = await queryEvents({
+      source: source || undefined,
+      kind: kind || undefined,
+      since: since || undefined,
+      until: until || undefined,
+      limit: lim,
+    });
+    res.json(events);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

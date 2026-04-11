@@ -1,12 +1,13 @@
 {
   "name": "seal",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "SEAL — Autonomous Tech Lead task runner. Discipline. Execution. No excuses.",
   "type": "module",
   "scripts": {
     "start": "node src/runner.js",
     "dev": "node --watch src/runner.js",
-    "web": "node src/web.js"
+    "web": "node src/web.js",
+    "test": "node --test tests/**/*.test.js"
   },
   "dependencies": {
     "@libsql/client": "^0.17.2",

@@ -5,6 +5,16 @@ import { loadConfig, CONFIG_PATH } from './config.js';
 
 const PORT = parseInt(process.env.SEAL_WEB_PORT || '3457', 10);
 
+// ─── Observer ingestion hooks ──────────────────────────
+// Stream C — the GitObserver is wired by runner.js at startup via
+// setGitIngester(). Keeping web.js observer-agnostic (no direct import of
+// src/observers/git.js) avoids circular-import risk and keeps the web
+// surface decoupled from the observer subsystem.
+let gitIngester = null;
+export function setGitIngester(fn) {
+  gitIngester = typeof fn === 'function' ? fn : null;
+}
+
 async function getStats() {
   const [active, done, failed, firing] = await Promise.all([
     db.get(`SELECT count(*) as c FROM tasks WHERE status IN ('pending','running')`),
@@ -107,6 +117,38 @@ async function handleAPI(req, res) {
       res.end(JSON.stringify({ ok: true, message: 'Config saved. Restart SEAL to apply.' }));
     } catch (err) {
       res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return true;
+  }
+
+  // ─── Stream C: Git hook ingestion endpoint ──────────
+  // Receives payloads from git hooks installed by Stream D. Normalization
+  // and event emission happen in GitObserver.ingestHookPayload, wired in
+  // by runner.js via setGitIngester(). This endpoint only handles HTTP
+  // framing + dispatch.
+  if (url.pathname === '/api/observe/git' && req.method === 'POST') {
+    const body = await readBody(req);
+    let payload;
+    try {
+      payload = JSON.parse(body);
+    } catch (err) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid JSON: ' + err.message }));
+      return true;
+    }
+    if (!gitIngester) {
+      res.writeHead(503, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'git observer not ready' }));
+      return true;
+    }
+    try {
+      await gitIngester(payload);
+      res.writeHead(204);
+      res.end();
+    } catch (err) {
+      console.warn('[web] git ingestion failed:', err.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message }));
     }
     return true;
