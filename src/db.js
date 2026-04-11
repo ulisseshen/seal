@@ -223,6 +223,37 @@ await db.exec(`
   CREATE INDEX IF NOT EXISTS idx_scratch_kind ON memory_scratch(kind);
 `);
 
+// v0.6.0 "SEAL remembers" — skill factory storage.
+// See docs/AGENT-SYSTEM-DESIGN.md §3.5, §6. Approved proposals become
+// rows here and get persisted to ~/.config/seal/skills/<name>/ on disk.
+// Runs are tracked inline (run_count, success_count, last_run_at) with
+// the full jsonl history living next to the script on disk.
+
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS skills (
+    id               TEXT PRIMARY KEY,
+    name             TEXT UNIQUE NOT NULL,
+    description      TEXT,
+    script_path      TEXT NOT NULL,
+    pattern_id       TEXT,
+    proposal_id      TEXT,
+    parameters       TEXT NOT NULL DEFAULT '[]',
+    triggers         TEXT NOT NULL DEFAULT '{"manual":true,"pattern_match":false,"cron":null}',
+    requires_ack     INTEGER NOT NULL DEFAULT 0,
+    sandbox_profile  TEXT,
+    created_at       TEXT NOT NULL,
+    updated_at       TEXT NOT NULL,
+    last_run_at      TEXT,
+    run_count        INTEGER NOT NULL DEFAULT 0,
+    success_count    INTEGER NOT NULL DEFAULT 0,
+    failure_count    INTEGER NOT NULL DEFAULT 0,
+    state            TEXT NOT NULL DEFAULT 'active'
+                     CHECK(state IN ('active','dormant','retired'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_skills_state ON skills(state);
+  CREATE INDEX IF NOT EXISTS idx_skills_pattern ON skills(pattern_id);
+`);
+
 // v0.5.0 "SEAL proposes" — proposals + decisions (permission gate).
 // See docs/AGENT-SYSTEM-DESIGN.md §3.3, §3.4, §6. A proposal is a
 // draft automation the Brain wrote from an observing pattern. The
@@ -873,6 +904,84 @@ export async function expireOldProposals() {
 function safeJson(s, fallback) {
   if (!s) return fallback;
   try { return JSON.parse(s); } catch { return fallback; }
+}
+
+// ─── Skill queries (v0.6.0 "SEAL remembers") ────────────
+
+export async function insertSkill(s) {
+  const now = new Date().toISOString();
+  return db.run(`
+    INSERT INTO skills (id, name, description, script_path, pattern_id, proposal_id,
+                        parameters, triggers, requires_ack, sandbox_profile,
+                        created_at, updated_at, state)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'active')
+  `, [
+    s.id, s.name, s.description ?? null, s.script_path,
+    s.pattern_id ?? null, s.proposal_id ?? null,
+    JSON.stringify(s.parameters ?? []),
+    JSON.stringify(s.triggers ?? { manual: true, pattern_match: false, cron: null }),
+    s.requires_ack ? 1 : 0,
+    s.sandbox_profile ?? null,
+    now, now,
+  ]);
+}
+
+export async function getSkillByName(name) {
+  const row = await db.get(`SELECT * FROM skills WHERE name = ?`, [name]);
+  if (!row) return null;
+  return {
+    ...row,
+    parameters: safeJson(row.parameters, []),
+    triggers: safeJson(row.triggers, { manual: true }),
+  };
+}
+
+export async function getSkillById(id) {
+  const row = await db.get(`SELECT * FROM skills WHERE id = ?`, [id]);
+  if (!row) return null;
+  return {
+    ...row,
+    parameters: safeJson(row.parameters, []),
+    triggers: safeJson(row.triggers, { manual: true }),
+  };
+}
+
+export async function listSkills({ state, limit = 100 } = {}) {
+  let sql = `SELECT * FROM skills`;
+  const params = [];
+  if (state) { sql += ` WHERE state = ?`; params.push(state); }
+  sql += ` ORDER BY
+    CASE state WHEN 'active' THEN 1 WHEN 'dormant' THEN 2 WHEN 'retired' THEN 3 END,
+    last_run_at DESC NULLS LAST,
+    created_at DESC
+    LIMIT ?`;
+  params.push(Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500));
+  const rows = await db.all(sql, params);
+  return (rows || []).map((r) => ({
+    ...r,
+    parameters: safeJson(r.parameters, []),
+    triggers: safeJson(r.triggers, { manual: true }),
+  }));
+}
+
+export async function recordSkillRun(id, { success }) {
+  const now = new Date().toISOString();
+  const successInc = success ? 1 : 0;
+  const failInc = success ? 0 : 1;
+  return db.run(`
+    UPDATE skills
+    SET run_count = run_count + 1,
+        success_count = success_count + ?,
+        failure_count = failure_count + ?,
+        last_run_at = ?,
+        updated_at = ?
+    WHERE id = ?
+  `, [successInc, failInc, now, now, id]);
+}
+
+export async function setSkillState(id, state) {
+  const now = new Date().toISOString();
+  return db.run(`UPDATE skills SET state = ?, updated_at = ? WHERE id = ?`, [state, now, id]);
 }
 
 export { db, DB_PATH };

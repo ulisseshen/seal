@@ -21,6 +21,7 @@ import {
 } from '../src/db.js';
 import { runDetectors } from '../src/brain/detector.js';
 import { runProposer, applyDecision } from '../src/brain/proposer.js';
+import { listSkills, runSkill, getSkillByName, readSkillRunHistory } from '../src/brain/skills.js';
 import { installSealHooks, uninstallSealHooks, hasSealHooks } from './hooks-installer.js';
 import { getProvider, listProviders } from '../src/providers/index.js';
 import { hasSecret, backend as secretsBackend } from '../src/secrets.js';
@@ -591,6 +592,41 @@ app.get('/api/patterns', async (req, res) => {
 app.post('/api/patterns/scan', async (_req, res) => {
   try {
     const result = await runDetectors();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- API: Skills (v0.6.0 "SEAL remembers") ---
+
+app.get('/api/skills', async (req, res) => {
+  try {
+    const rows = await listSkills({
+      state: req.query.state || undefined,
+      limit: parseInt(req.query.limit, 10) || 100,
+    });
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/skills/:name', async (req, res) => {
+  try {
+    const skill = await getSkillByName(req.params.name);
+    if (!skill) return res.status(404).json({ error: 'not found' });
+    const history = readSkillRunHistory(skill.name, 20);
+    res.json({ ...skill, history });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/skills/:name/run', async (req, res) => {
+  const args = Array.isArray(req.body?.args) ? req.body.args.map(String) : [];
+  try {
+    const result = await runSkill(req.params.name, args);
     res.json(result);
   } catch (err) {
     res.status(500).json({ error: err.message });
