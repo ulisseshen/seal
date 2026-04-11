@@ -84,6 +84,7 @@ document.querySelectorAll('.sidebar-item').forEach(tab => {
     if (tabName === 'patterns') loadPatterns();
     if (tabName === 'proposals') loadProposals();
     if (tabName === 'skills') loadSkills();
+    if (tabName === 'ingest') loadIngest();
   });
 });
 
@@ -1454,6 +1455,129 @@ async function onSkillRun(e) {
     loadSkills();
   }
 }
+
+// --- Ingest (v0.10.0 "SEAL asks back") ---
+
+async function loadIngest() {
+  const list = document.getElementById('ingest-list');
+  if (!list) return;
+  list.innerHTML = '<div class="empty-state"><p>Loading…</p></div>';
+  try {
+    const res = await fetch(`${API}/api/ingest/queue`);
+    const rows = await res.json();
+    if (!Array.isArray(rows) || rows.length === 0) {
+      list.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-state-icon">&#x1F4E5;</div>
+          <h3>Ingest queue is empty</h3>
+          <p>Use the form above to drop test data into the loop, or wire a gateway to POST <code>/api/ingest</code>.</p>
+        </div>`;
+      return;
+    }
+    list.innerHTML = rows.map(renderIngestCard).join('');
+    list.querySelectorAll('[data-ingest-action]').forEach((btn) => btn.addEventListener('click', onIngestAction));
+  } catch (err) {
+    list.innerHTML = `<div class="empty-state"><p>Failed to load: ${err.message}</p></div>`;
+  }
+}
+
+function renderIngestCard(item) {
+  const handler = item.suggested_handler;
+  const actions = Array.isArray(item.suggested_actions) ? item.suggested_actions : [];
+
+  const pendingActions = item.decided_at ? '' : `
+    <div class="ingest-actions">
+      ${handler ? `<button class="btn btn-success btn-sm" data-ingest-action="teach" data-id="${item.id}">📚 Approve handler</button>` : ''}
+      <button class="btn btn-ghost btn-sm" data-ingest-action="ignore" data-id="${item.id}">🤷 Ignore</button>
+    </div>`;
+
+  const decidedHtml = item.decided_at
+    ? `<div class="proposal-decided">State: <strong>${item.state}</strong>${item.handler_skill_id ? ` · handler <code>${escapeHtml(item.handler_skill_id)}</code>` : ''}</div>`
+    : '';
+
+  return `
+    <div class="ingest-card ${item.decided_at ? 'decided' : ''}" data-ingest-id="${item.id}">
+      <div class="ingest-header">
+        <span class="ingest-source">${escapeHtml(item.source)}</span>
+        <span class="ingest-time">${fmtRelative(item.received_at)}</span>
+        <span class="ingest-state">${item.state}</span>
+      </div>
+      <pre class="ingest-data"><code>${escapeHtml(JSON.stringify(item.data, null, 2))}</code></pre>
+      ${item.interpretation ? `<div class="ingest-interpretation"><strong>Interpretation:</strong> ${escapeHtml(item.interpretation)}</div>` : ''}
+      ${actions.length ? `<div class="ingest-suggested-actions"><strong>Suggested:</strong> ${actions.map(escapeHtml).join(' · ')}</div>` : ''}
+      ${handler ? `
+        <div class="ingest-handler">
+          <strong>Draft handler:</strong> <code>${escapeHtml(handler.name || 'unnamed')}</code>
+          ${handler.description ? `<p class="ingest-handler-desc">${escapeHtml(handler.description)}</p>` : ''}
+          ${handler.match_criteria ? `<details><summary>match criteria</summary><pre><code>${escapeHtml(JSON.stringify(handler.match_criteria, null, 2))}</code></pre></details>` : ''}
+          ${handler.flow_yaml ? `<details><summary>flow.yaml</summary><pre><code>${escapeHtml(handler.flow_yaml)}</code></pre></details>` : ''}
+        </div>` : ''}
+      ${pendingActions}
+      ${decidedHtml}
+    </div>
+  `;
+}
+
+async function onIngestAction(e) {
+  const btn = e.currentTarget;
+  const id = btn.dataset.id;
+  const action = btn.dataset.ingestAction;
+
+  btn.disabled = true;
+  btn.textContent = 'Working…';
+  try {
+    const url = action === 'teach'
+      ? `${API}/api/ingest/queue/${id}/teach`
+      : `${API}/api/ingest/queue/${id}/ignore`;
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({}),
+    });
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({}));
+      alert('Action failed: ' + (err.error || res.status));
+      return;
+    }
+    await loadIngest();
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+document.getElementById('btn-reload-ingest')?.addEventListener('click', loadIngest);
+
+document.getElementById('btn-ingest-poke')?.addEventListener('click', async () => {
+  const source = document.getElementById('ingest-poke-source').value.trim() || 'manual';
+  const rawData = document.getElementById('ingest-poke-data').value.trim();
+  const resultEl = document.getElementById('ingest-poke-result');
+  resultEl.textContent = 'Sending…';
+
+  let data = {};
+  if (rawData) {
+    try { data = JSON.parse(rawData); }
+    catch (err) { resultEl.textContent = '⚠ Invalid JSON: ' + err.message; return; }
+  }
+
+  try {
+    const res = await fetch(`${API}/api/ingest`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ source, data }),
+    });
+    const result = await res.json();
+    if (!res.ok) {
+      resultEl.textContent = '⚠ ' + (result.error || `HTTP ${res.status}`);
+      return;
+    }
+    resultEl.textContent = result.matched
+      ? `✓ matched handler "${result.handler}" (exit ${result.result?.exit_code ?? '—'})`
+      : `✓ queued as ingest #${result.ingest_id}`;
+    setTimeout(loadIngest, 300);
+  } catch (err) {
+    resultEl.textContent = '⚠ ' + err.message;
+  }
+});
 
 // --- Init ---
 
