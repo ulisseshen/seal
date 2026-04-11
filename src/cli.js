@@ -21,9 +21,11 @@ const CHAT_CONFIG = join(SEAL_DIR, 'chat-config.json');
 const CHANNELS_CONFIG = join(SEAL_DIR, 'channels.json');
 
 const PROVIDERS = {
-  claude:  { label: 'Claude (via claude CLI)',      defaultModel: 'claude-opus-4-6',     authMode: 'cli-managed' },
-  codex:   { label: 'Codex (via codex CLI)',        defaultModel: 'gpt-5',               authMode: 'cli-managed' },
-  gemini:  { label: 'Gemini (Google AI Studio key)', defaultModel: 'gemini-2.5-pro',      authMode: 'token' },
+  claude:  { label: 'Claude (via claude CLI)',       defaultModel: 'claude-opus-4-6',  authMode: 'cli-managed' },
+  codex:   { label: 'Codex (via codex CLI)',         defaultModel: 'gpt-5',            authMode: 'cli-managed' },
+  gemini:  { label: 'Gemini (Google AI Studio key)', defaultModel: 'gemini-2.5-pro',   authMode: 'token' },
+  openai:  { label: 'OpenAI (sk-... from platform)', defaultModel: 'gpt-4.1-mini',     authMode: 'token' },
+  ollama:  { label: 'Ollama (local, http://...)',    defaultModel: 'llama3.1',         authMode: 'host' },
 };
 
 // --- utilities ---
@@ -122,6 +124,10 @@ function cmdStatus() {
     } else {
       credStatus = hasSecret(name, 'api_key') ? C.green('token saved') : C.dim('not configured');
     }
+    if (meta.authMode === 'host') {
+      const host = getSecret(name, 'host') || process.env.OLLAMA_HOST || 'http://localhost:11434';
+      credStatus = `${C.green('host')} ${C.dim(host)}`;
+    }
     console.log(`    ${C.cyan(name.padEnd(8))} ${meta.label.padEnd(36)} ${credStatus}${isDefault}`);
   }
   console.log();
@@ -157,9 +163,29 @@ async function cmdProvider(args) {
     if (meta.authMode === 'token') {
       const ok = delSecret(name, 'api_key');
       console.log(ok ? C.green(`✓ Removed ${name} token`) : C.yellow(`No ${name} token to remove`));
+    } else if (meta.authMode === 'host') {
+      const ok = delSecret(name, 'host');
+      console.log(ok ? C.green(`✓ Removed ${name} host override`) : C.yellow(`No ${name} host override to remove`));
     } else {
       console.log(C.yellow(`${name} auth is managed by its CLI. Run \`${name} logout\` to sign out.`));
     }
+    return;
+  }
+
+  // Host-based provider (ollama)
+  if (meta.authMode === 'host') {
+    let host = typeof flags.host === 'string' ? flags.host : null;
+    if (!host) {
+      const rl = createInterface({ input: process.stdin, output: process.stdout });
+      try {
+        console.log(C.cyan(`Configuring ${meta.label}`));
+        host = await prompt(rl, `Host URL [http://localhost:11434]: `);
+      } finally { rl.close(); }
+      if (!host) host = 'http://localhost:11434';
+    }
+    setSecret(name, 'host', host);
+    setDefaultProvider(name, flags.model || meta.defaultModel);
+    console.log(C.green(`✓ ${name} host saved (${host})`));
     return;
   }
 
