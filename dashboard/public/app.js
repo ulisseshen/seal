@@ -445,41 +445,60 @@ async function testChannel(channel) {
 
 // --- Chat ---
 
-const chatMessages = [];
+const chatHistory = [];
+let currentProvider = null;
+let currentModel = null;
+let chatBusy = false;
 
 async function loadChatConfig() {
   try {
     const res = await fetch(`${API}/api/chat-config`);
     const config = await res.json();
-    document.getElementById('chat-model').value = config.model || 'claude';
-    document.getElementById('chat-api-key').value = config.api_key || '';
+    currentProvider = config.provider;
+    currentModel = config.model;
+
     document.getElementById('chat-system-prompt').value = config.system_prompt || '';
+    document.getElementById('chat-model-input').value = config.model || '';
+
+    // Populate provider select from server-side registry
+    const sel = document.getElementById('chat-provider');
+    sel.innerHTML = '';
+    (config.providers || []).forEach((p) => {
+      const opt = document.createElement('option');
+      opt.value = p.name;
+      opt.textContent = `${p.name}${p.available ? '' : ' (not configured)'}`;
+      opt.disabled = !p.available;
+      if (p.is_default) opt.selected = true;
+      sel.appendChild(opt);
+    });
+
+    document.getElementById('chat-secrets-backend').textContent = config.secrets_backend || '';
   } catch (err) {
     console.error('Failed to load chat config:', err);
   }
 }
 
 document.getElementById('btn-save-chat-config').addEventListener('click', async () => {
-  const config = {
-    model: document.getElementById('chat-model').value,
-    api_key: document.getElementById('chat-api-key').value,
+  const body = {
+    provider: document.getElementById('chat-provider').value,
+    model: document.getElementById('chat-model-input').value || null,
     system_prompt: document.getElementById('chat-system-prompt').value,
   };
   try {
     await fetch(`${API}/api/chat-config`, {
       method: 'PUT',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(config)
+      body: JSON.stringify(body)
     });
+    currentProvider = body.provider;
+    currentModel = body.model;
   } catch (err) {
     console.error('Failed to save chat config:', err);
   }
 });
 
 function addChatMessage(text, role) {
-  chatMessages.push({ text, role });
   const container = document.getElementById('chat-messages');
-  // Remove welcome
   const welcome = container.querySelector('.chat-welcome');
   if (welcome) welcome.remove();
 
@@ -488,24 +507,102 @@ function addChatMessage(text, role) {
   msg.textContent = text;
   container.appendChild(msg);
   container.scrollTop = container.scrollHeight;
+  return msg;
 }
 
 document.getElementById('btn-send').addEventListener('click', sendChat);
 document.getElementById('chat-input').addEventListener('keydown', (e) => {
-  if (e.key === 'Enter') sendChat();
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendChat(); }
 });
 
-function sendChat() {
+async function sendChat() {
+  if (chatBusy) return;
   const input = document.getElementById('chat-input');
   const text = input.value.trim();
   if (!text) return;
+
+  chatHistory.push({ role: 'user', content: text });
   addChatMessage(text, 'user');
   input.value = '';
 
-  // Simulated response (UI shell only)
-  setTimeout(() => {
-    addChatMessage("Chat integration coming soon. Configure the model and API key below to enable AI responses.", 'ai');
-  }, 600);
+  const assistantEl = addChatMessage('', 'ai');
+  assistantEl.classList.add('streaming');
+  chatBusy = true;
+
+  const provider = document.getElementById('chat-provider').value || currentProvider;
+  const model = document.getElementById('chat-model-input').value || currentModel || undefined;
+  const systemPrompt = document.getElementById('chat-system-prompt').value || undefined;
+
+  try {
+    const res = await fetch(`${API}/api/chat`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        provider,
+        model,
+        system_prompt: systemPrompt,
+        messages: chatHistory,
+      }),
+    });
+
+    if (!res.ok) {
+      const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+      assistantEl.textContent = `⚠ ${err.error}`;
+      chatHistory.pop(); // drop the user turn so they can retry
+      return;
+    }
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    let accumulated = '';
+    let hadError = null;
+
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += decoder.decode(value, { stream: true });
+
+      let sep;
+      while ((sep = buffer.indexOf('\n\n')) !== -1) {
+        const raw = buffer.slice(0, sep);
+        buffer = buffer.slice(sep + 2);
+
+        const lines = raw.split('\n');
+        let event = 'message';
+        let data = '';
+        for (const line of lines) {
+          if (line.startsWith('event:')) event = line.slice(6).trim();
+          else if (line.startsWith('data:')) data += line.slice(5).trim();
+        }
+        if (!data) continue;
+
+        let payload;
+        try { payload = JSON.parse(data); } catch { continue; }
+
+        if (event === 'chunk' && payload.text) {
+          accumulated += payload.text;
+          assistantEl.textContent = accumulated;
+          document.getElementById('chat-messages').scrollTop = 1e9;
+        } else if (event === 'error') {
+          hadError = payload.message;
+        }
+      }
+    }
+
+    assistantEl.classList.remove('streaming');
+    if (hadError) {
+      assistantEl.textContent = `⚠ ${hadError}`;
+      chatHistory.pop();
+    } else {
+      chatHistory.push({ role: 'assistant', content: accumulated });
+    }
+  } catch (err) {
+    assistantEl.textContent = `⚠ ${err.message}`;
+    chatHistory.pop();
+  } finally {
+    chatBusy = false;
+  }
 }
 
 // --- Logs ---
