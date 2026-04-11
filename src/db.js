@@ -223,6 +223,32 @@ await db.exec(`
   CREATE INDEX IF NOT EXISTS idx_scratch_kind ON memory_scratch(kind);
 `);
 
+// v0.4.0 "SEAL notices" — pattern detector storage.
+// See docs/AGENT-SYSTEM-DESIGN.md §3.2.2. The detector writes here,
+// the proposal engine (v0.5.0) reads from here, the dashboard renders
+// the observing/proposed/active rows.
+
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS patterns (
+    id              TEXT PRIMARY KEY,
+    kind            TEXT NOT NULL CHECK(kind IN ('sequence','temporal','naming','reaction','usage')),
+    signature       TEXT NOT NULL UNIQUE,
+    evidence_count  INTEGER NOT NULL DEFAULT 0,
+    confidence      REAL NOT NULL DEFAULT 0.0,
+    first_seen      TEXT NOT NULL,
+    last_seen       TEXT NOT NULL,
+    state           TEXT NOT NULL DEFAULT 'observing'
+                    CHECK(state IN ('observing','proposed','approved','denied','active','retired')),
+    metadata        TEXT NOT NULL DEFAULT '{}',
+    proposed_at     TEXT,
+    skill_id        TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_patterns_state ON patterns(state);
+  CREATE INDEX IF NOT EXISTS idx_patterns_kind ON patterns(kind);
+  CREATE INDEX IF NOT EXISTS idx_patterns_confidence_observing
+    ON patterns(confidence) WHERE state='observing';
+`);
+
 // FTS5 is only available on local better-sqlite3; libSQL cloud builds
 // disable the extension. Guard the virtual tables behind the mode check.
 if (!db.isCloud) {
@@ -641,6 +667,66 @@ export async function listChatMessages({ sessionId = 'default', limit = 100 } = 
 
 export async function clearChatMessages(sessionId = 'default') {
   return db.run(`DELETE FROM chat_messages WHERE session_id = ?`, [sessionId]);
+}
+
+// ─── Pattern detector queries (v0.4.0 "SEAL notices") ───
+
+export async function upsertPattern({ id, kind, signature, evidenceCount, confidence, metadata }) {
+  const now = new Date().toISOString();
+  const metaStr = JSON.stringify(metadata ?? {});
+  // Insert-or-update semantics: new patterns start as "observing",
+  // existing rows get their counts/confidence/last_seen refreshed
+  // without disturbing state transitions driven by the proposal engine.
+  return db.run(`
+    INSERT INTO patterns (id, kind, signature, evidence_count, confidence,
+                          first_seen, last_seen, state, metadata)
+    VALUES (?, ?, ?, ?, ?, ?, ?, 'observing', ?)
+    ON CONFLICT(signature) DO UPDATE SET
+      evidence_count = excluded.evidence_count,
+      confidence     = excluded.confidence,
+      last_seen      = excluded.last_seen,
+      metadata       = excluded.metadata
+  `, [id, kind, signature, evidenceCount, confidence, now, now, metaStr]);
+}
+
+export async function listPatterns({ state, kind, limit = 100 } = {}) {
+  const where = [];
+  const params = [];
+  if (state) { where.push('state = ?'); params.push(state); }
+  if (kind)  { where.push('kind = ?');  params.push(kind); }
+  const clause = where.length ? `WHERE ${where.join(' AND ')}` : '';
+  params.push(Math.min(Math.max(parseInt(limit, 10) || 100, 1), 500));
+  const rows = await db.all(`
+    SELECT id, kind, signature, evidence_count, confidence, state,
+           first_seen, last_seen, metadata, proposed_at, skill_id
+    FROM patterns ${clause}
+    ORDER BY
+      CASE state
+        WHEN 'proposed' THEN 1
+        WHEN 'observing' THEN 2
+        WHEN 'active' THEN 3
+        WHEN 'approved' THEN 4
+        WHEN 'denied' THEN 5
+        WHEN 'retired' THEN 6
+      END,
+      confidence DESC,
+      last_seen DESC
+    LIMIT ?
+  `, params);
+  return (rows || []).map((r) => {
+    let meta = null;
+    try { meta = JSON.parse(r.metadata); } catch { meta = null; }
+    return { ...r, metadata: meta };
+  });
+}
+
+export async function setPatternState(id, state) {
+  const now = new Date().toISOString();
+  const proposedAt = state === 'proposed' ? now : null;
+  return db.run(`
+    UPDATE patterns SET state = ?, proposed_at = COALESCE(?, proposed_at)
+    WHERE id = ?
+  `, [state, proposedAt, id]);
 }
 
 export { db, DB_PATH };

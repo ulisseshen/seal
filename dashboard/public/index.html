@@ -53,6 +53,10 @@
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></svg>
           <span class="sidebar-label">Events</span>
         </button>
+        <button class="sidebar-item" data-tab="patterns" title="Patterns">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M4 6h16M4 12h10M4 18h6"/><circle cx="18" cy="12" r="2"/><circle cx="14" cy="18" r="2"/></svg>
+          <span class="sidebar-label">Patterns</span>
+        </button>
       </nav>
       <div class="sidebar-footer">
         <div class="sidebar-stats" id="header-stats"></div>
@@ -227,6 +231,27 @@
           </div>
         </div>
         <div id="events-list" class="events-list"></div>
+      </section>
+
+      <!-- Patterns (v0.4.0 "SEAL notices") -->
+      <section class="page" id="page-patterns">
+        <div class="page-header">
+          <h2 class="page-title">Detected Patterns</h2>
+          <div class="page-actions">
+            <div class="log-filters">
+              <button class="filter-chip active" data-pattern-state="all">All</button>
+              <button class="filter-chip" data-pattern-state="observing">Observing</button>
+              <button class="filter-chip" data-pattern-state="proposed">Proposed</button>
+              <button class="filter-chip" data-pattern-state="active">Active</button>
+            </div>
+            <button class="btn btn-primary btn-sm" id="btn-scan-patterns">Scan now</button>
+          </div>
+        </div>
+        <p class="page-subtitle">
+          SEAL watches the event stream and surfaces repeated shapes.
+          No automation runs from here yet — patterns become proposals in v0.5.0.
+        </p>
+        <div id="patterns-list" class="patterns-list"></div>
       </section>
     </main>
   </div>

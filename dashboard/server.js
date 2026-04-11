@@ -14,7 +14,10 @@ import {
   clearChatMessages,
   listMemories,
   insertMemory,
+  listPatterns,
+  setPatternState,
 } from '../src/db.js';
+import { runDetectors } from '../src/brain/detector.js';
 import { installSealHooks, uninstallSealHooks, hasSealHooks } from './hooks-installer.js';
 import { getProvider, listProviders } from '../src/providers/index.js';
 import { hasSecret, backend as secretsBackend } from '../src/secrets.js';
@@ -561,6 +564,45 @@ app.get('/api/memories', async (req, res) => {
       limit: parseInt(limit, 10) || 50,
     });
     res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- API: Patterns (v0.4.0 "SEAL notices") ---
+
+app.get('/api/patterns', async (req, res) => {
+  const { state, kind, limit } = req.query;
+  try {
+    const rows = await listPatterns({
+      state: state || undefined,
+      kind: kind || undefined,
+      limit: parseInt(limit, 10) || 100,
+    });
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/patterns/scan', async (_req, res) => {
+  try {
+    const result = await runDetectors();
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/patterns/:id/state', async (req, res) => {
+  const { state } = req.body || {};
+  const valid = ['observing', 'proposed', 'approved', 'denied', 'active', 'retired'];
+  if (!valid.includes(state)) {
+    return res.status(400).json({ error: `state must be one of ${valid.join(', ')}` });
+  }
+  try {
+    await setPatternState(req.params.id, state);
+    res.json({ id: req.params.id, state });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

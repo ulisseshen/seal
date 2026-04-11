@@ -81,6 +81,7 @@ document.querySelectorAll('.sidebar-item').forEach(tab => {
     else stopWorkspacesPolling();
     if (tabName === 'events') startEventsTab();
     else stopEventsPolling();
+    if (tabName === 'patterns') loadPatterns();
   });
 });
 
@@ -1147,6 +1148,98 @@ document.getElementById('events-source')?.addEventListener('change', () => loadE
 document.getElementById('events-kind')?.addEventListener('change', () => renderEvents(lastEventsPayload));
 document.getElementById('events-since')?.addEventListener('change', () => loadEvents());
 document.getElementById('events-limit')?.addEventListener('change', () => loadEvents());
+
+// --- Patterns (v0.4.0 "SEAL notices") ---
+
+let currentPatternState = 'all';
+
+async function loadPatterns() {
+  const list = document.getElementById('patterns-list');
+  if (!list) return;
+  list.innerHTML = '<div class="empty-state"><p>Loading…</p></div>';
+  try {
+    const qs = currentPatternState === 'all' ? '' : `?state=${currentPatternState}`;
+    const res = await fetch(`${API}/api/patterns${qs}`);
+    const rows = await res.json();
+
+    if (!Array.isArray(rows) || rows.length === 0) {
+      list.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-state-icon">&#x1F440;</div>
+          <h3>No patterns yet</h3>
+          <p>SEAL will surface repeated shapes from the event stream as it accumulates activity. Add a watched repo under <strong>Workspaces</strong> to start feeding events.</p>
+        </div>`;
+      return;
+    }
+
+    list.innerHTML = rows.map((p) => {
+      const pct = Math.round((p.confidence || 0) * 100);
+      const meta = p.metadata || {};
+      let detail = '';
+      if (p.kind === 'sequence' && meta.a && meta.b) {
+        detail = `<code>${meta.a}</code> → <code>${meta.b}</code> within ${Math.round((meta.window_ms || 0) / 60000)}m`;
+      } else if (p.kind === 'naming' && meta.label) {
+        const examples = (meta.examples || []).slice(0, 3).map((e) => `<code>${e}</code>`).join(' ');
+        detail = `${meta.field} · <code>${meta.label}</code> ${examples ? '<br><span class="pattern-examples">' + examples + '</span>' : ''}`;
+      } else {
+        detail = `<code>${p.signature}</code>`;
+      }
+
+      return `
+        <div class="pattern-card" data-pattern-id="${p.id}">
+          <div class="pattern-header">
+            <span class="pattern-kind pattern-kind-${p.kind}">${p.kind}</span>
+            <span class="pattern-state pattern-state-${p.state}">${p.state}</span>
+            <span class="pattern-confidence">${pct}% confidence</span>
+            <span class="pattern-evidence">${p.evidence_count} obs</span>
+          </div>
+          <div class="pattern-body">${detail}</div>
+          <div class="pattern-footer">
+            <span class="pattern-time">last seen ${fmtRelative(p.last_seen)}</span>
+          </div>
+        </div>
+      `;
+    }).join('');
+  } catch (err) {
+    list.innerHTML = `<div class="empty-state"><p>Failed to load patterns: ${err.message}</p></div>`;
+  }
+}
+
+function fmtRelative(iso) {
+  if (!iso) return '—';
+  const now = Date.now();
+  const then = Date.parse(iso);
+  const diff = Math.max(0, now - then);
+  const s = Math.floor(diff / 1000);
+  if (s < 60) return `${s}s ago`;
+  const m = Math.floor(s / 60);
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
+
+document.querySelectorAll('[data-pattern-state]').forEach((btn) => {
+  btn.addEventListener('click', () => {
+    document.querySelectorAll('[data-pattern-state]').forEach((b) => b.classList.remove('active'));
+    btn.classList.add('active');
+    currentPatternState = btn.dataset.patternState;
+    loadPatterns();
+  });
+});
+
+document.getElementById('btn-scan-patterns')?.addEventListener('click', async (e) => {
+  const btn = e.currentTarget;
+  btn.disabled = true;
+  btn.textContent = 'Scanning…';
+  try {
+    await fetch(`${API}/api/patterns/scan`, { method: 'POST' });
+    await loadPatterns();
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Scan now';
+  }
+});
 
 // --- Init ---
 

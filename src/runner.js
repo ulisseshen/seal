@@ -26,6 +26,7 @@ import { loadFlows } from './flows/engine.js';
 import { eventBus } from './event-bus.js';
 import { GitObserver } from './observers/git.js';
 import { setGitIngester } from './web.js';
+import { startDetectorLoop } from './brain/detector.js';
 
 const POLL_INTERVAL = 30_000;       // Check tasks every 30 seconds
 const SUPERNOVA_INTERVAL = 60_000;  // Check supernova re-fires every 60 seconds
@@ -112,6 +113,12 @@ const RETENTION_INTERVAL_MS = 24 * 60 * 60 * 1000; // daily
 setInterval(runEventRetention, RETENTION_INTERVAL_MS);
 // First run shortly after startup so it doesn't block init.
 setTimeout(runEventRetention, 60_000);
+
+// v0.4.0 "SEAL notices" — pattern detector slow-path scheduler.
+// Runs every 15m in the background, scanning the events table that
+// v0.3.0's Eye layer fills. Writes candidates to the `patterns` table
+// where v0.5.0's proposal engine will promote them to 'proposed'.
+startDetectorLoop();
 
 console.log(`[seal] Standing by...`);
 

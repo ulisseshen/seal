@@ -1546,3 +1546,96 @@ body {
   .events-filters { grid-template-columns: 1fr 1fr; }
   .workspaces-table .ws-path { max-width: 180px; }
 }
+
+/* --- Patterns tab (v0.4.0 "SEAL notices") --- */
+
+.page-subtitle {
+  color: var(--text-muted);
+  font-size: 13px;
+  margin: 0 0 16px;
+}
+
+.patterns-list {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.pattern-card {
+  background: var(--bg-card);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 14px 16px;
+  transition: border-color var(--transition);
+}
+
+.pattern-card:hover {
+  border-color: rgba(139, 92, 246, 0.35);
+}
+
+.pattern-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin-bottom: 8px;
+}
+
+.pattern-kind,
+.pattern-state {
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  padding: 3px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+}
+
+.pattern-kind-sequence { color: #8dd0ff; border-color: rgba(141, 208, 255, 0.3); }
+.pattern-kind-naming   { color: #c8b6ff; border-color: rgba(200, 182, 255, 0.3); }
+.pattern-kind-temporal { color: #ffc09f; border-color: rgba(255, 192, 159, 0.3); }
+.pattern-kind-reaction { color: #9fffdf; border-color: rgba(159, 255, 223, 0.3); }
+.pattern-kind-usage    { color: #ffe89f; border-color: rgba(255, 232, 159, 0.3); }
+
+.pattern-state-observing { color: var(--text-muted); }
+.pattern-state-proposed  { color: #ffc09f; }
+.pattern-state-approved,
+.pattern-state-active    { color: #9fffdf; }
+.pattern-state-denied,
+.pattern-state-retired   { color: #ff9f9f; opacity: 0.7; }
+
+.pattern-confidence {
+  font-size: 12px;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
+.pattern-evidence {
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
+.pattern-body {
+  font-size: 13px;
+  color: var(--text);
+  line-height: 1.5;
+  margin-bottom: 8px;
+}
+
+.pattern-body code {
+  background: rgba(0, 0, 0, 0.3);
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+}
+
+.pattern-examples code {
+  margin-right: 4px;
+}
+
+.pattern-footer {
+  font-size: 11px;
+  color: var(--text-muted);
+}
