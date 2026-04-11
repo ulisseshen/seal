@@ -66,7 +66,7 @@ echo -e "${GREEN}✓${NC} Source ready"
 
 echo -e "${CYAN}→${NC} Installing Node dependencies..."
 npm install --production 2>/dev/null
-echo -e "${GREEN}✓${NC} Node dependencies installed
+echo -e "${GREEN}✓${NC} Node dependencies installed"
 
 # --- Install RTK (token compression) ---
 
@@ -166,17 +166,30 @@ elif [[ "$SHELL" == *"bash"* ]]; then
 fi
 
 if [ -n "$SHELL_CONFIG" ]; then
-  if ! grep -q 'alias seal=' "$SHELL_CONFIG" 2>/dev/null; then
+  # Remove legacy alias form if present, then write the function form
+  if grep -q 'alias seal=' "$SHELL_CONFIG" 2>/dev/null; then
+    # Strip the old SEAL block (alias seal=, seal-run, cds)
+    sed -i.bak '/^# SEAL — Autonomous Tech Lead Task Runner$/,/^alias cds=/d' "$SHELL_CONFIG" 2>/dev/null || true
+    echo -e "${GREEN}✓${NC} Removed legacy SEAL aliases"
+  fi
+
+  if ! grep -q 'SEAL — Autonomous Tech Lead Task Runner' "$SHELL_CONFIG" 2>/dev/null; then
     cat >> "$SHELL_CONFIG" << EOF
 
 # SEAL — Autonomous Tech Lead Task Runner
-alias seal="cd $INSTALL_DIR"
+seal() {
+  if [ \$# -eq 0 ]; then
+    cd "$INSTALL_DIR"
+  else
+    node "$INSTALL_DIR/src/cli.js" "\$@"
+  fi
+}
 alias seal-run="cd $INSTALL_DIR && node src/runner.js"
 alias cds="claude --dangerously-skip-permissions"
 EOF
-    echo -e "${GREEN}✓${NC} Aliases added to $SHELL_CONFIG"
+    echo -e "${GREEN}✓${NC} Shell integration added to $SHELL_CONFIG"
   else
-    echo -e "${GREEN}✓${NC} Aliases already configured"
+    echo -e "${GREEN}✓${NC} Shell integration already configured"
   fi
 fi
 
@@ -197,15 +210,23 @@ echo ""
 
 echo "Commands:"
 echo ""
-echo "  seal          Navigate to SEAL project"
-echo "  seal-run      Start the autonomous runner"
-echo "  cds           Start Claude with --dangerously-skip-permissions"
+echo "  seal                   Navigate to SEAL project"
+echo "  seal setup             Configure providers (claude, codex, gemini) and channels"
+echo "  seal setup status      Show current configuration"
+echo "  seal-run               Start the autonomous runner"
+echo "  cds                    Start Claude with --dangerously-skip-permissions"
 echo ""
 echo "In Claude Code:"
 echo ""
 echo "  /seal run tests on my-project tomorrow at 9am"
 echo "  /seal remind me to review PR by Friday"
 echo "  /seal list"
+echo ""
+echo -e "${CYAN}Next step:${NC} configure a chat provider"
+echo ""
+echo "  seal setup                              # interactive"
+echo "  seal setup provider gemini --token ...  # or via flags"
+echo "  seal setup provider codex --login       # delegate to codex CLI"
 echo ""
 if [ -n "$SHELL_CONFIG" ]; then
   echo "Reload your shell:"
