@@ -16,7 +16,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import fs from 'fs';
 import path from 'path';
-import { insertTask, searchTasks } from '../db.js';
+import { insertTask, searchTasks, insertEvent } from '../db.js';
 
 const execFileP = promisify(execFile);
 
@@ -198,6 +198,29 @@ export async function runAzurePrReview() {
   } catch (err) {
     console.warn(`[azure-pr-review] list PRs failed: ${err.message}`);
     return { skipped: true, reason: 'list-error', error: err.message };
+  }
+
+  // Emit events for every active PR so the detector + team builder see them.
+  for (const pr of prs) {
+    const authorEmail = (pr.createdBy?.uniqueName || '').toLowerCase();
+    const authorName = pr.createdBy?.displayName || '';
+    try {
+      await insertEvent({
+        source: 'azure',
+        kind: 'azure.pr.active',
+        data: {
+          pr_id: pr.pullRequestId,
+          title: pr.title,
+          source_branch: (pr.sourceRefName || '').replace('refs/heads/', ''),
+          target_branch: (pr.targetRefName || '').replace('refs/heads/', ''),
+          author_name: authorName,
+          author_email: authorEmail,
+          is_draft: pr.isDraft || false,
+          repo: pr.repository?.name || '',
+          url: `https://dev.azure.com/${ORG}/${PROJECT}/_git/${pr.repository?.name || ''}/pullrequest/${pr.pullRequestId}`,
+        },
+      });
+    } catch {}
   }
 
   // Step 2: Filter and create tasks (up to available slots)

@@ -23,6 +23,7 @@ import { runDetectors } from '../src/brain/detector.js';
 import { runProposer, applyDecision } from '../src/brain/proposer.js';
 import { listSkills, runSkill, getSkillByName, readSkillRunHistory } from '../src/brain/skills.js';
 import { runIngest, approveIngestTeaching, ignoreIngest, listIngestQueue } from '../src/brain/ingest.js';
+import { listTeamMembers, getTeamMember, setTeamMemberInfo } from '../src/db.js';
 import { installSealHooks, uninstallSealHooks, hasSealHooks } from './hooks-installer.js';
 import { getProvider, listProviders } from '../src/providers/index.js';
 import { hasSecret, backend as secretsBackend } from '../src/secrets.js';
@@ -594,6 +595,38 @@ app.post('/api/patterns/scan', async (_req, res) => {
   try {
     const result = await runDetectors();
     res.json(result);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- API: Team ---
+
+app.get('/api/team', async (req, res) => {
+  try {
+    const rows = await listTeamMembers({ limit: parseInt(req.query.limit, 10) || 100 });
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/team/:email', async (req, res) => {
+  try {
+    const member = await getTeamMember(req.params.email);
+    if (!member) return res.status(404).json({ error: 'not found' });
+    res.json(member);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.put('/api/team/:email', async (req, res) => {
+  const { role, notes, is_me } = req.body || {};
+  try {
+    await setTeamMemberInfo(req.params.email, { role, notes, is_me });
+    const updated = await getTeamMember(req.params.email);
+    res.json(updated);
   } catch (err) {
     res.status(500).json({ error: err.message });
   }

@@ -223,6 +223,25 @@ await db.exec(`
   CREATE INDEX IF NOT EXISTS idx_scratch_kind ON memory_scratch(kind);
 `);
 
+// Team model — auto-populated from git author metadata.
+// SEAL builds a contributor graph from the events it observes. When a
+// new author appears, an ingest_queued alert asks the TL "who is this?"
+
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS team_members (
+    email          TEXT PRIMARY KEY,
+    name           TEXT NOT NULL,
+    first_seen     TEXT NOT NULL,
+    last_seen      TEXT NOT NULL,
+    repos          TEXT NOT NULL DEFAULT '[]',
+    commit_count   INTEGER NOT NULL DEFAULT 0,
+    role           TEXT,
+    notes          TEXT,
+    is_me          INTEGER NOT NULL DEFAULT 0
+  );
+  CREATE INDEX IF NOT EXISTS idx_team_members_name ON team_members(name);
+`);
+
 // v0.10.0 "SEAL asks back" — ingest loop storage.
 // See docs/AGENT-SYSTEM-DESIGN.md §3.9. Two tables:
 //  - handler_matchers: indexed match criteria per handler skill,
@@ -1013,6 +1032,56 @@ export async function recordSkillRun(id, { success }) {
         updated_at = ?
     WHERE id = ?
   `, [successInc, failInc, now, now, id]);
+}
+
+// ─── Team model queries ─────────────────────────────
+
+export async function upsertTeamMember({ email, name, repo }) {
+  const now = new Date().toISOString();
+  const existing = await db.get(`SELECT * FROM team_members WHERE email = ?`, [email]);
+  if (existing) {
+    let repos = [];
+    try { repos = JSON.parse(existing.repos); } catch { repos = []; }
+    if (repo && !repos.includes(repo)) repos.push(repo);
+    return db.run(`
+      UPDATE team_members SET
+        name = CASE WHEN name = '' OR name = email THEN ? ELSE name END,
+        last_seen = ?,
+        repos = ?,
+        commit_count = commit_count + 1
+      WHERE email = ?
+    `, [name, now, JSON.stringify(repos), email]);
+  }
+  return db.run(`
+    INSERT INTO team_members (email, name, first_seen, last_seen, repos, commit_count)
+    VALUES (?, ?, ?, ?, ?, 1)
+  `, [email, name || email, now, now, JSON.stringify(repo ? [repo] : [])]);
+}
+
+export async function getTeamMember(email) {
+  const row = await db.get(`SELECT * FROM team_members WHERE email = ?`, [email]);
+  if (!row) return null;
+  return { ...row, repos: safeJson(row.repos, []) };
+}
+
+export async function listTeamMembers({ limit = 100 } = {}) {
+  const rows = await db.all(`
+    SELECT * FROM team_members
+    ORDER BY commit_count DESC, last_seen DESC
+    LIMIT ?
+  `, [limit]);
+  return (rows || []).map((r) => ({ ...r, repos: safeJson(r.repos, []) }));
+}
+
+export async function setTeamMemberInfo(email, { role, notes, is_me }) {
+  const sets = [];
+  const params = [];
+  if (role !== undefined) { sets.push('role = ?'); params.push(role); }
+  if (notes !== undefined) { sets.push('notes = ?'); params.push(notes); }
+  if (is_me !== undefined) { sets.push('is_me = ?'); params.push(is_me ? 1 : 0); }
+  if (sets.length === 0) return;
+  params.push(email);
+  return db.run(`UPDATE team_members SET ${sets.join(', ')} WHERE email = ?`, params);
 }
 
 export async function setSkillState(id, state) {
