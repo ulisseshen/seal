@@ -16,6 +16,7 @@ import { createInterface } from 'readline';
 import { fileURLToPath } from 'url';
 import { setSecret, getSecret, delSecret, hasSecret, backend } from './secrets.js';
 import { listSkills, runSkill, getSkillByName } from './brain/skills.js';
+import { readAlertConfig, writeAlertConfig, sendAlert } from './brain/alert.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -281,6 +282,113 @@ function setDefaultProvider(name, model) {
   writeJSON(CHAT_CONFIG, cfg);
 }
 
+async function cmdAlerts(args) {
+  const [sub, ...rest] = args;
+  const { flags } = parseFlags(rest);
+
+  if (!sub || sub === 'status') {
+    const cfg = readAlertConfig();
+    console.log();
+    console.log(C.bold('  Alert routing'));
+    console.log(`    ${C.cyan('dashboard_url'.padEnd(16))} ${cfg.dashboard_url}`);
+    console.log(`    ${C.cyan('macos'.padEnd(16))} ${cfg.macos ? C.green('enabled') : C.dim('disabled')}`);
+    const tg = cfg.telegram;
+    if (tg.bot_token && tg.chat_id) {
+      console.log(`    ${C.cyan('telegram'.padEnd(16))} ${C.green('configured')} ${C.dim('(chat ' + tg.chat_id + ')')}`);
+    } else {
+      console.log(`    ${C.cyan('telegram'.padEnd(16))} ${C.dim('not configured')}`);
+    }
+    if (cfg.discord.webhook_url) {
+      console.log(`    ${C.cyan('discord'.padEnd(16))} ${C.green('configured')} ${C.dim('(webhook)')}`);
+    } else {
+      console.log(`    ${C.cyan('discord'.padEnd(16))} ${C.dim('not configured')}`);
+    }
+    console.log();
+    console.log(C.dim('  Config file: ~/.config/seal/alerts.json'));
+    console.log();
+    return;
+  }
+
+  if (sub === 'test') {
+    console.log(C.cyan('→ firing test alert to every configured channel…'));
+    sendAlert({
+      kind: 'test',
+      title: 'Test alert',
+      body: 'If you see this on your phone, the channel is wired correctly.',
+      path: '/',
+    });
+    console.log(C.green('  sent (check your channels)'));
+    return;
+  }
+
+  const cfg = readAlertConfig();
+
+  if (sub === 'telegram') {
+    if (flags.remove) {
+      cfg.telegram = { bot_token: '', chat_id: '' };
+      writeAlertConfig(cfg);
+      console.log(C.green('✓ telegram alert target removed'));
+      return;
+    }
+    const token = typeof flags.token === 'string' ? flags.token : '';
+    const chatId = typeof flags['chat-id'] === 'string' ? flags['chat-id'] : '';
+    if (!token || !chatId) {
+      console.error(C.red('Usage: seal setup alerts telegram --token <bot_token> --chat-id <chat_id>'));
+      console.error(C.dim('  Get a bot token from @BotFather.'));
+      console.error(C.dim('  Get your chat ID by sending any message to the bot, then visit'));
+      console.error(C.dim('  https://api.telegram.org/bot<TOKEN>/getUpdates'));
+      process.exit(1);
+    }
+    cfg.telegram = { bot_token: token, chat_id: chatId };
+    writeAlertConfig(cfg);
+    console.log(C.green('✓ telegram alert target saved'));
+    return;
+  }
+
+  if (sub === 'discord') {
+    if (flags.remove) {
+      cfg.discord = { webhook_url: '' };
+      writeAlertConfig(cfg);
+      console.log(C.green('✓ discord alert target removed'));
+      return;
+    }
+    const webhook = typeof flags.webhook === 'string' ? flags.webhook : '';
+    if (!webhook) {
+      console.error(C.red('Usage: seal setup alerts discord --webhook <webhook_url>'));
+      console.error(C.dim('  Create a webhook in Server Settings → Integrations → Webhooks.'));
+      process.exit(1);
+    }
+    cfg.discord = { webhook_url: webhook };
+    writeAlertConfig(cfg);
+    console.log(C.green('✓ discord alert target saved'));
+    return;
+  }
+
+  if (sub === 'url') {
+    const u = typeof flags.url === 'string' ? flags.url : rest[0];
+    if (!u) {
+      console.error(C.red('Usage: seal setup alerts url <http://...>'));
+      process.exit(1);
+    }
+    cfg.dashboard_url = u;
+    writeAlertConfig(cfg);
+    console.log(C.green(`✓ dashboard_url set to ${u}`));
+    return;
+  }
+
+  if (sub === 'macos') {
+    if (flags.off || rest.includes('off')) { cfg.macos = false; }
+    else { cfg.macos = true; }
+    writeAlertConfig(cfg);
+    console.log(C.green(`✓ macOS alerts ${cfg.macos ? 'enabled' : 'disabled'}`));
+    return;
+  }
+
+  console.error(C.red(`Unknown alerts command: ${sub}`));
+  console.error(C.dim('Options: status, test, telegram, discord, url, macos'));
+  process.exit(1);
+}
+
 async function cmdChannel(args) {
   const { flags, positional } = parseFlags(args);
   const name = positional[0];
@@ -376,6 +484,14 @@ ${C.bold('SEAL')} — autonomous Tech Lead assistant
   seal setup provider <name> --remove
   seal setup channel <name> --set key=value
   seal setup channel <name> --disable
+
+  ${C.bold('Alert routing (phone nudges)')}
+  seal setup alerts status               show configured alert channels
+  seal setup alerts test                 fire a test alert to every channel
+  seal setup alerts telegram --token <bot_token> --chat-id <id>
+  seal setup alerts discord --webhook <url>
+  seal setup alerts url <dashboard_url>  for phones outside localhost
+  seal setup alerts macos [off]          toggle macOS system notifications
 
   ${C.bold('Skills (v0.6.0 "SEAL remembers")')}
   seal skills                            list installed skills
@@ -611,6 +727,7 @@ async function main() {
     if (sub === 'status')             return cmdStatus();
     if (sub === 'provider')           return cmdProvider(rest);
     if (sub === 'channel')            return cmdChannel(rest);
+    if (sub === 'alerts')             return cmdAlerts(rest);
     if (sub === 'help' || sub === '-h' || sub === '--help') return help();
     console.error(C.red(`Unknown setup command: ${sub}`));
     help();
