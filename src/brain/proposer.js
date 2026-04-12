@@ -36,6 +36,7 @@ import {
 } from '../db.js';
 import { getProvider } from '../providers/index.js';
 import { createSkillFromProposal } from './skills.js';
+import { sendAlert } from './alert.js';
 
 const CONFIDENCE_THRESHOLD = 0.75;       // §3.2.3
 const EVIDENCE_THRESHOLD = 3;            // §3.2.3
@@ -81,6 +82,18 @@ export async function runProposer() {
       await setPatternState(pattern.id, 'proposed');
       drafted++;
       console.log(`[brain] drafted proposal ${proposal.id} for pattern ${pattern.id}`);
+
+      // Alert: TL needs to approve. Fire-and-forget to every configured
+      // channel (macOS, Telegram, Discord). The phone link lands on the
+      // Proposals tab directly.
+      try {
+        sendAlert({
+          kind: 'proposal_drafted',
+          title: `New proposal: ${proposal.name}`,
+          body: truncate(proposal.explanation, 280),
+          path: '/#proposals',
+        });
+      } catch {}
     } catch (err) {
       errors.push({ pattern: pattern.id, error: err.message });
       console.warn(`[brain] proposal drafting failed for ${pattern.id}:`, err.message);
@@ -304,6 +317,11 @@ function isBoringPattern(pattern) {
     if (trivial.has(key)) return true;
   }
   return false;
+}
+
+function truncate(s, n) {
+  if (typeof s !== 'string') return '';
+  return s.length > n ? s.slice(0, n) + '…' : s;
 }
 
 function readChatConfig() {

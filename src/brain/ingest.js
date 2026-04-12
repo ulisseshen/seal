@@ -36,6 +36,7 @@ import {
 } from '../db.js';
 import { getProvider } from '../providers/index.js';
 import { runSkill } from './skills.js';
+import { sendAlert } from './alert.js';
 
 const SEAL_DIR = process.env.SEAL_DIR || join(homedir(), '.config', 'seal');
 const SKILLS_DIR = join(SEAL_DIR, 'skills');
@@ -76,8 +77,10 @@ export async function runIngest(event) {
   //    via the LLM. This is fire-and-forget from the caller's perspective
   //    but we await it here so the dashboard has something to show on the
   //    first poll. Errors fall back to state='pending' with no interpretation.
+  let interpretationText = '';
   try {
     const { interpretation, suggestedActions, suggestedHandler } = await interpretAndDraft(event);
+    interpretationText = interpretation || '';
     await updateIngest(ingestId, {
       interpretation,
       suggested_actions: suggestedActions,
@@ -88,6 +91,20 @@ export async function runIngest(event) {
     console.warn(`[ingest] LLM interpretation failed:`, err.message);
     await updateIngest(ingestId, { state: 'pending' });
   }
+
+  // Alert: TL needs to teach. Fire-and-forget to every configured channel.
+  // Phone link lands on the Ingest tab directly.
+  try {
+    const previewBody = interpretationText
+      ? interpretationText
+      : `New ${event.source} data in the ingest queue.`;
+    sendAlert({
+      kind: 'ingest_queued',
+      title: `Unknown ${event.source} data`,
+      body: previewBody.slice(0, 280),
+      path: '/#ingest',
+    });
+  } catch {}
 
   return { matched: false, queued: true, ingest_id: ingestId };
 }

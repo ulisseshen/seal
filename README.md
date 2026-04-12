@@ -160,7 +160,7 @@ Two flavors of channel, and they're not the same thing:
 1. **Input channels** are how you *talk to* SEAL — drop a bug report, a test message, a thought, a voice note, or arbitrary JSON at the ingest loop.
 2. **Approval channels** are where SEAL *asks you back* — pending proposals, unmatched ingest events, and any `ask_user` step a running flow hits.
 
-On day one, both roles are fully covered by the **dashboard**. The mobile / messaging channels listed below exist in the codebase and can receive inputs today, but their *approval* UX (inline keyboard buttons for approve/deny/modify) is wired at the channel level and waits for a follow-up commit to surface proposals through them. Until then, approvals happen in the dashboard Proposals and Ingest tabs.
+On day one, both roles are fully covered by the **dashboard**. Proposal-approval UX through messaging-app buttons (Telegram inline keyboards, Discord components, WhatsApp keyword replies) is planned but not wired — so instead, SEAL sends a **push alert** through your configured channels whenever a proposal or ingest event lands, and the alert embeds the dashboard URL so you open, read, and approve from your phone browser in one tap. Configured via `seal setup alerts`. See below.
 
 ### Input — talk to SEAL
 
@@ -186,8 +186,22 @@ SEAL only raises a hand when something isn't approved-and-confident. When that h
 | **Dashboard → Ingest tab** | ✅ working | Unmatched events with the LLM's interpretation + a drafted handler (match criteria + `flow.yaml`). Two buttons: Approve handler (→ skill is born and all future similar events run through it automatically) · Ignore. |
 | **Dashboard → Missions tab** | ✅ working | Policy-blocked tasks (`status: firing`) wait here for your explicit ack. The existing v0.2.0 permission gate. |
 | **macOS notifications** | ✅ working | `nuclear` / `supernova` levels fire alert dialogs and re-fire until acknowledged — the "you **will** see this" escalation. |
-| **Telegram / Discord inline keyboard** | 🔲 planned | The design doc calls for approve/deny/modify buttons on proposal delivery. Wired for notification delivery already; proposal delivery is the follow-up. |
+| **Push alert → phone browser** | ✅ working | New proposals and ingest events fire through `seal setup alerts` targets (macOS notification + Telegram + Discord webhook). Each alert embeds a deep link to `/#proposals` or `/#ingest`. You tap, the responsive dashboard opens, you approve there. Works from anywhere your phone has network access to the dashboard URL. |
+| **Telegram / Discord inline keyboard** | 🔲 planned | Approve/deny/modify buttons on proposal delivery from inside the chat app, so you don't even open the dashboard. The alerting path above unblocks mobile reach today; inline buttons are the follow-up that skips the dashboard hop. |
 | **WhatsApp keyword reply** | 🔲 planned | `/seal approve 42` / `/seal deny 42` since WhatsApp has no buttons. |
+
+### Alert routing
+
+```bash
+seal setup alerts status                       # show configured channels
+seal setup alerts test                          # fire a test alert to every channel
+seal setup alerts telegram --token X --chat-id Y
+seal setup alerts discord --webhook https://...
+seal setup alerts url https://seal.yourdomain   # for phones outside localhost
+seal setup alerts macos off                     # mute desktop notifications
+```
+
+Alert config lives at `~/.config/seal/alerts.json`. Telegram alerts use raw HTTPS (no bot process needed), Discord uses a webhook URL (no bot process needed), macOS uses `osascript`. Fire-and-forget — alert failures never break the proposer or ingest router.
 
 ### The short version
 
