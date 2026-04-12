@@ -1944,3 +1944,53 @@ body {
   gap: 8px;
   margin-top: 12px;
 }
+
+/* --- Team tab --- */
+
+.team-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+.team-table th {
+  text-align: left;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.team-table td {
+  padding: 8px 12px;
+  border-bottom: 1px solid rgba(255, 255, 255, 0.04);
+}
+
+.team-table tr:hover td {
+  background: rgba(139, 92, 246, 0.04);
+}
+
+.team-me td {
+  background: rgba(139, 92, 246, 0.06);
+}
+
+.team-badge {
+  font-size: 10px;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--primary);
+  color: white;
+  text-transform: uppercase;
+  font-weight: 600;
+}
+
+.team-email {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+
+.dim { color: var(--text-muted); }

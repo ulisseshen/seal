@@ -28,6 +28,7 @@ import { GitObserver } from './observers/git.js';
 import { setGitIngester } from './web.js';
 import { startDetectorLoop } from './brain/detector.js';
 import { startProposerLoop } from './brain/proposer.js';
+import { startTeamBuilder } from './brain/team.js';
 
 const POLL_INTERVAL = 30_000;       // Check tasks every 30 seconds
 const SUPERNOVA_INTERVAL = 60_000;  // Check supernova re-fires every 60 seconds
@@ -114,6 +115,11 @@ const RETENTION_INTERVAL_MS = 24 * 60 * 60 * 1000; // daily
 setInterval(runEventRetention, RETENTION_INTERVAL_MS);
 // First run shortly after startup so it doesn't block init.
 setTimeout(runEventRetention, 60_000);
+
+// Team model builder — auto-populates team_members from git.commit
+// author metadata. Fires new-contributor alerts when a previously
+// unseen author appears.
+startTeamBuilder(eventBus);
 
 // v0.4.0 "SEAL notices" — pattern detector slow-path scheduler.
 // Runs every 15m in the background, scanning the events table that

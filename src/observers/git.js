@@ -122,6 +122,8 @@ export class GitObserver extends Observer {
             branch: data.branch || '',
             sha: data.sha || '',
             message: data.message || '',
+            author_name: data.author_name || '',
+            author_email: data.author_email || '',
           },
         });
         return;
@@ -291,10 +293,10 @@ export class GitObserver extends Observer {
       : '--max-count=50';
 
     // ─── Commits ───────────────────────────────
-    // %H = sha, %D = refs/decorations, %s = subject
+    // %H=sha, %D=refs, %an=author name, %ae=author email, %aI=author date, %s=subject
     const logCmd =
       `git -C "${repo.path}" log --all ${sinceArg} ` +
-      `--pretty=format:"%H|%D|%s"`;
+      `--pretty=format:"%H|%D|%an|%ae|%aI|%s"`;
 
     let out = '';
     try {
@@ -319,13 +321,11 @@ export class GitObserver extends Observer {
 
     const lines = out.split('\n').filter((l) => l.trim().length > 0);
     for (const line of lines) {
-      const firstPipe = line.indexOf('|');
-      if (firstPipe < 0) continue;
-      const sha = line.slice(0, firstPipe);
-      const rest = line.slice(firstPipe + 1);
-      const secondPipe = rest.indexOf('|');
-      const refs = secondPipe < 0 ? rest : rest.slice(0, secondPipe);
-      const message = secondPipe < 0 ? '' : rest.slice(secondPipe + 1);
+      // Format: SHA|refs|author_name|author_email|author_date|subject
+      const parts = line.split('|');
+      if (parts.length < 6) continue;
+      const [sha, refs, authorName, authorEmail, authorDate, ...msgParts] = parts;
+      const message = msgParts.join('|'); // subject may contain pipes
       if (!sha || seenShas.has(sha)) continue;
       seenShas.add(sha);
 
@@ -338,6 +338,9 @@ export class GitObserver extends Observer {
           sha,
           message,
           refs: refs || '',
+          author_name: authorName || '',
+          author_email: authorEmail || '',
+          author_date: authorDate || '',
           scraped: true,
         },
       });

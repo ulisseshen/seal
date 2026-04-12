@@ -85,6 +85,7 @@ document.querySelectorAll('.sidebar-item').forEach(tab => {
     if (tabName === 'proposals') loadProposals();
     if (tabName === 'skills') loadSkills();
     if (tabName === 'ingest') loadIngest();
+    if (tabName === 'team') loadTeam();
   });
 });
 
@@ -1578,6 +1579,42 @@ document.getElementById('btn-ingest-poke')?.addEventListener('click', async () =
     resultEl.textContent = '⚠ ' + err.message;
   }
 });
+
+// --- Team ---
+
+async function loadTeam() {
+  const list = document.getElementById('team-list');
+  if (!list) return;
+  list.innerHTML = '<div class="empty-state"><p>Loading…</p></div>';
+  try {
+    const res = await fetch(`${API}/api/team`);
+    const rows = await res.json();
+    if (!Array.isArray(rows) || rows.length === 0) {
+      list.innerHTML = `
+        <div class="empty-state">
+          <div class="empty-state-icon">&#x1F465;</div>
+          <h3>No team members yet</h3>
+          <p>SEAL auto-populates this from git commit authors. Add a workspace to start.</p>
+        </div>`;
+      return;
+    }
+    list.innerHTML = `<table class="team-table">
+      <thead><tr><th>Name</th><th>Email</th><th>Commits</th><th>Repos</th><th>Role</th><th>Last seen</th></tr></thead>
+      <tbody>${rows.map((m) => `
+        <tr class="${m.is_me ? 'team-me' : ''}">
+          <td><strong>${escapeHtml(m.name)}</strong>${m.is_me ? ' <span class="team-badge">you</span>' : ''}</td>
+          <td class="team-email">${escapeHtml(m.email)}</td>
+          <td>${m.commit_count}</td>
+          <td>${(Array.isArray(m.repos) ? m.repos : []).length}</td>
+          <td>${m.role ? escapeHtml(m.role) : '<span class="dim">—</span>'}</td>
+          <td>${fmtRelative(m.last_seen)}</td>
+        </tr>`).join('')}
+      </tbody>
+    </table>`;
+  } catch (err) {
+    list.innerHTML = `<div class="empty-state"><p>Failed: ${err.message}</p></div>`;
+  }
+}
 
 // --- Init ---
 

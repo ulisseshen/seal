@@ -86,7 +86,7 @@ const NAMING_LIBRARY = [
  * daemon.
  */
 export async function runDetectors() {
-  const results = { sequence: 0, naming: 0, errors: [] };
+  const results = { sequence: 0, naming: 0, message: 0, errors: [] };
 
   try {
     results.sequence = await detectSequences();
@@ -100,6 +100,13 @@ export async function runDetectors() {
   } catch (err) {
     console.warn('[brain] naming detector error:', err.message);
     results.errors.push({ detector: 'naming', error: err.message });
+  }
+
+  try {
+    results.message = await detectCommitMessagePatterns();
+  } catch (err) {
+    console.warn('[brain] message detector error:', err.message);
+    results.errors.push({ detector: 'message', error: err.message });
   }
 
   return results;
@@ -284,6 +291,129 @@ function extractName(data) {
 
 function hashId(signature) {
   return crypto.createHash('sha1').update(signature).digest('hex').slice(0, 12);
+}
+
+// ─── Commit message pattern detector ──────────────────
+//
+// Scans recent git.commit events for recurring commit-message shapes:
+//   - Conventional commits (feat:, fix:, chore:, refactor:, etc.)
+//   - Ticket references (PROJ-123, #456)
+//   - Author-specific habits (who commits what kind of work)
+//
+// These are "naming patterns for messages" — the same 80%-match
+// threshold applies, but the field is the commit message instead of
+// the branch name.
+
+const MESSAGE_LOOKBACK = 100;
+const MESSAGE_MIN_MATCH_RATIO = 0.6; // lower than naming because messages are noisier
+
+const MESSAGE_PATTERNS = [
+  {
+    label: 'conventional commit (type: subject)',
+    regex: /^(feat|fix|chore|refactor|docs|test|style|perf|ci|build|revert)(\(.+?\))?!?:\s/i,
+  },
+  {
+    label: 'conventional commit with scope',
+    regex: /^(feat|fix|chore|refactor|docs|test|style|perf|ci|build|revert)\(.+?\):\s/i,
+  },
+  {
+    label: 'ticket reference in message (PROJ-NNN)',
+    regex: /[A-Z]{2,}-\d+/,
+  },
+  {
+    label: 'GitHub issue reference (#NNN)',
+    regex: /#\d+/,
+  },
+  {
+    label: 'merge commit',
+    regex: /^Merge (branch|pull request|remote-tracking)/i,
+  },
+];
+
+async function detectCommitMessagePatterns() {
+  const rows = await db.all(`
+    SELECT id, kind, timestamp, data
+    FROM events
+    WHERE kind = 'git.commit'
+    ORDER BY timestamp DESC
+    LIMIT ?
+  `, [MESSAGE_LOOKBACK]);
+  if (!rows || rows.length < 5) return 0;
+
+  const messages = [];
+  const authorStats = new Map();
+  for (const r of rows) {
+    let data = {};
+    try { data = JSON.parse(r.data); } catch { continue; }
+    if (data.message) messages.push(data.message);
+    // Track per-author commit shape distribution for team insights
+    const email = data.author_email;
+    if (email) {
+      if (!authorStats.has(email)) authorStats.set(email, { total: 0, types: {} });
+      const stat = authorStats.get(email);
+      stat.total++;
+      const typeMatch = data.message?.match(/^(\w+)(?:\(.*?\))?:/);
+      if (typeMatch) {
+        const type = typeMatch[1].toLowerCase();
+        stat.types[type] = (stat.types[type] || 0) + 1;
+      }
+    }
+  }
+
+  let upserts = 0;
+
+  for (const entry of MESSAGE_PATTERNS) {
+    const matches = messages.filter((m) => entry.regex.test(m));
+    const ratio = matches.length / messages.length;
+    if (ratio < MESSAGE_MIN_MATCH_RATIO) continue;
+
+    const signature = `naming:message:${entry.regex.source}`;
+    const id = hashId(signature);
+    await upsertPattern({
+      id,
+      kind: 'naming',
+      signature,
+      evidenceCount: matches.length,
+      confidence: ratio,
+      metadata: {
+        field: 'commit_message',
+        label: entry.label,
+        regex: entry.regex.source,
+        examples: matches.slice(0, 5),
+        sample_size: messages.length,
+      },
+    });
+    upserts++;
+  }
+
+  // Author activity pattern: if any author has >10 commits, surface
+  // their type distribution as a usage-kind pattern the proposer can read.
+  for (const [email, stat] of authorStats.entries()) {
+    if (stat.total < 5) continue;
+    const topTypes = Object.entries(stat.types)
+      .sort((a, b) => b[1] - a[1])
+      .slice(0, 5);
+    if (topTypes.length === 0) continue;
+
+    const signature = `usage:author:${email}`;
+    const id = hashId(signature);
+    await upsertPattern({
+      id,
+      kind: 'usage',
+      signature,
+      evidenceCount: stat.total,
+      confidence: 1.0,
+      metadata: {
+        field: 'author_activity',
+        author_email: email,
+        commit_count: stat.total,
+        type_distribution: Object.fromEntries(topTypes),
+      },
+    });
+    upserts++;
+  }
+
+  return upserts;
 }
 
 // Re-export for convenience so callers can import everything from `brain/detector.js`.
