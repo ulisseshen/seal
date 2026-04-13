@@ -1038,24 +1038,30 @@ export async function recordSkillRun(id, { success }) {
 
 export async function upsertTeamMember({ email, name, repo }) {
   const now = new Date().toISOString();
-  const existing = await db.get(`SELECT * FROM team_members WHERE email = ?`, [email]);
-  if (existing) {
-    let repos = [];
-    try { repos = JSON.parse(existing.repos); } catch { repos = []; }
-    if (repo && !repos.includes(repo)) repos.push(repo);
-    return db.run(`
-      UPDATE team_members SET
-        name = CASE WHEN name = '' OR name = email THEN ? ELSE name END,
-        last_seen = ?,
-        repos = ?,
-        commit_count = commit_count + 1
-      WHERE email = ?
-    `, [name, now, JSON.stringify(repos), email]);
-  }
-  return db.run(`
+  const reposJson = JSON.stringify(repo ? [repo] : []);
+  // Single atomic upsert — no check-then-insert race.
+  // On conflict, bump commit_count and merge the repo into the JSON array.
+  await db.run(`
     INSERT INTO team_members (email, name, first_seen, last_seen, repos, commit_count)
     VALUES (?, ?, ?, ?, ?, 1)
-  `, [email, name || email, now, now, JSON.stringify(repo ? [repo] : [])]);
+    ON CONFLICT(email) DO UPDATE SET
+      name = CASE WHEN team_members.name = '' OR team_members.name = team_members.email THEN excluded.name ELSE team_members.name END,
+      last_seen = excluded.last_seen,
+      commit_count = team_members.commit_count + 1
+  `, [email, name || email, now, now, reposJson]);
+
+  // Merge repo into the existing repos array (can't do JSON array ops in SQLite easily).
+  if (repo) {
+    const row = await db.get(`SELECT repos FROM team_members WHERE email = ?`, [email]);
+    if (row) {
+      let repos = [];
+      try { repos = JSON.parse(row.repos); } catch { repos = []; }
+      if (!repos.includes(repo)) {
+        repos.push(repo);
+        await db.run(`UPDATE team_members SET repos = ? WHERE email = ?`, [JSON.stringify(repos), email]);
+      }
+    }
+  }
 }
 
 export async function getTeamMember(email) {
