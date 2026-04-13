@@ -596,13 +596,50 @@ function stopDaemon(name) {
   }
 }
 
+function checkProviderReady() {
+  // Check if at least one LLM provider is configured and usable.
+  // Without a provider, the proposer, ingest drafter, and chat are all dead.
+  const cfg = readJSON(CHAT_CONFIG, {});
+  const providerName = cfg.provider || 'claude';
+  const meta = PROVIDERS[providerName];
+  if (!meta) return false;
+
+  if (meta.authMode === 'cli-managed') {
+    return Boolean(which(providerName));
+  }
+  if (meta.authMode === 'token') {
+    return hasSecret(providerName, 'api_key');
+  }
+  if (meta.authMode === 'host') {
+    return true; // ollama is always "available" (fails at runtime if server is down)
+  }
+  return false;
+}
+
 function cmdStart(args) {
   const names = resolveDaemonName(args[0]);
+
+  // Pre-flight: warn if no LLM provider is ready.
+  if (!checkProviderReady()) {
+    console.log();
+    console.log(`  ${C.yellow('⚠')} ${C.bold('No LLM provider configured.')}`);
+    console.log(`    The detector finds patterns, but the proposer, ingest drafter,`);
+    console.log(`    and chat all need a model to operate. Configure one first:`);
+    console.log();
+    console.log(`    ${C.cyan('seal setup provider claude')}          ${C.dim('(uses your Claude Code login)')}`);
+    console.log(`    ${C.cyan('seal setup provider codex --login')}   ${C.dim('(delegates to codex login)')}`);
+    console.log(`    ${C.cyan('seal setup provider gemini --token X')} ${C.dim('(Google AI Studio key)')}`);
+    console.log(`    ${C.cyan('seal setup provider openai --token X')} ${C.dim('(OpenAI platform key)')}`);
+    console.log(`    ${C.cyan('seal setup provider ollama')}          ${C.dim('(local, no key needed)')}`);
+    console.log();
+    console.log(`    ${C.dim('Continuing anyway — the Eye and detector will work; the Brain won\'t.')}`);
+    console.log();
+  }
+
   console.log();
   console.log(C.bold('  Starting…'));
   for (const name of names) {
     const result = startDaemon(name);
-    // If dashboard was started (or is already running), print the URL.
     if (name === 'dashboard' && (result.state === 'started' || result.state === 'already-running')) {
       const dashUrl = process.env.SEAL_DASHBOARD_URL || 'http://localhost:3333';
       console.log();
