@@ -61,7 +61,7 @@ export async function runProposer() {
     return { drafted: 0, skipped: 'fatigue' };
   }
 
-  const candidates = await listPatterns({ state: 'observing', limit: 20 });
+  const candidates = await listPatterns({ state: 'observing', limit: 50 });
   const ready = candidates
     .filter((p) => p.confidence >= CONFIDENCE_THRESHOLD && p.evidence_count >= EVIDENCE_THRESHOLD)
     .filter((p) => !isBoringPattern(p))
@@ -70,22 +70,23 @@ export async function runProposer() {
   if (ready.length === 0) return { drafted: 0 };
 
   const budget = PROPOSALS_PER_DAY_MAX - already;
-  const pick = ready.slice(0, budget);
+  // Give the LLM more candidates than the budget — it may skip some as boring
+  // (usage/author patterns, trivial sequences). We stop once `drafted >= budget`.
+  const pick = ready.slice(0, budget * 3);
 
   let drafted = 0;
+  let skipped = 0;
   const errors = [];
   for (const pattern of pick) {
+    if (drafted >= budget) break;
     try {
       const proposal = await draftProposal(pattern);
-      if (!proposal) continue;
+      if (!proposal) { skipped++; continue; } // drafter said skip — don't count against budget
       await insertProposal(proposal);
       await setPatternState(pattern.id, 'proposed');
       drafted++;
       console.log(`[brain] drafted proposal ${proposal.id} for pattern ${pattern.id}`);
 
-      // Alert: TL needs to approve. Fire-and-forget to every configured
-      // channel (macOS, Telegram, Discord). The phone link lands on the
-      // Proposals tab directly.
       try {
         sendAlert({
           kind: 'proposal_drafted',
@@ -214,6 +215,14 @@ async function draftProposal(pattern) {
   const parsed = extractJson(raw);
   if (!parsed) {
     throw new Error(`drafter returned unparseable output: ${raw.slice(0, 200)}`);
+  }
+  // The drafter may return {skip: true, reason: "..."} for patterns it
+  // considers boring or not worth automating. That's a valid answer, not
+  // an error — return null so the proposer loop continues to the next
+  // candidate without burning the daily budget.
+  if (parsed.skip) {
+    console.log(`[brain] drafter skipped pattern ${pattern.id}: ${parsed.reason || 'no reason'}`);
+    return null;
   }
   if (!parsed.name || !parsed.script || !parsed.explanation) {
     throw new Error(`drafter output missing required fields`);

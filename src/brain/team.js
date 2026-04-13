@@ -34,19 +34,23 @@ export function startTeamBuilder(eventBus) {
     const name = d.author_name;
     if (!email) return;
 
-    const existed = await getTeamMember(email);
-    await upsertTeamMember({ email, name, repo: d.repo || d.repo_path });
+    try {
+      const existed = await getTeamMember(email);
+      await upsertTeamMember({ email, name, repo: d.repo || d.repo_path });
 
-    if (!existed) {
-      console.log(`[team] new contributor: ${name} <${email}>`);
-      try {
-        sendAlert({
-          kind: 'new_contributor',
-          title: `New contributor: ${name || email}`,
-          body: `First commit seen from ${name} <${email}> in ${d.repo || 'unknown repo'}. Check the Team tab to add role/notes.`,
-          path: '/#team',
-        });
-      } catch {}
+      if (!existed) {
+        console.log(`[team] new contributor: ${name} <${email}>`);
+        try {
+          sendAlert({
+            kind: 'new_contributor',
+            title: `New contributor: ${name || email}`,
+            body: `First commit seen from ${name} <${email}> in ${d.repo || 'unknown repo'}. Check the Team tab to add role/notes.`,
+            path: '/#team',
+          });
+        } catch {}
+      }
+    } catch (err) {
+      console.warn(`[team] upsert failed for ${email}: ${err.message}`);
     }
   });
 
