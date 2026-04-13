@@ -600,7 +600,15 @@ function cmdStart(args) {
   const names = resolveDaemonName(args[0]);
   console.log();
   console.log(C.bold('  Starting…'));
-  for (const name of names) startDaemon(name);
+  for (const name of names) {
+    const result = startDaemon(name);
+    // If dashboard was started (or is already running), print the URL.
+    if (name === 'dashboard' && (result.state === 'started' || result.state === 'already-running')) {
+      const dashUrl = process.env.SEAL_DASHBOARD_URL || 'http://localhost:3333';
+      console.log();
+      console.log(`  ${C.cyan('Dashboard:')} ${C.bold(dashUrl)}`);
+    }
+  }
   console.log();
 }
 
