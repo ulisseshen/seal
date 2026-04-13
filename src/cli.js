@@ -231,8 +231,14 @@ async function cmdProvider(args) {
       console.error(C.red(`${name} CLI not found in PATH. Install it first.`));
       process.exit(1);
     }
-    console.log(C.cyan(`→ Delegating to \`${name} login\`...`));
-    const r = spawnSync(name, ['login'], { stdio: 'inherit' });
+    // Forward --device-auth if present (useful for remote/headless machines)
+    const loginArgs = ['login'];
+    if (flags['device-auth']) loginArgs.push('--device-auth');
+    console.log(C.cyan(`→ Delegating to \`${name} ${loginArgs.join(' ')}\`...`));
+    if (!flags['device-auth']) {
+      console.log(C.dim(`  (on a remote machine? use: seal setup provider ${name} --login --device-auth)`));
+    }
+    const r = spawnSync(name, loginArgs, { stdio: 'inherit' });
     if (r.status !== 0) {
       console.error(C.red(`${name} login failed (exit ${r.status})`));
       process.exit(r.status || 1);
