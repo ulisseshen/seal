@@ -136,16 +136,52 @@ export class GitObserver extends Observer {
         if (prev === next) return;    // no-op checkout — ignore
         const branch = data.branch || '';
         if (!branch) return;          // detached / unknown — ignore
-        const isNew = await this.isBranchNew(repo_path, branch);
-        if (!isNew) return;
+
+        // Always emit a checkout event so the detector sees branch switches.
         this.emit({
-          kind: 'git.branch.created',
+          kind: 'git.checkout',
           timestamp,
           data: {
             repo: repoLabel,
             repo_path,
-            name: branch,
-            base: null, // not reliably knowable from a post-checkout alone
+            branch,
+            prev_head: prev,
+            new_head: next,
+          },
+        });
+
+        // Additionally emit branch.created if this is a genuinely new branch.
+        const isNew = await this.isBranchNew(repo_path, branch);
+        if (isNew) {
+          this.emit({
+            kind: 'git.branch.created',
+            timestamp,
+            data: {
+              repo: repoLabel,
+              repo_path,
+              name: branch,
+              base: null,
+            },
+          });
+        }
+        return;
+      }
+
+      case 'post-rewrite': {
+        const rewriteKind = data.rewrite_kind || 'unknown';
+        const eventKind = rewriteKind === 'amend' ? 'git.amend' : 'git.rebase';
+        this.emit({
+          kind: eventKind,
+          timestamp,
+          data: {
+            repo: repoLabel,
+            repo_path,
+            branch: data.branch || '',
+            sha: data.sha || '',
+            rewrite_kind: rewriteKind,
+            rewrite_count: parseInt(data.rewrite_count, 10) || 0,
+            author_name: data.author_name || '',
+            author_email: data.author_email || '',
           },
         });
         return;

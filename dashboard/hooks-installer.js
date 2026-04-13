@@ -16,7 +16,7 @@ import { existsSync, readFileSync, writeFileSync, chmodSync, unlinkSync, renameS
 import { join } from 'node:path';
 
 export const SEAL_HOOK_MARKER = 'SEAL-HOOK-MARKER-v1';
-export const SEAL_HOOKS = ['post-commit', 'post-checkout', 'post-merge', 'pre-push'];
+export const SEAL_HOOKS = ['post-commit', 'post-checkout', 'post-merge', 'pre-push', 'post-rewrite'];
 
 // ─── Hook script bodies ─────────────────────────────────
 //
@@ -53,8 +53,10 @@ function buildPostCommit() {
 SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
 BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
 MSG=$(git log -1 --pretty=%B 2>/dev/null | head -c 500 | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g' | tr '\\n' ' ')
+AUTHOR_NAME=$(git log -1 --pretty=%an 2>/dev/null | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')
+AUTHOR_EMAIL=$(git log -1 --pretty=%ae 2>/dev/null)
 
-PAYLOAD="{\\"repo_path\\":\\"$REPO_PATH\\",\\"repo_name\\":\\"$REPO_NAME\\",\\"hook\\":\\"$HOOK_TYPE\\",\\"timestamp\\":\\"$TS\\",\\"data\\":{\\"sha\\":\\"$SHA\\",\\"branch\\":\\"$BRANCH\\",\\"message\\":\\"$MSG\\"}}"
+PAYLOAD="{\\"repo_path\\":\\"$REPO_PATH\\",\\"repo_name\\":\\"$REPO_NAME\\",\\"hook\\":\\"$HOOK_TYPE\\",\\"timestamp\\":\\"$TS\\",\\"data\\":{\\"sha\\":\\"$SHA\\",\\"branch\\":\\"$BRANCH\\",\\"message\\":\\"$MSG\\",\\"author_name\\":\\"$AUTHOR_NAME\\",\\"author_email\\":\\"$AUTHOR_EMAIL\\"}}"
 ` + commonPostlude();
 }
 
@@ -89,11 +91,30 @@ PAYLOAD="{\\"repo_path\\":\\"$REPO_PATH\\",\\"repo_name\\":\\"$REPO_NAME\\",\\"h
 ` + commonPostlude();
 }
 
+function buildPostRewrite() {
+  return commonPrelude('post-rewrite') + `
+# $1 is either "rebase" or "amend"
+REWRITE_KIND="$1"
+BRANCH=$(git rev-parse --abbrev-ref HEAD 2>/dev/null || echo "")
+SHA=$(git rev-parse HEAD 2>/dev/null || echo "")
+# Count rewritten commits from stdin (old-sha new-sha lines)
+REWRITE_COUNT=0
+while read OLD NEW EXTRA; do
+  REWRITE_COUNT=$((REWRITE_COUNT + 1))
+done
+AUTHOR_NAME=$(git log -1 --pretty=%an 2>/dev/null | sed 's/\\\\/\\\\\\\\/g; s/"/\\\\"/g')
+AUTHOR_EMAIL=$(git log -1 --pretty=%ae 2>/dev/null)
+
+PAYLOAD="{\\"repo_path\\":\\"$REPO_PATH\\",\\"repo_name\\":\\"$REPO_NAME\\",\\"hook\\":\\"$HOOK_TYPE\\",\\"timestamp\\":\\"$TS\\",\\"data\\":{\\"rewrite_kind\\":\\"$REWRITE_KIND\\",\\"branch\\":\\"$BRANCH\\",\\"sha\\":\\"$SHA\\",\\"rewrite_count\\":\\"$REWRITE_COUNT\\",\\"author_name\\":\\"$AUTHOR_NAME\\",\\"author_email\\":\\"$AUTHOR_EMAIL\\"}}"
+` + commonPostlude();
+}
+
 const HOOK_BUILDERS = {
   'post-commit': buildPostCommit,
   'post-checkout': buildPostCheckout,
   'post-merge': buildPostMerge,
   'pre-push': buildPrePush,
+  'post-rewrite': buildPostRewrite,
 };
 
 // ─── Helpers ────────────────────────────────────────────

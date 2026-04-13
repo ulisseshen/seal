@@ -86,7 +86,7 @@ const NAMING_LIBRARY = [
  * daemon.
  */
 export async function runDetectors() {
-  const results = { sequence: 0, naming: 0, message: 0, errors: [] };
+  const results = { sequence: 0, naming: 0, message: 0, workflow: 0, errors: [] };
 
   try {
     results.sequence = await detectSequences();
@@ -107,6 +107,13 @@ export async function runDetectors() {
   } catch (err) {
     console.warn('[brain] message detector error:', err.message);
     results.errors.push({ detector: 'message', error: err.message });
+  }
+
+  try {
+    results.workflow = await detectWorkflowPatterns();
+  } catch (err) {
+    console.warn('[brain] workflow detector error:', err.message);
+    results.errors.push({ detector: 'workflow', error: err.message });
   }
 
   return results;
@@ -408,6 +415,94 @@ async function detectCommitMessagePatterns() {
         author_email: email,
         commit_count: stat.total,
         type_distribution: Object.fromEntries(topTypes),
+      },
+    });
+    upserts++;
+  }
+
+  return upserts;
+}
+
+// ─── Workflow (multi-step sequence) detector ──────────
+//
+// Extends the 2-step sequence detector to find 3-step and 4-step
+// chains that represent developer workflows. Examples:
+//   git.checkout → git.merge → git.commit → git.push  (pull-rebase-push)
+//   git.checkout → git.branch.created → git.commit     (start feature)
+//   git.rebase → git.commit → git.push                 (rebase-and-ship)
+//
+// Algorithm: slide a window of 3-4 events (within WORKFLOW_WINDOW_MS),
+// extract the kind chain, count occurrences, emit as a sequence pattern
+// with the full chain in metadata.
+
+const WORKFLOW_WINDOW_MS = 15 * 60 * 1000; // 15 minutes for multi-step
+const WORKFLOW_MIN_SUPPORT = 2;
+const WORKFLOW_MIN_CONFIDENCE = 0.7;
+
+async function detectWorkflowPatterns() {
+  const rows = await db.all(`
+    SELECT id, source, kind, timestamp
+    FROM events
+    WHERE source = 'git'
+    ORDER BY timestamp ASC
+    LIMIT 2000
+  `);
+  if (!rows || rows.length < 4) return 0;
+
+  // Count 3-step and 4-step chains within the window.
+  const chains3 = new Map();
+  const chains4 = new Map();
+
+  for (let i = 0; i < rows.length - 2; i++) {
+    const a = rows[i];
+    const aMs = Date.parse(a.timestamp);
+    if (!Number.isFinite(aMs)) continue;
+
+    const b = rows[i + 1];
+    const bMs = Date.parse(b.timestamp);
+    if (!Number.isFinite(bMs) || bMs - aMs > WORKFLOW_WINDOW_MS) continue;
+
+    const c = rows[i + 2];
+    const cMs = Date.parse(c.timestamp);
+    if (!Number.isFinite(cMs) || cMs - aMs > WORKFLOW_WINDOW_MS) continue;
+
+    const key3 = `${a.kind}→${b.kind}→${c.kind}`;
+    chains3.set(key3, (chains3.get(key3) || 0) + 1);
+
+    if (i + 3 < rows.length) {
+      const d = rows[i + 3];
+      const dMs = Date.parse(d.timestamp);
+      if (Number.isFinite(dMs) && dMs - aMs <= WORKFLOW_WINDOW_MS) {
+        const key4 = `${key3}→${d.kind}`;
+        chains4.set(key4, (chains4.get(key4) || 0) + 1);
+      }
+    }
+  }
+
+  let upserts = 0;
+
+  // Emit interesting chains. Skip boring ones (all same kind, purely
+  // commit sequences).
+  const allChains = [...chains3.entries(), ...chains4.entries()];
+  for (const [chain, count] of allChains) {
+    if (count < WORKFLOW_MIN_SUPPORT) continue;
+    const steps = chain.split('→');
+    // Skip if all steps are the same kind (e.g., commit→commit→commit)
+    if (new Set(steps).size === 1) continue;
+
+    const signature = `workflow:${chain}`;
+    const id = hashId(signature);
+    await upsertPattern({
+      id,
+      kind: 'sequence',
+      signature,
+      evidenceCount: count,
+      confidence: Math.min(count / 3, 1.0), // normalize to 1.0 at 3 occurrences
+      metadata: {
+        workflow: true,
+        steps,
+        step_count: steps.length,
+        window_ms: WORKFLOW_WINDOW_MS,
       },
     });
     upserts++;
