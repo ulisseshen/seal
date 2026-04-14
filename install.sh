@@ -109,7 +109,15 @@ CURSOR_FILE="$INSTALL_DIR/skills/cursor/seal.mdc"
 if [ -d "$HOME/.claude" ]; then
   mkdir -p "$HOME/.claude/skills/seal"
   cp "$SKILL_FILE" "$HOME/.claude/skills/seal/SKILL.md"
-  echo -e "${GREEN}✓${NC} Claude Code skill installed"
+  # Install /seal:* subcommands
+  COMMANDS_DIR="$INSTALL_DIR/commands"
+  if [ -d "$COMMANDS_DIR" ]; then
+    mkdir -p "$HOME/.claude/commands/seal"
+    cp "$COMMANDS_DIR"/*.md "$HOME/.claude/commands/seal/"
+    echo -e "${GREEN}✓${NC} Claude Code skill + $(ls "$COMMANDS_DIR"/*.md 2>/dev/null | wc -l | tr -d ' ') commands installed"
+  else
+    echo -e "${GREEN}✓${NC} Claude Code skill installed"
+  fi
 fi
 
 # Codex
