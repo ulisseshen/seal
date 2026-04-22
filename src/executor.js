@@ -57,6 +57,11 @@ export async function executeTask(task) {
     return;
   }
 
+  // ─── Shell executor: run command directly, no Claude ────
+  if (task.executor === 'shell') {
+    return executeShellTask(task, policyResult);
+  }
+
   running++;
   await updateStatus(task.id, 'running');
 
@@ -266,6 +271,128 @@ export async function executeTask(task) {
       } catch {}
       await updateStatus(task.id, 'failed', err.message);
       console.error(`[executor] Task ${task.id} spawn error:`, err.message);
+      await notifyTaskLifecycle(task, 'failed', `Failed: ${task.summary}\n\nSpawn error: ${err.message}`);
+      resolve();
+    });
+  });
+}
+
+/**
+ * Execute a task directly as a shell command, bypassing Claude.
+ * The task.prompt is treated as the shell command to run.
+ */
+async function executeShellTask(task) {
+  running++;
+  await updateStatus(task.id, 'running');
+
+  const command = task.prompt;
+  const cwd = task.project ? expandPath(task.project) : undefined;
+
+  console.log(`[executor] Shell task ${task.id}: ${task.summary}`);
+  console.log(`[executor] command: ${command}`);
+
+  let runId = null;
+  try {
+    runId = await insertTaskRun({
+      task_id: task.id,
+      started_at: new Date().toISOString(),
+      profile: 'shell',
+      capabilities: '[]',
+    });
+  } catch (err) {
+    console.error(`[executor] insertTaskRun failed:`, err.message);
+  }
+
+  await notifyTaskLifecycle(task, 'start');
+
+  return new Promise((resolve) => {
+    const proc = spawn('/bin/bash', ['-c', command], {
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, HOME: process.env.HOME || os.homedir() },
+      cwd,
+      timeout: 300000, // 5 min max for shell tasks
+    });
+
+    let stdout = '';
+    let stderr = '';
+
+    proc.stdout.on('data', (data) => { stdout += data.toString(); });
+    proc.stderr.on('data', (data) => { stderr += data.toString(); });
+
+    proc.on('close', async (code) => {
+      running--;
+
+      try {
+        await finishTaskRun(runId, {
+          exit_code: code,
+          finished_at: new Date().toISOString(),
+          stdout_preview: stdout,
+          stderr_preview: stderr,
+        });
+      } catch (err) {
+        console.error(`[executor] finishTaskRun failed:`, err.message);
+      }
+
+      if (code === 0) {
+        const result = stdout.trim().slice(0, 50000);
+        await updateStatus(task.id, 'done', result);
+        console.log(`[executor] Shell task ${task.id} completed successfully`);
+
+        if (task.recurrence) {
+          try {
+            if (await checkMaxRuns(task.id)) {
+              console.log(`[executor] Task ${task.id} reached max runs, marking done`);
+            } else {
+              const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+              const interval = CronExpressionParser.parse(task.recurrence, { tz });
+              const nextRun = interval.next().toDate().toISOString();
+              await advanceRecurring(task.id, nextRun);
+              console.log(`[executor] Task ${task.id} next run: ${nextRun}`);
+            }
+          } catch (err) {
+            console.error(`[executor] Failed to parse cron for task ${task.id}:`, err.message);
+          }
+        }
+
+        const preview = result ? `\n\n${result.slice(0, 800)}${result.length > 800 ? '\n[...truncated]' : ''}` : '';
+        await notifyTaskLifecycle(task, 'done', `Done: ${task.summary}${preview}`);
+      } else {
+        const error = stderr.trim().slice(0, 10000) || stdout.trim().slice(0, 10000) || `Exit code ${code}`;
+        await updateStatus(task.id, 'failed', error);
+        console.error(`[executor] Shell task ${task.id} failed:`, error.slice(0, 200));
+
+        if (task.recurrence) {
+          try {
+            if (!(await checkMaxRuns(task.id))) {
+              const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
+              const interval = CronExpressionParser.parse(task.recurrence, { tz });
+              const nextRun = interval.next().toDate().toISOString();
+              await advanceRecurring(task.id, nextRun);
+              console.log(`[executor] Task ${task.id} re-queued after failure, next run: ${nextRun}`);
+            }
+          } catch (err) {
+            console.error(`[executor] Failed to re-queue cron for task ${task.id}:`, err.message);
+          }
+        }
+
+        await notifyTaskLifecycle(task, 'failed', `Failed: ${task.summary}\n\n${error.slice(0, 800)}`);
+      }
+
+      resolve();
+    });
+
+    proc.on('error', async (err) => {
+      running--;
+      try {
+        await finishTaskRun(runId, {
+          exit_code: -1,
+          finished_at: new Date().toISOString(),
+          stdout_preview: stdout,
+          stderr_preview: `${stderr}\n${err.message}`,
+        });
+      } catch {}
+      await updateStatus(task.id, 'failed', err.message);
+      console.error(`[executor] Shell task ${task.id} spawn error:`, err.message);
       await notifyTaskLifecycle(task, 'failed', `Failed: ${task.summary}\n\nSpawn error: ${err.message}`);
       resolve();
     });

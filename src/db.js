@@ -88,12 +88,19 @@ await db.exec(`
     created TEXT NOT NULL,
     completed_at TEXT,
     run_count INTEGER DEFAULT 0,
-    max_runs INTEGER
+    max_runs INTEGER,
+    executor TEXT DEFAULT 'claude' CHECK(executor IN ('claude','shell'))
   );
   CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
   CREATE INDEX IF NOT EXISTS idx_tasks_execute_at ON tasks(execute_at);
   CREATE INDEX IF NOT EXISTS idx_tasks_next_run ON tasks(next_run);
 `);
+
+  // Migration: add executor column if missing (existing DBs)
+  try {
+    await db.run(`ALTER TABLE tasks ADD COLUMN executor TEXT DEFAULT 'claude' CHECK(executor IN ('claude','shell'))`);
+  } catch {}
+
 
 // Migration: add notify_target column to existing databases (SQLite doesn't support
 // IF NOT EXISTS for ADD COLUMN, so swallow the "duplicate column" error)
@@ -169,12 +176,12 @@ export async function insertTask(task) {
   return db.run(`
     INSERT INTO tasks (id, type, summary, detail, execute_at, recurrence, next_run,
       prompt, project, allowed_tools, permission_mode, notify_type, notify_channel, notify_target,
-      people, priority, status, created, max_runs)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      people, priority, status, created, max_runs, executor)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `, [task.id, task.type, task.summary, task.detail, task.execute_at, task.recurrence,
       task.next_run, task.prompt, task.project, task.allowed_tools, task.permission_mode,
       task.notify_type, task.notify_channel, task.notify_target || null, task.people, task.priority, task.status,
-      task.created, task.max_runs]);
+      task.created, task.max_runs, task.executor || 'claude']);
 }
 
 export async function getPendingTasks(limit = 5) {

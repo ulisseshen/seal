@@ -206,12 +206,41 @@ export function isTelegramConnected() {
  * Returns true on success, false if not connected or send failed.
  */
 export async function sendTelegramMessage(chatId, text) {
-  if (!bot || !chatId) return false;
+  if (!chatId) return false;
+
+  // If the ingestion bot is running, use it directly
+  if (bot) {
+    try {
+      await bot.sendMessage(chatId, text);
+      return true;
+    } catch (err) {
+      console.error('[telegram] sendMessage via bot failed:', err.message);
+      return false;
+    }
+  }
+
+  // Fallback: send via HTTP using token from channels.json
   try {
-    await bot.sendMessage(chatId, text);
+    const { readFileSync } = await import('fs');
+    const cfg = JSON.parse(readFileSync(path.join(os.homedir(), '.config/seal/channels.json'), 'utf8'));
+    const token = cfg.telegram?.bot_token;
+    if (!token) {
+      console.error('[telegram] No bot_token in channels.json');
+      return false;
+    }
+    const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ chat_id: chatId, text }),
+    });
+    const data = await res.json();
+    if (!data.ok) {
+      console.error('[telegram] sendMessage HTTP failed:', data.description);
+      return false;
+    }
     return true;
   } catch (err) {
-    console.error('[telegram] sendMessage failed:', err.message);
+    console.error('[telegram] sendMessage HTTP failed:', err.message);
     return false;
   }
 }
