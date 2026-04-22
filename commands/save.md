@@ -100,12 +100,19 @@ confirmation output so the user can act on it.
    - Append the selected MCP tools using wildcard form: `mcp__<server>__*`
    - Skills are loaded automatically via the project dir — no need to list them in allowed_tools.
 
+   **4f. Determine `executor`:**
+   - `'claude'` (default) — task needs AI reasoning (interpret results, make decisions, use skills/MCPs)
+   - `'shell'` — task is a self-contained shell script or command that needs no AI. The `prompt` field becomes the shell command to run directly via `/bin/bash -c`. Use this when:
+     - The task is "run this script" and the script handles its own output/logging
+     - No interpretation, decision-making, or tool orchestration is needed
+     - Examples: cron-like scripts, API calls, file operations, build commands
+
 5. **Generate short ID**: Use `openssl rand -hex 4` via Bash
 
 6. **Insert into SQLite**:
 
 ```bash
-sqlite3 ~/.config/seal/tasks.db "INSERT INTO tasks (id, type, summary, detail, execute_at, recurrence, next_run, prompt, project, allowed_tools, permission_mode, notify_type, notify_channel, people, priority, status, created, max_runs) VALUES ('<id>', '<type>', '<summary>', '<detail>', '<execute_at or null>', '<recurrence or null>', '<next_run or null>', '<prompt or null>', '<project or null>', '<allowed_tools_json>', 'auto', '<notify_type>', 'system', '<people_json>', '<priority>', 'pending', datetime('now'), <max_runs or null>);"
+sqlite3 ~/.config/seal/tasks.db "INSERT INTO tasks (id, type, summary, detail, execute_at, recurrence, next_run, prompt, project, allowed_tools, permission_mode, notify_type, notify_channel, people, priority, status, created, max_runs, executor) VALUES ('<id>', '<type>', '<summary>', '<detail>', '<execute_at or null>', '<recurrence or null>', '<next_run or null>', '<prompt or null>', '<project or null>', '<allowed_tools_json>', 'auto', '<notify_type>', 'system', '<people_json>', '<priority>', 'pending', datetime('now'), <max_runs or null>, '<executor>');"
 ```
 
 7. **Confirm**:
