@@ -1,7 +1,8 @@
 import http from 'http';
 import fs from 'fs';
-import { db } from './db.js';
+import { db, getRepoProfile, listRepoProfiles } from './db.js';
 import { loadConfig, CONFIG_PATH } from './config.js';
+import { onboardRepo } from './brain/onboard.js';
 
 const PORT = parseInt(process.env.SEAL_WEB_PORT || '3457', 10);
 
@@ -148,6 +149,58 @@ async function handleAPI(req, res) {
       res.end();
     } catch (err) {
       console.warn('[web] git ingestion failed:', err.message);
+      res.writeHead(500, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: err.message }));
+    }
+    return true;
+  }
+
+  // ─── Repo profiles (v0.11.0 "SEAL learns your repo") ──
+
+  if (url.pathname === '/api/repos/profiles' && req.method === 'GET') {
+    const profiles = await listRepoProfiles();
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(profiles));
+    return true;
+  }
+
+  if (url.pathname === '/api/repos/profile' && req.method === 'GET') {
+    const repoPath = url.searchParams.get('path');
+    if (!repoPath) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'missing ?path= parameter' }));
+      return true;
+    }
+    const profile = await getRepoProfile(repoPath);
+    if (!profile) {
+      res.writeHead(404, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'no profile for this repo' }));
+      return true;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(profile));
+    return true;
+  }
+
+  if (url.pathname === '/api/repos/onboard' && req.method === 'POST') {
+    const body = await readBody(req);
+    let parsed;
+    try { parsed = JSON.parse(body); } catch {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid JSON' }));
+      return true;
+    }
+    const repoPath = parsed.path;
+    if (!repoPath) {
+      res.writeHead(400, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: 'missing "path" field' }));
+      return true;
+    }
+    try {
+      const profile = await onboardRepo(repoPath, { force: !!parsed.force });
+      res.writeHead(200, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify(profile));
+    } catch (err) {
       res.writeHead(500, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({ error: err.message }));
     }

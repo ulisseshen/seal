@@ -33,16 +33,29 @@ import {
   expireOldProposals,
   countProposalsCreatedSince,
   getPattern,
+  db,
 } from '../db.js';
 import { getProvider } from '../providers/index.js';
 import { createSkillFromProposal } from './skills.js';
 import { sendAlert } from './alert.js';
+import { getBreaker } from '../circuit-breaker.js';
 
 const CONFIDENCE_THRESHOLD = 0.75;       // §3.2.3
 const EVIDENCE_THRESHOLD = 3;            // §3.2.3
 const PROPOSALS_PER_DAY_MAX = 3;         // §7 v0.5.0 "max 3/day, configurable"
+const MAX_PROPOSALS_PER_DAY = 3;         // hard calendar-day cap (v0.4.0 safety)
 const SLOW_PATH_INTERVAL_MS = 15 * 60 * 1000;
 const TTL_DAYS = 7;
+
+// Stop hammering codex/claude when they're failing in a loop (v0.4.0 safety).
+const codexBreaker = getBreaker('codex', { threshold: 3, cooldownMs: 30 * 60 * 1000 });
+const claudeBreaker = getBreaker('claude', { threshold: 3, cooldownMs: 30 * 60 * 1000 });
+
+function breakerFor(providerName) {
+  if (providerName === 'codex') return codexBreaker;
+  if (providerName === 'claude') return claudeBreaker;
+  return getBreaker(providerName, { threshold: 3, cooldownMs: 30 * 60 * 1000 });
+}
 
 const SEAL_DIR = process.env.SEAL_DIR || join(process.env.HOME, '.config', 'seal');
 const CHAT_CONFIG = join(SEAL_DIR, 'chat-config.json');
@@ -53,12 +66,39 @@ export async function runProposer() {
   const expired = await expireOldProposals().catch(() => 0);
   if (expired) console.log(`[brain] expired ${expired} stale proposals`);
 
+  // Hard calendar-day cap (v0.4.0). Counts proposals delivered today,
+  // independent of the rolling 24h gate below. Belt-and-suspenders so we
+  // never burn budget after a clock-skew or boot-loop.
+  try {
+    const todayCount = await db.get(
+      `SELECT COUNT(*) as c FROM proposals WHERE date(delivered_at) = date('now')`
+    );
+    if (todayCount?.c >= MAX_PROPOSALS_PER_DAY) {
+      console.log(`[brain] daily proposal limit reached (${todayCount.c}/${MAX_PROPOSALS_PER_DAY}), skipping`);
+      return { drafted: 0, skipped: 'daily-cap' };
+    }
+  } catch (err) {
+    console.warn('[brain] daily cap query failed:', err.message);
+  }
+
   // Fatigue gate: count proposals delivered in the last 24h.
   const since = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
   const already = await countProposalsCreatedSince(since);
   if (already >= PROPOSALS_PER_DAY_MAX) {
     console.log(`[brain] proposal fatigue gate: ${already}/${PROPOSALS_PER_DAY_MAX} today, skipping`);
     return { drafted: 0, skipped: 'fatigue' };
+  }
+
+  // Circuit-breaker gate: if the active provider's CLI has been failing
+  // repeatedly, refuse to run until cooldown expires. Prevents tight
+  // failure loops from chewing API credits (root cause of the 4452 codex
+  // calls on 2026-04-28).
+  const cfg = readChatConfig();
+  const providerName = cfg.provider || 'claude';
+  const breaker = breakerFor(providerName);
+  if (!breaker.canExecute()) {
+    console.log(`[brain] ${providerName} circuit open, skipping proposer run`);
+    return { drafted: 0, skipped: 'circuit-open' };
   }
 
   const candidates = await listPatterns({ state: 'observing', limit: 50 });
@@ -79,8 +119,15 @@ export async function runProposer() {
   const errors = [];
   for (const pattern of pick) {
     if (drafted >= budget) break;
+    // Re-check the breaker each iteration — the previous draft may have
+    // tripped it (and we should bail before issuing more failing calls).
+    if (!breaker.canExecute()) {
+      console.log(`[brain] ${providerName} circuit opened mid-run, aborting`);
+      break;
+    }
     try {
       const proposal = await draftProposal(pattern);
+      breaker.recordSuccess();
       if (!proposal) { skipped++; continue; } // drafter said skip — don't count against budget
       await insertProposal(proposal);
       await setPatternState(pattern.id, 'proposed');
@@ -96,6 +143,7 @@ export async function runProposer() {
         });
       } catch {}
     } catch (err) {
+      breaker.recordFailure();
       errors.push({ pattern: pattern.id, error: err.message });
       console.warn(`[brain] proposal drafting failed for ${pattern.id}:`, err.message);
     }

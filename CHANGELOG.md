@@ -2,6 +2,44 @@
 
 All notable changes to SEAL are documented in this file.
 
+## [0.4.0] — 2026-04-28 — "SEAL stops digging"
+
+Emergency safety release. On 2026-04-28 the launchd service kept respawning
+the runner after every `seal stop`, which combined with a failing `codex`
+CLI loop produced **4452 failed codex calls in a single afternoon**, burning
+API credits and creating duplicate task execution / race conditions. This
+release adds the safety mechanisms that should have been there from day one.
+
+### Added
+- **Single-instance lock** in `src/runner.js` — refuses to start when another
+  runner holds `~/.config/seal/run/runner.pid`. Stale locks (PID dead) are
+  cleaned up automatically. Logging prefix: `[seal:lock]`.
+- **Circuit breaker** (`src/circuit-breaker.js`) — generic per-name breaker
+  that opens after 3 consecutive failures with a 30-minute cooldown. Wired
+  into `brain/proposer.js` and `brain/onboard.js` around every `codex` /
+  `claude` call. Logging prefix: `[circuit-breaker:NAME]`.
+- **Hard daily proposal cap** (`MAX_PROPOSALS_PER_DAY = 3`) in
+  `brain/proposer.js`, querying `date(delivered_at) = date('now')` so the
+  cap survives clock skew and rolling-window edge cases. Belt-and-suspenders
+  alongside the existing 24h fatigue gate.
+- **`seal status`** CLI subcommand showing the runner lock, circuit-breaker
+  state, and running/pending/firing/done-today task counts. Designed to
+  answer "why isn't SEAL doing anything?" without grepping the runner log.
+
+### Changed
+- **launchd plist** (`com.ulisseshen.seal.plist`) — `KeepAlive` set to
+  `false`. The runner used to auto-restart on `Crashed=true`, which in
+  combination with the codex failure loop produced the respawn storm.
+  `RunAtLoad=true` is preserved so SEAL still comes back after a reboot;
+  stop/start during a session is now manual via `seal stop` / `seal start`.
+
+### Philosophy
+SEAL is autonomous, but autonomous systems with infinite-retry loops and
+no concurrency guards turn into runaway processes. Every external CLI call
+goes through a circuit breaker; every long-lived process holds a lock; and
+the supervisor (launchd) trusts our own lifecycle rather than papering over
+crashes.
+
 ## [0.3.0] — 2026-04-10 — "SEAL sees"
 
 The Eye opens. SEAL now passively observes your git activity — branches, commits, merges, pushes, tags — and surfaces them in a live dashboard. No inference, no proposals, no LLM calls. Pure mechanical observation.
