@@ -15,12 +15,36 @@ import { wrapWithSandbox, profileForPermissionMode } from './sandbox.js';
 import { evaluatePolicy } from './policy.js';
 import { prefetch, sync as memorySync } from './memory.js';
 import { enhancePrompt, compressOutput, isRtkAvailable } from './rtk.js';
+import { checkClaudeAuth, LOGIN_EXPIRED_RESULT } from './auth.js';
+import { getClaudeBin } from './claude-bin.js';
 import { CronExpressionParser } from 'cron-parser';
 import path from 'path';
 import os from 'os';
 
 const MAX_CONCURRENT = 4; // Leave 1 slot for your interactive session
 let running = 0;
+
+// Throttle for the "run /login" sticky nag — at most one per hour.
+const LOGIN_NAG_INTERVAL_MS = 60 * 60 * 1000;
+let lastLoginNagAt = 0;
+
+function nagLoginExpired(reason) {
+  const now = Date.now();
+  if (now - lastLoginNagAt < LOGIN_NAG_INTERVAL_MS) return;
+  lastLoginNagAt = now;
+  console.warn(`[seal:auth] Claude CLI login appears expired (${reason}). Notifying user.`);
+  try {
+    notify(
+      {
+        priority: 'high',
+        summary: 'Claude CLI login expired — run /login in any terminal to resume SEAL tasks',
+      },
+      'sticky'
+    );
+  } catch (err) {
+    console.warn('[seal:auth] notify failed:', err.message);
+  }
+}
 
 /**
  * Execute a task by spawning claude -p with the task's meta-prompt.
@@ -58,12 +82,50 @@ export async function executeTask(task) {
   }
 
   // ─── Shell executor: run command directly, no Claude ────
+  // Tasks with executor='shell' bypass Claude entirely. Used for cheap,
+  // deterministic chores (cron-style shell commands) where spawning a
+  // full Claude session would be wasteful.
   if (task.executor === 'shell') {
     return executeShellTask(task, policyResult);
   }
 
+  // ─── Worktree existence check ───────────────────────
+  // If the task targets a worktree directory that no longer exists,
+  // fail early with a clear message so the sensor can auto-recover it.
+  if (task.project) {
+    const expanded = expandPath(task.project);
+    if (expanded.includes('.seal-worktrees') && !existsSync(expanded)) {
+      const msg = `Worktree missing: ${expanded} — will be auto-recovered by sensor on next tick`;
+      console.warn(`[executor] ${msg} (task ${task.id})`);
+      await updateStatus(task.id, 'failed', msg);
+      await notifyTaskLifecycle(task, 'failed', `Failed: ${task.summary}\n\n${msg}`);
+      return;
+    }
+  }
+
+  // ─── Claude CLI login pre-flight ────────────────────
+  // If the local claude session is expired, every spawn fails with
+  // exit -2/143 and an empty stderr. Detect once (cached 5 min) and
+  // park the task as 'failed' with a sentinel result so the recovery
+  // loop knows not to retry until /login is run.
+  try {
+    const auth = await checkClaudeAuth();
+    if (!auth.ok) {
+      console.warn(`[seal:auth] Skipping task ${task.id} — ${auth.reason}`);
+      await updateStatus(task.id, 'failed', LOGIN_EXPIRED_RESULT);
+      nagLoginExpired(auth.reason);
+      await notifyTaskLifecycle(task, 'failed', `Blocked: ${task.summary}\n\n${LOGIN_EXPIRED_RESULT}`);
+      return;
+    }
+  } catch (err) {
+    // Don't fail tasks just because the probe itself crashed — let the
+    // normal flow run and surface the real error if any.
+    console.warn(`[seal:auth] Pre-flight check errored (continuing): ${err.message}`);
+  }
+
   running++;
-  await updateStatus(task.id, 'running');
+  // Note: task.status was already set to 'running' atomically by
+  // claimPendingTasks() in the runner. We don't re-update here.
 
   // Phone channels (Telegram, Discord, WhatsApp) save prompt=null.
   // Fallback: use summary + detail so claude -p has something to work with.
@@ -131,7 +193,7 @@ export async function executeTask(task) {
     ? expandPath(task.project)
     : path.join(os.homedir(), 'projects');
 
-  const { command, args, profile } = wrapWithSandbox('claude', claudeArgs, profileName, {
+  const { command, args, profile } = wrapWithSandbox(getClaudeBin(), claudeArgs, profileName, {
     SEAL_PROJECT_ROOT: projectRoot,
     HOME: process.env.HOME || os.homedir(),
   });
@@ -221,11 +283,31 @@ export async function executeTask(task) {
           }
         }
 
-        // Notify all channels: include result preview (first 800 chars)
-        const preview = result ? `\n\n${result.slice(0, 800)}${result.length > 800 ? '\n[...truncated]' : ''}` : '';
-        await notifyTaskLifecycle(task, 'done', `Done: ${task.summary}${preview}`);
+        // Notify all channels: build a rich message for PR reviews,
+        // generic preview for everything else.
+        const message = buildDoneMessage(task, result);
+        await notifyTaskLifecycle(task, 'done', message);
       } else {
-        const error = stderr.trim().slice(0, 10000) || `Exit code ${code}`;
+        const isSigterm = code === 143;
+        // Detect Anthropic API auth failures in stdout/stderr — pre-flight probe
+        // sometimes passes (cached/stale token) but the real API call returns 401.
+        const combinedOutput = `${stdout}\n${stderr}`;
+        const isApiAuthError = /Invalid authentication credentials|API Error: 401|authentication_error/i.test(combinedOutput);
+
+        let error;
+        if (isApiAuthError) {
+          error = LOGIN_EXPIRED_RESULT;
+          // Invalidate cache so next probe re-checks
+          try {
+            const auth = await import('./auth.js');
+            auth.invalidateAuthCache && auth.invalidateAuthCache();
+          } catch {}
+          nagLoginExpired('API 401 in task output');
+        } else if (isSigterm) {
+          error = `Process killed (SIGTERM) — will retry on next boot`;
+        } else {
+          error = stderr.trim().slice(0, 10000) || `Exit code ${code}`;
+        }
 
         // ─── Memory sync (MemPalace) — store failure ────
         try {
@@ -354,6 +436,7 @@ async function executeShellTask(task) {
           }
         }
 
+        // Shell tasks don't need the rich PR-review formatter.
         const preview = result ? `\n\n${result.slice(0, 800)}${result.length > 800 ? '\n[...truncated]' : ''}` : '';
         await notifyTaskLifecycle(task, 'done', `Done: ${task.summary}${preview}`);
       } else {
@@ -407,4 +490,58 @@ function expandPath(p) {
   if (!p) return p;
   if (p.startsWith('~/')) return p.replace('~', process.env.HOME);
   return p;
+}
+
+/**
+ * Build a rich "done" notification message.
+ *
+ * For smart-review PR tasks: extracts PR number, title, and author. Falls
+ * back to a generic summary + result preview for any other task type.
+ */
+function buildDoneMessage(task, result) {
+  const summary = task.summary || '';
+  const resultStr = result || '';
+
+  // Match: "smart-review PR #34564: Title here"
+  const prMatch = summary.match(/smart-review PR #(\d+):\s*(.*)/i);
+
+  if (prMatch) {
+    const prNumber = prMatch[1];
+    const prTitle = (prMatch[2] || '').trim();
+
+    // Author: comes from task.people (JSON array) when present
+    let author = '?';
+    try {
+      const people = typeof task.people === 'string' ? JSON.parse(task.people) : (task.people || []);
+      if (Array.isArray(people) && people[0]) author = String(people[0]);
+    } catch {}
+
+    // Verdict line: try to find the "Findings: X críticos · Y importantes · Z sugestões" line
+    let verdict = '';
+    const verdictMatch = resultStr.match(/(\*\*Findings\*\*[^\n]*|Findings[^\n]*críticos[^\n]*)/i);
+    if (verdictMatch) {
+      verdict = `\n${verdictMatch[1].replace(/\*\*/g, '').trim()}`;
+    }
+
+    // Resumo opcional: pega a primeira linha não-vazia do resultado depois do título
+    let firstSummary = '';
+    const lines = resultStr.split('\n').map((l) => l.trim()).filter(Boolean);
+    const firstLine = lines.find((l) => !l.startsWith('#') && !l.startsWith('**Resumo')) || '';
+    if (firstLine && firstLine.length < 200) firstSummary = `\n${firstLine}`;
+
+    return [
+      `✅ Review concluída — PR #${prNumber}`,
+      `📝 ${prTitle}`,
+      `👤 Autor: ${author}`,
+      verdict,
+      firstSummary,
+    ]
+      .filter(Boolean)
+      .join('\n')
+      .trim();
+  }
+
+  // Generic: same behavior as before (truncated preview)
+  const preview = resultStr ? `\n\n${resultStr.slice(0, 800)}${resultStr.length > 800 ? '\n[...truncated]' : ''}` : '';
+  return `Done: ${summary}${preview}`;
 }
