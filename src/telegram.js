@@ -3,6 +3,7 @@ import { insertTask } from './db.js';
 import { transcribeBuffer } from './transcribe.js';
 import { detectProject, getKnownProjects } from './projects.js';
 import { resolveSecret } from './config.js';
+import { setSharedBot, getExistingBot } from './gateway/telegram/bot.js';
 import crypto from 'crypto';
 import path from 'path';
 import os from 'os';
@@ -38,9 +39,28 @@ export function startTelegram(config) {
     return null;
   }
 
-  bot = new TelegramBot(token, { polling: true });
+  // Reuse the gateway's bot instance if it was already created; otherwise
+  // create one and register it so the gateway plugin uses the same.
+  // This prevents the dreaded "ETELEGRAM 409 Conflict" loop that crashes
+  // the runner when two polling instances exist for the same token.
+  const existing = getExistingBot();
+  if (existing) {
+    bot = existing;
+    console.log('[telegram] Reusing existing shared bot instance');
+  } else {
+    bot = new TelegramBot(token, { polling: true });
+    setSharedBot(bot);
+    console.log('[telegram] Bot started. Waiting for messages...');
+  }
 
-  console.log('[telegram] Bot started. Waiting for messages...');
+  // Always attach an error handler — without one, polling errors become
+  // unhandled `error` events and crash the Node process.
+  bot.on('polling_error', (err) => {
+    console.warn('[telegram] polling_error:', err?.code || err?.message || err);
+  });
+  bot.on('error', (err) => {
+    console.warn('[telegram] error:', err?.code || err?.message || err);
+  });
 
   // --- Text messages ---
   bot.on('message', async (msg) => {
@@ -50,9 +70,11 @@ export function startTelegram(config) {
       const username = msg.from.username || '';
 
       if (allowedUsers && allowedUsers.length > 0) {
-        const allowed = allowedUsers.some(u =>
-          u === userId || u === username || u === `@${username}`
-        );
+        const allowed = allowedUsers.some(u => {
+          // Normalize: allow numeric ID (number or string), username, @username
+          const us = String(u);
+          return us === userId || us === username || us === `@${username}`;
+        });
         if (!allowed) {
           await bot.sendMessage(msg.chat.id, 'SEAL: Not authorized. Add your Telegram user ID to the config.');
           return;

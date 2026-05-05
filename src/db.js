@@ -1,8 +1,10 @@
 import Database from 'better-sqlite3';
 import { createClient } from '@libsql/client';
+import * as sqliteVec from 'sqlite-vec';
 import path from 'path';
 import os from 'os';
 import fs from 'fs';
+import { setupKnowledgeSchema } from './knowledge/schema.js';
 
 // Allow test isolation / custom DB location via SEAL_DB_PATH.
 // Production default: ~/.config/seal/tasks.db
@@ -48,6 +50,7 @@ if (isCloud) {
   console.log(`[db] Cloud → ${TURSO_URL.split('.')[0].replace('libsql://', '')}`);
 } else {
   const sqlite = new Database(DB_PATH);
+  sqliteVec.load(sqlite);
   sqlite.pragma('journal_mode = WAL');
   sqlite.pragma('foreign_keys = ON');
 
@@ -120,6 +123,13 @@ try {
 // Migration: approved_at (set when a human approves an ack-required task)
 try {
   await db.exec(`ALTER TABLE tasks ADD COLUMN approved_at TEXT`);
+} catch (err) {
+  // Column already exists — that's fine
+}
+
+// Migration: retry_count (tracks how many times a task was auto-retried after orphan/SIGTERM recovery)
+try {
+  await db.exec(`ALTER TABLE tasks ADD COLUMN retry_count INTEGER DEFAULT 0`);
 } catch (err) {
   // Column already exists — that's fine
 }
@@ -381,6 +391,49 @@ await db.exec(`
     ON patterns(confidence) WHERE state='observing';
 `);
 
+// v0.11.0 "SEAL onboards" — repo profile storage.
+// When SEAL first encounters a repo (or `seal onboard` is run), it deep-scans
+// the git history and uses the configured LLM to produce a structured profile:
+// working hours, commit conventions, team structure, branch strategy, release
+// cadence, and recommendations for how SEAL should behave for that repo.
+
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS repo_profiles (
+    repo_path       TEXT PRIMARY KEY,
+    repo_name       TEXT NOT NULL,
+    analyzed_at     TEXT NOT NULL,
+    commit_count    INTEGER NOT NULL DEFAULT 0,
+    contributor_count INTEGER NOT NULL DEFAULT 0,
+    active_branches INTEGER NOT NULL DEFAULT 0,
+    stats           TEXT NOT NULL DEFAULT '{}',
+    llm_analysis    TEXT NOT NULL DEFAULT '{}',
+    provider        TEXT,
+    model           TEXT,
+    version         INTEGER NOT NULL DEFAULT 1
+  );
+`);
+
+// v0.12.0 "Action System" — pending_actions for confirmation flow.
+// Actions triggered by SEAL go through a confirmation gate before execution.
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS pending_actions (
+    id              TEXT PRIMARY KEY,
+    action_name     TEXT NOT NULL,
+    context         TEXT NOT NULL DEFAULT '{}',
+    preview_summary TEXT,
+    preview_details TEXT,
+    preview_impact  TEXT,
+    status          TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','confirmed','executed','denied','expired','error')),
+    created_at      TEXT NOT NULL,
+    confirmed_at    TEXT,
+    confirmed_by    TEXT,
+    executed_at     TEXT,
+    result          TEXT
+  );
+  CREATE INDEX IF NOT EXISTS idx_pending_actions_status ON pending_actions(status);
+`);
+
 // FTS5 is only available on local better-sqlite3; libSQL cloud builds
 // disable the extension. Guard the virtual tables behind the mode check.
 if (!db.isCloud) {
@@ -419,6 +472,9 @@ if (!db.isCloud) {
       VALUES ('delete', old.id, old.content);
     END;
   `);
+
+  // Knowledge Engine schema (FTS5 + sqlite-vec)
+  await setupKnowledgeSchema(db);
 }
 
 // ─── Public API (all async) ─────────────────────────────
@@ -435,6 +491,21 @@ export async function insertTask(task) {
       task.created, task.max_runs, task.executor || 'claude']);
 }
 
+/** Insert only if the id doesn't already exist. Returns true if inserted, false if skipped. */
+export async function insertTaskIfNew(task) {
+  const result = await db.run(`
+    INSERT OR IGNORE INTO tasks (id, type, summary, detail, execute_at, recurrence, next_run,
+      prompt, project, allowed_tools, permission_mode, notify_type, notify_channel, notify_target,
+      people, priority, status, created, max_runs)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `, [task.id, task.type, task.summary, task.detail, task.execute_at, task.recurrence,
+      task.next_run, task.prompt, task.project, task.allowed_tools, task.permission_mode,
+      task.notify_type, task.notify_channel, task.notify_target || null, task.people, task.priority, task.status,
+      task.created, task.max_runs]);
+  // better-sqlite3 → .changes, libsql → .rowsAffected
+  return (result?.changes ?? result?.rowsAffected ?? 0) > 0;
+}
+
 export async function getPendingTasks(limit = 5) {
   return db.all(`
     SELECT * FROM tasks
@@ -445,6 +516,35 @@ export async function getPendingTasks(limit = 5) {
     ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, execute_at ASC
     LIMIT ?
   `, [limit]);
+}
+
+/**
+ * Atomically claim up to N pending tasks: select pending tasks AND mark
+ * them as 'running' in a single transaction. This prevents the race where
+ * two concurrent poll ticks (e.g. after the Mac wakes from sleep and
+ * timers fire in a burst) both see the same pending task and execute it
+ * twice.
+ */
+export async function claimPendingTasks(limit = 5) {
+  // Single SQL statement using UPDATE ... RETURNING. SQLite serialises
+  // writes, so two concurrent calls cannot both update the same row.
+  // The subquery picks the same N rows that getPendingTasks would, then
+  // the outer UPDATE flips them to 'running' atomically.
+  const rows = await db.all(`
+    UPDATE tasks
+    SET status = 'running'
+    WHERE id IN (
+      SELECT id FROM tasks
+      WHERE status = 'pending'
+        AND (execute_at IS NULL OR datetime(execute_at) <= datetime('now'))
+        AND type IN ('task', 'ritual')
+        AND prompt IS NOT NULL AND prompt != ''
+      ORDER BY CASE priority WHEN 'high' THEN 0 WHEN 'medium' THEN 1 ELSE 2 END, execute_at ASC
+      LIMIT ?
+    )
+    RETURNING *
+  `, [limit]);
+  return rows || [];
 }
 
 export async function getPendingReminders() {
@@ -498,6 +598,63 @@ export async function advanceRecurring(id, nextRun) {
 export async function checkMaxRuns(id) {
   const task = await db.get(`SELECT run_count, max_runs FROM tasks WHERE id = ?`, [id]);
   return task && task.max_runs && task.run_count >= task.max_runs;
+}
+
+/**
+ * Recover orphan tasks on boot.
+ * 1. Tasks stuck with status='running' — the process that ran them is dead.
+ * 2. Tasks that failed with exit code 143 (SIGTERM) recently — killed by SEAL restart.
+ * Returns the count of recovered tasks.
+ */
+export async function recoverOrphanTasks() {
+  let recovered = 0;
+
+  // 1. Recover tasks stuck in 'running' status (orphans)
+  const orphans = await db.all(`SELECT id, summary, recurrence, retry_count FROM tasks WHERE status = 'running'`);
+  for (const task of orphans) {
+    const retryCount = task.retry_count || 0;
+    if (retryCount >= 3) {
+      // Too many retries — mark as failed instead
+      await db.run(
+        `UPDATE tasks SET status = 'failed', result = 'Orphaned: exceeded max retries (3)', completed_at = datetime('now') WHERE id = ?`,
+        [task.id]
+      );
+      console.log(`[seal] Orphan task ${task.id} exceeded retries, marked failed: ${task.summary}`);
+      continue;
+    }
+
+    // Reset to pending for re-execution
+    await db.run(
+      `UPDATE tasks SET status = 'pending', result = NULL, retry_count = retry_count + 1 WHERE id = ?`,
+      [task.id]
+    );
+    console.log(`[seal] Recovered orphan task: ${task.id} (${task.summary})`);
+    recovered++;
+  }
+
+  // 2. Recover tasks killed by SIGTERM (exit code 143) in the last 24h
+  const sigtermed = await db.all(`
+    SELECT id, summary, retry_count FROM tasks
+    WHERE status = 'failed'
+      AND result LIKE '%SIGTERM%'
+      AND completed_at > datetime('now', '-1 day')
+  `);
+  for (const task of sigtermed) {
+    const retryCount = task.retry_count || 0;
+    if (retryCount >= 3) {
+      console.log(`[seal] SIGTERM'd task ${task.id} exceeded retries, leaving as failed: ${task.summary}`);
+      continue;
+    }
+
+    await db.run(
+      `UPDATE tasks SET status = 'pending', result = NULL, retry_count = retry_count + 1 WHERE id = ?`,
+      [task.id]
+    );
+    console.log(`[seal] Retrying SIGTERM'd task: ${task.id} (${task.summary})`);
+    recovered++;
+  }
+
+  return recovered;
 }
 
 export async function searchTasks(query, statusFilter = null) {
@@ -1179,6 +1336,40 @@ export async function updateIngest(id, patch) {
   if (sets.length === 0) return null;
   params.push(id);
   return db.run(`UPDATE ingest_queue SET ${sets.join(', ')} WHERE id = ?`, params);
+}
+
+// ─── Repo profile helpers ──────────────────────────────
+
+export async function upsertRepoProfile({ repoPath, repoName, commitCount, contributorCount, activeBranches, stats, llmAnalysis, provider, model }) {
+  const now = new Date().toISOString();
+  const existing = await db.get(`SELECT version FROM repo_profiles WHERE repo_path = ?`, [repoPath]);
+  const version = existing ? (existing.version || 0) + 1 : 1;
+  if (existing) {
+    return db.run(`
+      UPDATE repo_profiles SET
+        repo_name = ?, analyzed_at = ?, commit_count = ?, contributor_count = ?,
+        active_branches = ?, stats = ?, llm_analysis = ?, provider = ?, model = ?, version = ?
+      WHERE repo_path = ?
+    `, [repoName, now, commitCount, contributorCount, activeBranches,
+        JSON.stringify(stats), JSON.stringify(llmAnalysis), provider, model, version, repoPath]);
+  }
+  return db.run(`
+    INSERT INTO repo_profiles (repo_path, repo_name, analyzed_at, commit_count, contributor_count,
+      active_branches, stats, llm_analysis, provider, model, version)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+  `, [repoPath, repoName, now, commitCount, contributorCount, activeBranches,
+      JSON.stringify(stats), JSON.stringify(llmAnalysis), provider, model, version]);
+}
+
+export async function getRepoProfile(repoPath) {
+  const row = await db.get(`SELECT * FROM repo_profiles WHERE repo_path = ?`, [repoPath]);
+  if (!row) return null;
+  return { ...row, stats: safeJson(row.stats, {}), llm_analysis: safeJson(row.llm_analysis, {}) };
+}
+
+export async function listRepoProfiles() {
+  const rows = await db.all(`SELECT * FROM repo_profiles ORDER BY analyzed_at DESC`);
+  return (rows || []).map(r => ({ ...r, stats: safeJson(r.stats, {}), llm_analysis: safeJson(r.llm_analysis, {}) }));
 }
 
 export { db, DB_PATH };

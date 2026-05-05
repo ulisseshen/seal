@@ -17,6 +17,7 @@ import { fileURLToPath } from 'url';
 import { setSecret, getSecret, delSecret, hasSecret, backend } from './secrets.js';
 import { listSkills, runSkill, getSkillByName } from './brain/skills.js';
 import { readAlertConfig, writeAlertConfig, sendAlert } from './brain/alert.js';
+import { onboardRepo } from './brain/onboard.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -478,6 +479,7 @@ ${C.bold('SEAL')} — autonomous Tech Lead assistant
   seal stop  [runner|dashboard]          stop background services (default: both)
   seal restart [runner|dashboard]        stop + start
   seal ps                                show running services + PIDs
+  seal status                            show lock + circuit breakers + tasks
   seal logs [runner|dashboard] [-f]      tail service logs
   seal open                              open the dashboard in the browser
 
@@ -498,6 +500,11 @@ ${C.bold('SEAL')} — autonomous Tech Lead assistant
   seal setup alerts discord --webhook <url>
   seal setup alerts url <dashboard_url>  for phones outside localhost
   seal setup alerts macos [off]          toggle macOS system notifications
+
+  ${C.bold('Repo onboarding (v0.11.0 "SEAL learns your repo")')}
+  seal onboard [path]                    deep-scan git history + LLM profile
+  seal onboard [path] --force            re-analyze even if profile exists
+  seal onboard [path] --stats-only       gather stats without LLM synthesis
 
   ${C.bold('Skills (v0.6.0 "SEAL remembers")')}
   seal skills                            list installed skills
@@ -563,7 +570,14 @@ function startDaemon(name) {
     env: { ...process.env, SEAL_DIR },
   });
   child.unref();
-  writeFileSync(d.pidFile, String(child.pid));
+  // For runner, the runner.js itself writes the pid file via acquireLock().
+  // The CLI must NOT pre-write it, otherwise acquireLock() sees a stale
+  // PID written by the CLI (the runner's own future pid is *not yet* here)
+  // and refuses to start. For other daemons (dashboard, etc.), the CLI
+  // still owns the pid file.
+  if (name !== 'runner') {
+    writeFileSync(d.pidFile, String(child.pid));
+  }
   console.log(`  ${C.green('✓')} ${name} started (pid ${child.pid})  ${C.dim('→ ' + d.logFile)}`);
   return { name, pid: child.pid, state: 'started' };
 }
@@ -692,6 +706,98 @@ function cmdPs() {
   console.log();
 }
 
+// `seal status` — debug helper: shows lock + circuit breakers + running tasks
+// without having to grep the runner log. Added in v0.4.0 alongside the
+// safety mechanisms so the answer to "why isn't SEAL doing anything?" is
+// one command away. Reads files directly so it works even if the runner is
+// down.
+async function cmdStatusOverview() {
+  ensureRuntimeDirs();
+
+  console.log();
+  console.log(C.bold('  SEAL runtime status'));
+  console.log();
+
+  // ─── Lock ──────────────────────────────────────────
+  const lockFile = join(RUN_DIR, 'runner.pid');
+  console.log(C.bold('  Runner lock'));
+  if (!existsSync(lockFile)) {
+    console.log(`    ${C.dim('• no lock file (runner not running)')}`);
+  } else {
+    try {
+      const pid = parseInt(readFileSync(lockFile, 'utf-8').trim(), 10);
+      const alive = isAlive(pid);
+      const state = alive ? C.green('alive') : C.yellow('stale');
+      console.log(`    ${C.cyan('pid'.padEnd(12))} ${pid} ${state}`);
+      console.log(`    ${C.cyan('file'.padEnd(12))} ${C.dim(lockFile)}`);
+      if (!alive) {
+        console.log(`    ${C.dim('  (next `seal start` will clean this up)')}`);
+      }
+    } catch (err) {
+      console.log(`    ${C.red('• lock file unreadable:')} ${err.message}`);
+    }
+  }
+  console.log();
+
+  // ─── Circuit breakers ──────────────────────────────
+  // Breakers live in-process, so we can only show them when the runner is
+  // up. We import lazily to avoid pulling DB init into a status command.
+  console.log(C.bold('  Circuit breakers'));
+  try {
+    const { listBreakers } = await import('./circuit-breaker.js');
+    const rows = listBreakers();
+    if (rows.length === 0) {
+      console.log(`    ${C.dim('• none registered yet (no LLM calls this session)')}`);
+    } else {
+      for (const b of rows) {
+        const state = b.open ? C.red(`OPEN until ${b.openUntil}`) : C.green('closed');
+        console.log(`    ${C.cyan(b.name.padEnd(12))} ${state}  ${C.dim(`failures=${b.failures}/${b.threshold}`)}`);
+      }
+    }
+  } catch (err) {
+    console.log(`    ${C.red('• failed to read breakers:')} ${err.message}`);
+  }
+  console.log();
+
+  // ─── Subsystems / running tasks (only meaningful when runner is up) ─
+  console.log(C.bold('  Subsystems & tasks'));
+  const runnerLockExists = existsSync(lockFile);
+  let runnerAlive = false;
+  if (runnerLockExists) {
+    try {
+      const pid = parseInt(readFileSync(lockFile, 'utf-8').trim(), 10);
+      runnerAlive = isAlive(pid);
+    } catch {}
+  }
+
+  if (!runnerAlive) {
+    console.log(`    ${C.dim('• runner is down; subsystem state unavailable')}`);
+    console.log(`    ${C.dim('  start it with `seal start runner`')}`);
+  } else {
+    // Runner is alive — query the DB for task counts. We can read the same
+    // SQLite file the runner uses; better-sqlite3 / libsql both support
+    // concurrent readers.
+    try {
+      const { db } = await import('./db.js');
+      const running = await db.get(`SELECT COUNT(*) as c FROM tasks WHERE status = 'running'`);
+      const pending = await db.get(`SELECT COUNT(*) as c FROM tasks WHERE status = 'pending'`);
+      const firing = await db.get(`SELECT COUNT(*) as c FROM tasks WHERE status = 'firing'`);
+      const doneToday = await db.get(`SELECT COUNT(*) as c FROM tasks WHERE status = 'done' AND date(created) = date('now')`);
+      console.log(`    ${C.cyan('running'.padEnd(12))} ${running?.c ?? 0}`);
+      console.log(`    ${C.cyan('pending'.padEnd(12))} ${pending?.c ?? 0}`);
+      console.log(`    ${C.cyan('firing'.padEnd(12))} ${firing?.c ?? 0}`);
+      console.log(`    ${C.cyan('done today'.padEnd(12))} ${doneToday?.c ?? 0}`);
+
+      // Today's proposals (fatigue gate visibility)
+      const proposalsToday = await db.get(`SELECT COUNT(*) as c FROM proposals WHERE date(delivered_at) = date('now')`);
+      console.log(`    ${C.cyan('proposals'.padEnd(12))} ${proposalsToday?.c ?? 0}/3 today`);
+    } catch (err) {
+      console.log(`    ${C.red('• failed to query tasks:')} ${err.message}`);
+    }
+  }
+  console.log();
+}
+
 function humanSize(bytes) {
   if (bytes < 1024) return `${bytes}B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)}KB`;
@@ -766,6 +872,118 @@ async function cmdRun(args) {
   process.exit(result.exit_code === 0 ? 0 : 1);
 }
 
+// ─── Repo onboarding ─────────────────────────────────
+
+async function cmdOnboard(args) {
+  const flags = args.filter(a => a.startsWith('--'));
+  const positional = args.filter(a => !a.startsWith('--'));
+  const repoPath = positional[0] || process.cwd();
+  const force = flags.includes('--force');
+  const skipLlm = flags.includes('--stats-only');
+
+  const { resolve } = await import('path');
+  const absPath = resolve(repoPath);
+
+  console.log();
+  console.log(C.bold('  SEAL — Repo Onboarding'));
+  console.log(`  ${C.dim(absPath)}`);
+  console.log();
+
+  try {
+    const profile = await onboardRepo(absPath, {
+      force,
+      skipLlm,
+      onProgress(stage, data) {
+        switch (stage) {
+          case 'profile_exists':
+            console.log(`  ${C.yellow('ℹ')} Profile already exists (v${data.version}, ${data.analyzed_at})`);
+            console.log(`    ${C.dim('Use --force to re-analyze')}`);
+            break;
+          case 'scanning':
+            console.log(`  ${C.cyan('⟳')} Scanning git history…`);
+            break;
+          case 'stats_done':
+            console.log(`  ${C.green('✓')} ${data.commits} commits, ${data.contributors} contributors, ${data.branches} branches`);
+            break;
+          case 'llm_start':
+            console.log(`  ${C.cyan('⟳')} Synthesizing with LLM…`);
+            break;
+          case 'llm_unavailable':
+            console.log(`  ${C.yellow('⚠')} LLM provider "${data.provider}" not available — stats-only profile`);
+            break;
+          case 'llm_done':
+            console.log(`  ${C.green('✓')} LLM analysis complete`);
+            break;
+          case 'done':
+            console.log(`  ${C.green('✓')} Profile saved (v${data.version})`);
+            break;
+        }
+      },
+    });
+
+    // Print summary
+    const stats = profile.stats || {};
+    const llm = profile.llm_analysis || {};
+
+    console.log();
+    console.log(C.bold(`  ${profile.repo_name}`));
+    console.log(`  ${C.dim('─'.repeat(40))}`);
+
+    if (stats.workingHours) {
+      const wh = stats.workingHours;
+      console.log(`  ${C.cyan('Hours:')}    peak at ${wh.peakHours?.slice(0, 3).join('h, ')}h`);
+      console.log(`  ${C.cyan('Weekend:')}  ${(wh.weekendRatio * 100).toFixed(0)}% of commits`);
+    }
+
+    if (stats.conventions?.conventionalCommits) {
+      const cc = stats.conventions.conventionalCommits;
+      console.log(`  ${C.cyan('Commits:')}  ${(cc.ratio * 100).toFixed(0)}% conventional${cc.usesScopes ? ' (with scopes)' : ''}`);
+    }
+
+    if (stats.branches) {
+      const prefixes = Object.entries(stats.branches.prefixes || {})
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 4)
+        .map(([p, n]) => `${p}(${n})`)
+        .join(', ');
+      console.log(`  ${C.cyan('Branches:')} ${stats.branches.count} — ${prefixes}`);
+    }
+
+    if (stats.tags) {
+      console.log(`  ${C.cyan('Releases:')} ${stats.tags.releaseCadence?.frequency || 'unknown'} (${stats.tags.pattern?.pattern || 'no tags'})`);
+    }
+
+    if (stats.velocity) {
+      console.log(`  ${C.cyan('Velocity:')} ${stats.velocity.commitsPerWeek} commits/week (${stats.velocity.trend})`);
+    }
+
+    if (stats.contributors) {
+      const top = stats.contributors.slice(0, 3).map(c => c.name).join(', ');
+      console.log(`  ${C.cyan('Team:')}     ${stats.contributors.length} contributors — ${top}`);
+    }
+
+    // LLM recommendations
+    if (llm.seal_recommendations && Array.isArray(llm.seal_recommendations)) {
+      console.log();
+      console.log(C.bold('  Recommendations'));
+      for (const rec of llm.seal_recommendations.slice(0, 6)) {
+        const text = typeof rec === 'string' ? rec : rec.description || rec.recommendation || JSON.stringify(rec);
+        console.log(`    ${C.green('→')} ${text}`);
+      }
+    }
+
+    if (llm.summary) {
+      console.log();
+      console.log(`  ${C.dim(typeof llm.summary === 'string' ? llm.summary : JSON.stringify(llm.summary))}`);
+    }
+
+    console.log();
+  } catch (err) {
+    console.error(`  ${C.red('✗')} ${err.message}`);
+    process.exit(1);
+  }
+}
+
 // --- entrypoint ---
 
 async function main() {
@@ -785,14 +1003,16 @@ async function main() {
     process.exit(1);
   }
 
-  if (cmd === 'skills') return cmdSkills();
-  if (cmd === 'run')    return cmdRun([sub, ...rest].filter(Boolean));
+  if (cmd === 'skills')  return cmdSkills();
+  if (cmd === 'run')     return cmdRun([sub, ...rest].filter(Boolean));
+  if (cmd === 'onboard') return cmdOnboard([sub, ...rest].filter(Boolean));
 
   // Daemon management
   if (cmd === 'start')    return cmdStart([sub, ...rest].filter(Boolean));
   if (cmd === 'stop')     return cmdStop([sub, ...rest].filter(Boolean));
   if (cmd === 'restart')  return cmdRestart([sub, ...rest].filter(Boolean));
   if (cmd === 'ps')       return cmdPs();
+  if (cmd === 'status')   return cmdStatusOverview();
   if (cmd === 'logs')     return cmdLogs([sub, ...rest].filter(Boolean));
   if (cmd === 'open')     return cmdOpen();
 
