@@ -678,6 +678,15 @@ export async function updateStatus(id, status, result = null) {
   `, [status, result, status, id]);
 }
 
+/**
+ * Apaga uma tarefa de vez. Usado pela correção do áudio ("apaga 2"): quando o
+ * SEAL quebra uma fala em itens e erra um, o item errado tem que sumir — marcar
+ * como 'done' deixaria lixo contando na revisão.
+ */
+export async function deleteTask(id) {
+  return db.run(`DELETE FROM tasks WHERE id = ?`, [id]);
+}
+
 export async function setFiring(id) {
   return db.run(`UPDATE tasks SET status = 'firing', last_notified_at = datetime('now') WHERE id = ?`, [id]);
 }

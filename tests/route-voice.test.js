@@ -12,7 +12,39 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { classifyByHeuristic, renderStructured, isMicTest } from '../src/brain/route-voice.js';
+import { classifyByHeuristic, renderStructured, isMicTest, renderItems } from '../src/brain/route-voice.js';
+
+test('renderItems numera os itens para permitir "apaga N"', () => {
+  // A lista numerada é o que torna o erro corrigível. Sem número, a confirmação
+  // seria teatro: mostra o erro e não deixa consertar.
+  const out = renderItems([
+    { tipo: 'radar', resumo: 'login caindo', pessoa: null, campo: null },
+    { tipo: 'tl-log', resumo: 'ninguém documentou o fluxo', pessoa: null, campo: 'aprendizado' },
+    { tipo: 'tarefa', resumo: 'cobrar o Felipe', pessoa: null, campo: null },
+  ]);
+
+  assert.match(out, /1\..*RADAR/s);
+  assert.match(out, /2\..*TL LOG/s);
+  assert.match(out, /3\..*TAREFA/s);
+  assert.match(out, /login caindo/);
+  assert.match(out, /cobrar o Felipe/);
+});
+
+test('renderItems mostra o campo do TL Log e a pessoa citada', () => {
+  const out = renderItems([
+    { tipo: 'tl-log', resumo: 'ajudei no teste', pessoa: null, campo: 'ajudei' },
+    { tipo: 'pessoa', resumo: 'desmotivada com o projeto', pessoa: 'Carla', campo: null },
+  ]);
+
+  assert.match(out, /ajudei/, 'campo do tl-log deve aparecer');
+  assert.match(out, /\(Carla\)/, 'pessoa citada deve aparecer');
+});
+
+test('renderItems lida com um item só sem quebrar', () => {
+  const out = renderItems([{ tipo: 'radar', resumo: 'nada novo hoje', pessoa: null, campo: null }]);
+  assert.match(out, /1\./);
+  assert.match(out, /nada novo hoje/);
+});
 
 test('teste de microfone é reconhecido e não vira conteúdo', () => {
   // Caso real: em 10/08 "Alô, um, dois, três, testando" virou tarefa no banco

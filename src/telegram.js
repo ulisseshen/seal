@@ -97,6 +97,9 @@ export function startTelegram(config) {
           return;
         }
 
+        // "apaga 2" tem que ser tratado ANTES de tudo, senão vira tarefa nova.
+        if (await tryHandleCorrection(msg.text, chatId)) return;
+
         await handleText(msg.text, chatId, config);
       }
     } catch (err) {
@@ -112,7 +115,9 @@ async function handleVoice(msg, chatId, config) {
   if (!fileId) return;
 
   try {
-    await bot.sendMessage(chatId, 'SEAL: Transcribing...');
+    // Transcrição (~10s) + extração (~8-18s) somam meio minuto de silêncio. Sem
+    // sinal de vida o usuário reenvia o áudio achando que caiu.
+    await bot.sendMessage(chatId, '🎙️ SEAL: ouvindo...');
 
     const fileLink = await bot.getFileLink(fileId);
     const response = await fetch(fileLink);
@@ -149,7 +154,122 @@ const ROUTE_CONFIDENCE_FLOOR = 0.6;
 // Resposta de ritual aguardando o usuário desambiguar ("1" ou "2").
 const pendingRoute = new Map();
 
+// Últimos itens salvos por chat, para permitir "apaga 2". Sem isso a lista de
+// confirmação seria teatro: mostra o erro e não deixa corrigir.
+const lastSaved = new Map();
+
+/**
+ * Trata "apaga 2" / "apaga tudo" referente à última fala salva.
+ * Retorna true se tratou.
+ */
+async function tryHandleCorrection(text, chatId) {
+  const t = text.trim().toLowerCase();
+  const m = t.match(/^(apaga|apagar|remove|remover|corrig\w*)\s+(tudo|todos|\d+)$/);
+  if (!m) return false;
+
+  const saved = lastSaved.get(chatId);
+  if (!saved || !saved.length) {
+    await bot.sendMessage(chatId, 'SEAL: não tenho nada recente para apagar.');
+    return true;
+  }
+
+  const { deleteTask } = await import('./db.js');
+
+  if (m[2] === 'tudo' || m[2] === 'todos') {
+    for (const item of saved) await deleteTask(item.id);
+    lastSaved.delete(chatId);
+    await bot.sendMessage(chatId, `SEAL: apaguei os ${saved.length}.`);
+    return true;
+  }
+
+  const n = parseInt(m[2], 10);
+  if (!n || n < 1 || n > saved.length) {
+    await bot.sendMessage(chatId, `SEAL: só tenho ${saved.length} item(ns). Manda um número de 1 a ${saved.length}.`);
+    return true;
+  }
+
+  const alvo = saved[n - 1];
+  await deleteTask(alvo.id);
+  saved.splice(n - 1, 1);
+  lastSaved.set(chatId, saved);
+  await bot.sendMessage(chatId, `SEAL: apaguei "${alvo.resumo}".`);
+  return true;
+}
+
 const RITUAL_LABEL = { 'tl-log': 'TL Log', radar: 'Radar de incidentes' };
+
+// Mapeia o tipo extraído para o `type` do banco. 'radar' e 'tl-log' viram
+// 'person' (nota) porque é o tipo que o dashboard já lista e que a revisão de
+// 25/08 vai contar; o que distingue é o project + summary.
+const TYPE_TO_DB = {
+  radar: 'person',
+  'tl-log': 'person',
+  pessoa: 'person',
+  tarefa: 'task',
+  decisao: 'decision',
+  outro: 'task',
+};
+
+const TYPE_LABEL_DB = {
+  radar: 'Radar',
+  'tl-log': 'TL Log',
+  pessoa: 'Nota',
+  tarefa: 'Tarefa',
+  decisao: 'Decisão',
+  outro: 'Nota',
+};
+
+/**
+ * Grava os N itens extraídos de uma fala. Cada item vira sua própria linha, do
+ * seu tipo — nada some dentro de outro. Devolve os ids para permitir correção.
+ */
+async function saveItems(itens, rawText, chatId) {
+  const today = new Date().toISOString().slice(0, 10);
+  const saved = [];
+
+  for (const item of itens) {
+    const dbType = TYPE_TO_DB[item.tipo] || 'task';
+    const label = TYPE_LABEL_DB[item.tipo] || 'Nota';
+    const id = crypto.randomUUID().slice(0, 8);
+
+    // Só o primeiro item guarda a transcrição crua — repetir o áudio inteiro em
+    // cada linha polui o banco, mas perder o original impede recuperar nome
+    // próprio que o whisper errou.
+    const isFirst = saved.length === 0;
+    const detail = isFirst
+      ? `${item.texto}\n\n---\ntranscrição original:\n${rawText.trim()}`
+      : item.texto;
+
+    await insertTask({
+      id,
+      type: dbType,
+      summary: `${label} — ${item.resumo}`.slice(0, 80),
+      detail,
+      execute_at: null,
+      recurrence: null,
+      next_run: null,
+      prompt: null,
+      // Rituais vão para o projeto que a revisão de 25/08 conta. Tarefa e
+      // decisão ficam sem projeto — são trabalho, não medição do experimento.
+      project: (item.tipo === 'radar' || item.tipo === 'tl-log') ? 'techlead-90d' : null,
+      allowed_tools: '[]',
+      permission_mode: 'auto',
+      notify_type: 'silent',
+      notify_channel: 'telegram',
+      notify_target: String(chatId),
+      people: item.pessoa ? JSON.stringify([item.pessoa]) : '[]',
+      priority: 'medium',
+      // Tarefa fica pendente (é trabalho a fazer). Registro fica done.
+      status: item.tipo === 'tarefa' ? 'pending' : 'done',
+      created: new Date().toISOString(),
+      max_runs: null,
+    });
+
+    saved.push({ id, ...item });
+  }
+
+  return saved;
+}
 
 /**
  * Grava a resposta de um ritual: estrutura via IA e insere como type='person'
@@ -226,6 +346,13 @@ async function tryRouteToRitual(text, chatId) {
     const { classifyMessage, isMicTest } = await import('./brain/route-voice.js');
     const { getRecentlyFiredRituals } = await import('./db.js');
 
+    // Correção falada ("apaga dois"). O whisper escreve número por extenso, e
+    // corrigir por voz é justamente o caminho de quem já está de mãos ocupadas.
+    const numerais = { um: '1', dois: '2', tres: '3', três: '3', quatro: '4', cinco: '5', seis: '6' };
+    const normalizado = text.trim().toLowerCase().replace(/\.$/, '')
+      .replace(/\b(um|dois|tr[eê]s|quatro|cinco|seis)\b/g, (w) => numerais[w] || w);
+    if (await tryHandleCorrection(normalizado, chatId)) return true;
+
     // Teste de microfone não é conteúdo. Responde e NÃO grava nada.
     if (isMicTest(text)) {
       console.log(`[telegram] Mic test ignored: "${text.slice(0, 40)}"`);
@@ -243,29 +370,29 @@ async function tryRouteToRitual(text, chatId) {
         }
       : null;
 
-    const result = await classifyMessage(text, { pendingRitual: hint });
-    console.log(`[telegram] Route: kind=${result.kind} conf=${result.confidence} src=${result.source}`);
+    // Caminho principal: quebra a fala em N itens. Uma fala real de fim de dia
+    // mistura incidente + aprendizado + tarefa, e escolher UM rótulo jogaria o
+    // resto fora. `hint` continua sendo só contexto para a IA, nunca decisão.
+    const { extractItems, renderItems } = await import('./brain/route-voice.js');
+    // Mostra a transcrição já — assim o usuário confere as palavras enquanto a
+    // IA quebra em itens, e vê na hora se o whisper errou um nome.
+    await bot.sendMessage(chatId, `📝 "${text.trim()}"\n\nseparando...`);
+    const { itens, degraded } = await extractItems(text);
+    console.log(`[telegram] Extracted ${itens.length} item(s): ${itens.map(i => i.tipo).join(', ')}`);
 
-    if (result.kind === 'unknown' || result.confidence < ROUTE_CONFIDENCE_FLOOR) {
-      // Só pergunta se havia mesmo um ritual esperando. Sem isso, qualquer
-      // tarefa solta ("lembra de pagar o boleto") viraria uma pergunta chata.
-      if (!fired.length) return false;
+    // Nada com conteúdo real e nenhum ritual esperando → não é assunto do SEAL.
+    // Deixa cair no fluxo normal de tarefa em vez de forçar uma categoria.
+    const todosVazios = itens.every((i) => i.tipo === 'outro' && i.confianca < 0.4);
+    if (todosVazios && !fired.length) return false;
 
-      pendingRoute.set(chatId, { text, config: null });
-      await bot.sendMessage(chatId,
-        `SEAL: não tenho certeza do que é isso. Responde com o número:\n\n` +
-        `1 — TL Log\n2 — Radar de incidentes\n3 — Nenhum dos dois (vira tarefa)\n\n` +
-        `"${text.slice(0, 100)}${text.length > 100 ? '…' : ''}"`);
-      return true;
-    }
+    const saved = await saveItems(itens, text, chatId);
+    lastSaved.set(chatId, saved);
 
-    const { rendered, degraded } = await saveRitualResponse(result.kind, text, chatId);
-    // Sempre mostra o que entendeu. Se classificou errado, o usuário vê agora —
-    // não em 25/08 com o dado já contaminado.
+    const plural = saved.length === 1 ? 'coisa' : 'coisas';
     await bot.sendMessage(chatId,
-      `SEAL: ${RITUAL_LABEL[result.kind]} salvo.\n\n${rendered}\n\n` +
-      (degraded ? '(IA fora do ar — texto cru, sem estruturar.)\n' : '') +
-      `Se eu errei o ritual, manda "corrigir".`);
+      `SEAL: entendi ${saved.length} ${plural}:\n\n${renderItems(saved)}\n\n` +
+      (degraded ? '⚠️ IA fora do ar — salvei a fala inteira sem quebrar.\n\n' : '') +
+      `Errei algum? Manda "apaga N" (ex: "apaga 2") ou "apaga tudo".`);
     return true;
   } catch (err) {
     console.error('[telegram] Ritual routing failed:', err.message);

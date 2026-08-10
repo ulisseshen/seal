@@ -196,6 +196,137 @@ export async function classifyMessage(text, { pendingRitual } = {}) {
   return { ...heuristic, source: 'heuristic-fallback' };
 }
 
+// ─── Extração multi-item ────────────────────────────────────────────────────
+// A classificação single-label acima resolve o caso simples (um áudio, um
+// assunto). Mas o Ulisses não fala em compartimento: às 17:30, cansado, a fala
+// real é "o incidente do login foi token expirando, aprendi que ninguém
+// documentou o fluxo, e lembra de cobrar o Felipe" — radar + tl-log + tarefa
+// numa frase só. Escolher UM rótulo joga o resto fora.
+//
+// Então o modo principal é EXTRAIR N itens de uma fala. Cada item vira sua
+// própria linha, do seu tipo. O que não encaixa em nada vira tarefa genérica,
+// nunca é descartado.
+
+const EXTRACT_SYSTEM = [
+  'Você quebra a fala de um Tech Lead brasileiro em itens separados.',
+  'O texto vem de transcrição de voz: tem hesitação, repetição e erro em nome',
+  'próprio. Limpe isso. NUNCA invente conteúdo que ele não disse.',
+  '',
+  'Uma fala pode conter VÁRIOS itens de tipos diferentes. Extraia todos.',
+  '',
+  'Tipos:',
+  '- "radar": incidente concreto. Algo caiu/quebrou/está aberto agora.',
+  '- "tl-log": retrospectiva do dia. Aprendizado sobre o sistema, risco que',
+  '  apareceu, prevenção, quem ele ajudou.',
+  '- "pessoa": observação sobre alguém do time (humor, dificuldade, evolução,',
+  '  algo para retomar no 1:1). Ex: "a Carla tá desmotivada".',
+  '- "tarefa": algo que ELE precisa fazer. Ex: "lembra de cobrar o Felipe".',
+  '- "decisao": escolha técnica ou de produto tomada, com o porquê se ele disse.',
+  '  Ex: "decidimos segurar o rollout em 10%".',
+  '- "outro": tem conteúdo mas não encaixa em nenhum acima.',
+  '',
+  'REGRAS QUE IMPORTAM:',
+  '1. Um tl-log frequentemente MENCIONA um incidente. Se a fala é retrospectiva',
+  '   ("aprendi com o incidente de ontem"), é tl-log. Se é triagem do que está',
+  '   aberto ("o login está caindo agora"), é radar. Na dúvida, os dois podem',
+  '   coexistir como itens separados.',
+  '2. NÃO force. Fala com um assunto só gera UM item. Não invente itens para',
+  '   parecer completo.',
+  '2b. "Não teve nada", "nada novo no grupo", "dia tranquilo" É UM RADAR VÁLIDO',
+  '   (tipo "radar", texto "nada novo"). O valor do ritual está em ter olhado —',
+  '   classificar isso como "outro" apagaria um ritual cumprido.',
+  '3. Preserve o texto dele. `texto` é o que ele disse sobre AQUELE item,',
+  '   limpo mas não parafraseado.',
+  '',
+  'Responda APENAS JSON:',
+  '{"itens":[{"tipo":"radar|tl-log|pessoa|tarefa|decisao|outro",',
+  '  "texto":"<o que ele disse sobre este item>",',
+  '  "resumo":"<até 60 caracteres>",',
+  '  "pessoa":"<nome citado, ou null>",',
+  '  "campo":"<só para tl-log: aprendizado|risco|decisao|prevencao|ajudei|amanha>",',
+  '  "confianca":0.0-1.0}]}',
+].join('\n');
+
+/**
+ * Extrai N itens de uma fala. Este é o caminho principal do áudio.
+ *
+ * Se a IA falhar, devolve um único item 'outro' com o texto cru — a fala do
+ * usuário nunca se perde por causa de provider fora do ar.
+ */
+export async function extractItems(text) {
+  try {
+    const raw = await askLLM(EXTRACT_SYSTEM, `Fala:\n"""${text.trim()}"""`);
+    const parsed = extractJson(raw);
+    if (parsed && Array.isArray(parsed.itens) && parsed.itens.length) {
+      const itens = parsed.itens
+        .filter((i) => i && i.texto && String(i.texto).trim())
+        .map((i) => ({
+          tipo: VALID_TYPES.has(i.tipo) ? i.tipo : 'outro',
+          texto: String(i.texto).trim(),
+          resumo: (i.resumo || String(i.texto)).slice(0, 60).trim(),
+          pessoa: i.pessoa || null,
+          campo: i.campo || null,
+          confianca: typeof i.confianca === 'number' ? i.confianca : 0.5,
+        }));
+      if (itens.length) return { itens, degraded: false };
+    }
+  } catch (err) {
+    return { itens: [fallbackItem(text)], degraded: true, error: err.message };
+  }
+  return { itens: [fallbackItem(text)], degraded: true };
+}
+
+const VALID_TYPES = new Set(['radar', 'tl-log', 'pessoa', 'tarefa', 'decisao', 'outro']);
+
+function fallbackItem(text) {
+  // IA fora do ar: tenta ao menos acertar o tipo pela heurística, e guarda a
+  // fala inteira como um item só. Melhor um item mal-rotulado que zero itens.
+  const h = classifyByHeuristic(text);
+  return {
+    tipo: h.kind === 'unknown' ? 'outro' : h.kind,
+    texto: text.trim(),
+    resumo: text.trim().slice(0, 60),
+    pessoa: null,
+    campo: null,
+    confianca: h.confidence,
+  };
+}
+
+const TYPE_ICON = {
+  radar: '📕',
+  'tl-log': '📗',
+  pessoa: '📙',
+  tarefa: '📘',
+  decisao: '📓',
+  outro: '📄',
+};
+
+const TYPE_LABEL = {
+  radar: 'RADAR',
+  'tl-log': 'TL LOG',
+  pessoa: 'PESSOA',
+  tarefa: 'TAREFA',
+  decisao: 'DECISÃO',
+  outro: 'NOTA',
+};
+
+/**
+ * Monta a lista numerada que o usuário vê. É isso que torna o erro visível na
+ * hora em vez de aparecer contaminado na revisão de 25/08.
+ */
+export function renderItems(itens) {
+  const lines = [];
+  itens.forEach((item, idx) => {
+    const icon = TYPE_ICON[item.tipo] || '📄';
+    const label = TYPE_LABEL[item.tipo] || 'NOTA';
+    const campo = item.tipo === 'tl-log' && item.campo ? ` — ${item.campo}` : '';
+    const quem = item.pessoa ? ` (${item.pessoa})` : '';
+    lines.push(`${idx + 1}. ${icon} ${label}${campo}${quem}`);
+    lines.push(`   ${item.resumo}`);
+  });
+  return lines.join('\n');
+}
+
 const STRUCTURE_TL_LOG = [
   'Você estrutura o log diário de um Tech Lead brasileiro, falado por voz.',
   'O texto vem de transcrição automática: pode ter repetição, hesitação e erro',
