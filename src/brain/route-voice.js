@@ -97,6 +97,29 @@ function scoreHints(text, hints) {
   return hints.reduce((n, h) => (lower.includes(h) ? n + 1 : n), 0);
 }
 
+// Teste de microfone. Em 10/08 o Ulisses mandou "Alô, um, dois, três,
+// testando" e isso virou uma tarefa no banco — e o SEAL ainda perguntou em que
+// projeto salvar, prendendo a conversa num interrogatório. Um teste de áudio
+// não é conteúdo: é o usuário conferindo se o canal funciona.
+const MIC_TEST_PATTERNS = [
+  /^\s*(al[oô]+|ol[aá]|ei|hey|test\w*)\b/i,
+  /\btest(ando|e|ing)\b/i,
+  /\bum,?\s*dois,?\s*(tr[eê]s)?\b/i,
+  /\bmicrofone\b/i,
+  /\bt[aá]\s*(me\s*)?(ouvindo|gravando|funcionando)\b/i,
+];
+
+/**
+ * É só um teste de microfone? Precisa ser curto E casar um padrão — "testando
+ * o fluxo de aprovação em staging hoje" é conteúdo real, não teste de áudio.
+ */
+export function isMicTest(text) {
+  const t = text.trim();
+  const words = t.split(/\s+/).filter(Boolean).length;
+  if (words > 8) return false;
+  return MIC_TEST_PATTERNS.some((re) => re.test(t));
+}
+
 /**
  * Classificação sem IA. Retorna {kind, confidence} onde kind é
  * 'tl-log' | 'radar' | 'unknown'.

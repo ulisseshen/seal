@@ -12,7 +12,35 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-import { classifyByHeuristic, renderStructured } from '../src/brain/route-voice.js';
+import { classifyByHeuristic, renderStructured, isMicTest } from '../src/brain/route-voice.js';
+
+test('teste de microfone é reconhecido e não vira conteúdo', () => {
+  // Caso real: em 10/08 "Alô, um, dois, três, testando" virou tarefa no banco
+  // e o SEAL ainda perguntou em que projeto salvar, prendendo a conversa.
+  const testes = [
+    'Alô, um, dois, três, testando.',
+    'testando',
+    'alô, tá me ouvindo?',
+    'oi, teste',
+    'um, dois, três',
+    'testando o microfone',
+  ];
+  for (const t of testes) {
+    assert.ok(isMicTest(t), `"${t}" deveria ser teste de microfone`);
+  }
+});
+
+test('conteúdo real que MENCIONA teste não é confundido com teste de mic', () => {
+  // O risco do falso positivo: "testando" aparece em fala legítima de dev.
+  const reais = [
+    'Hoje passei o dia testando o fluxo de aprovação em staging e achei dois bugs',
+    'A QA está testando o cenário de erro do pedido rede desde ontem de manhã',
+    'Aprendi que o teste de integração do login não cobre o caso de token expirado',
+  ];
+  for (const t of reais) {
+    assert.ok(!isMicTest(t), `"${t.slice(0, 40)}..." é conteúdo real, não teste de mic`);
+  }
+});
 
 test('reconhece um TL Log típico pelo enquadramento retrospectivo', () => {
   const fala =

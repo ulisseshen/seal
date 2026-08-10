@@ -129,7 +129,12 @@ async function handleVoice(msg, chatId, config) {
     const routed = await tryRouteToRitual(text, chatId);
     if (routed) return;
 
-    await handleText(text, chatId, config);
+    // Áudio NUNCA vira interrogatório de projeto. Voz é captura rápida — o
+    // usuário falou e seguiu a vida; perguntar "qual projeto?" prende a
+    // conversa (a resposta seguinte dele é engolida como resposta à pergunta,
+    // que foi exatamente o que aconteceu em 10/08). Salva sem projeto; dá para
+    // classificar depois no dashboard.
+    await handleText(text, chatId, config, { askProject: false });
   } catch (err) {
     console.error('[telegram] Voice transcription failed:', err.message);
     await bot.sendMessage(chatId, 'SEAL: Voice transcription failed.');
@@ -203,7 +208,8 @@ async function tryRouteToRitual(text, chatId) {
     if (pick) {
       pendingRoute.delete(chatId);
       if (pick === 'none') {
-        await handleText(waiting.text, chatId, waiting.config);
+        // Veio de áudio → mesma regra: não interroga sobre projeto.
+        await handleText(waiting.text, chatId, waiting.config, { askProject: false });
         return true;
       }
       const { rendered, degraded } = await saveRitualResponse(pick, waiting.text, chatId);
@@ -217,8 +223,15 @@ async function tryRouteToRitual(text, chatId) {
   }
 
   try {
-    const { classifyMessage } = await import('./brain/route-voice.js');
+    const { classifyMessage, isMicTest } = await import('./brain/route-voice.js');
     const { getRecentlyFiredRituals } = await import('./db.js');
+
+    // Teste de microfone não é conteúdo. Responde e NÃO grava nada.
+    if (isMicTest(text)) {
+      console.log(`[telegram] Mic test ignored: "${text.slice(0, 40)}"`);
+      await bot.sendMessage(chatId, `SEAL: te ouvi 👍 ("${text.trim()}")\n\nNão salvei nada — isso foi teste de áudio.`);
+      return true;
+    }
 
     const fired = await getRecentlyFiredRituals({ windowHours: 20 });
     const hint = fired[0]
@@ -260,7 +273,7 @@ async function tryRouteToRitual(text, chatId) {
   }
 }
 
-async function handleText(text, chatId, config) {
+async function handleText(text, chatId, config, { askProject = true } = {}) {
   // Check if this is a reply to a pending project question
   const pending = pendingProject.get(chatId);
   if (pending) {
@@ -333,7 +346,14 @@ async function handleText(text, chatId, config) {
     return;
   }
 
-  // Multiple projects — ask
+  // Multiple projects — normally ask, but never for voice (see handleVoice).
+  if (!askProject) {
+    await insertTask(task);
+    await bot.sendMessage(chatId, `SEAL: ${summary}`);
+    console.log(`[telegram] "${summary}" saved without project, no prompt (${task.id})`);
+    return;
+  }
+
   pendingProject.set(chatId, { task, timestamp: Date.now() });
 
   // Auto-expire after 5 minutes
