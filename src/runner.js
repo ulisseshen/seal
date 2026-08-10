@@ -54,6 +54,8 @@ import {
   getPendingTasks,
   claimPendingTasks,
   getPendingReminders,
+  getPendingNudges,
+  markNudged,
   getFiringSupernova,
   getRunningCount,
   setFiring,
@@ -397,6 +399,36 @@ if (process.env.SEAL_BRAIN_PROPOSER === '1') {
   console.log('[brain] proposer disabled (set SEAL_BRAIN_PROPOSER=1 to enable)');
 }
 
+// Check-in contextual "pergunta o TL primeiro": ter (2) + sex (5), ~11h, o SEAL
+// gera as perguntas (no tom do Uli, contexto por pessoa), MANDA NO TELEGRAM com
+// botões Enviar/Ajustar/Pular, e só o aprovado vai pro Teams. Guard de 1x/dia.
+// Liga com SEAL_CHECKIN_TELEGRAM=1 (precisa do gateway Telegram configurado).
+if (process.env.SEAL_CHECKIN_TELEGRAM === '1') {
+  let lastCheckinDay = null;
+  const checkinTick = async () => {
+    const now = new Date();
+    const dow = now.getDay();        // 2=ter, 5=sex
+    const hour = now.getHours();
+    const dayKey = now.toISOString().slice(0, 10);
+    if ((dow === 2 || dow === 5) && hour === 11 && lastCheckinDay !== dayKey) {
+      lastCheckinDay = dayKey;
+      if (!gateway) { console.warn('[checkin] gateway off — pulando'); return; }
+      try {
+        const { proposeCheckinsViaTelegram } = await import('./brain/daily.js');
+        console.log('[checkin] propondo check-ins no Telegram pra aprovação…');
+        const r = await proposeCheckinsViaTelegram(gateway);
+        console.log('[checkin] resultado:', r.map((x) => `${x.person}:${x.action}`).join(' '));
+      } catch (err) {
+        console.warn('[checkin] falhou:', err.message);
+      }
+    }
+  };
+  setInterval(checkinTick, 10 * 60 * 1000); // checa a cada 10min se é a hora
+  console.log('[checkin] contextual via Telegram ON (ter+sex ~11h, aprovação no celular)');
+} else {
+  console.log('[checkin] contextual via Telegram disabled (set SEAL_CHECKIN_TELEGRAM=1)');
+}
+
 // v0.11.0 "SEAL learns your repo" — auto-onboard watched repos that
 // don't have a profile yet. Runs once at startup (delayed 45s to let
 // the Eye and detector settle first). Non-blocking: errors are logged,
@@ -459,6 +491,25 @@ async function pollTasks() {
         const { updateStatus } = await import('./db.js');
         await updateStatus(reminder.id, 'done');
       }
+    }
+
+    // Behavior nudges — type=person notes with a due follow-up. SEAL cobra a
+    // promessa de gestão e sugere o próximo passo via the nudge-behavior action
+    // (LLM + circuit breaker, buttons on Telegram). If the action system or
+    // gateway isn't up, degrade to the same dumb notify() the reminders use, so
+    // the note isn't lost. markNudged() caps insistence (3 tries, 2-day spacing).
+    const nudges = await getPendingNudges();
+    for (const note of nudges) {
+      await markNudged(note.id);
+      if (actionRegistry && gateway) {
+        try {
+          await actionRegistry.trigger('nudge-behavior', { task: note });
+          continue;
+        } catch (err) {
+          console.warn(`[seal] nudge trigger failed for ${note.id}, falling back to notify:`, err.message);
+        }
+      }
+      notify(note, note.notify_type || 'sound');
     }
   } catch (err) {
     console.error(`[seal] Poll error:`, err.message);

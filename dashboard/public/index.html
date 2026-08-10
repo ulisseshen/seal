@@ -73,6 +73,10 @@
           <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M20 16V8a2 2 0 00-1-1.73l-7-4a2 2 0 00-2 0l-7 4A2 2 0 002 8v8a2 2 0 001 1.73l7 4a2 2 0 002 0l7-4A2 2 0 0020 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
           <span class="sidebar-label">Ingest</span>
         </button>
+        <button class="sidebar-item" data-tab="nudges" title="Cobranças">
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M18 8A6 6 0 006 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 01-3.46 0"/></svg>
+          <span class="sidebar-label">Cobranças</span>
+        </button>
       </nav>
       <div class="sidebar-footer">
         <div class="sidebar-stats" id="header-stats"></div>
@@ -340,6 +344,19 @@
         </div>
 
         <div id="ingest-list" class="ingest-list"></div>
+      </section>
+
+      <section class="page" id="page-nudges">
+        <div class="page-header">
+          <h2 class="page-title">Cobranças — SEAL cobra e sugere</h2>
+          <div class="page-actions">
+            <button class="btn btn-primary btn-sm" id="btn-reload-nudges">Reload</button>
+          </div>
+        </div>
+        <p class="page-subtitle">
+          Promessas de gestão que você registrou (notas de pessoa com follow-up). SEAL cobra no prazo e sugere o próximo passo — os botões de ação chegam no seu Telegram. Aqui você acompanha o status.
+        </p>
+        <div id="nudges-list" class="nudges-list"></div>
       </section>
     </main>
   </div>

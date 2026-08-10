@@ -18,11 +18,15 @@ import {
   setPatternState,
   listProposals,
   getProposal,
+  listNudges,
+  completeNudge,
 } from '../src/db.js';
 import { runDetectors } from '../src/brain/detector.js';
 import { runProposer, applyDecision } from '../src/brain/proposer.js';
 import { listSkills, runSkill, getSkillByName, readSkillRunHistory } from '../src/brain/skills.js';
 import { runIngest, approveIngestTeaching, ignoreIngest, listIngestQueue } from '../src/brain/ingest.js';
+import { diagnosePerson, diagnoseTeam } from '../src/brain/diagnose.js';
+import { byTheme, byProject, listPeople } from '../src/brain/segments.js';
 import { listTeamMembers, getTeamMember, setTeamMemberInfo } from '../src/db.js';
 import { installSealHooks, uninstallSealHooks, hasSealHooks } from './hooks-installer.js';
 import { getProvider, listProviders } from '../src/providers/index.js';
@@ -40,7 +44,11 @@ db.pragma('journal_mode = WAL');
 
 const app = express();
 app.use(express.json());
-app.use(express.static(join(__dirname, 'public')));
+// Serve the Vite/React build (dashboard/web/dist). The legacy vanilla-JS UI
+// under dashboard/public is kept as a fallback only if the build is missing.
+const WEB_DIST = join(__dirname, 'web', 'dist');
+const STATIC_ROOT = existsSync(join(WEB_DIST, 'index.html')) ? WEB_DIST : join(__dirname, 'public');
+app.use(express.static(STATIC_ROOT));
 
 // --- API: Tasks ---
 
@@ -715,6 +723,92 @@ app.post('/api/skills/:name/run', async (req, res) => {
 
 // --- API: Proposals (v0.5.0 "SEAL proposes") ---
 
+// --- API: Daily (capture + contextual check-in suggestion) ---
+app.post('/api/daily/ingest', async (req, res) => {
+  try {
+    const text = (req.body?.text || '').trim();
+    if (!text) return res.status(400).json({ error: 'texto da daily vazio' });
+    const { ingestDaily } = await import('../src/brain/daily.js');
+    const saved = await ingestDaily(text, req.body?.date ? { date: req.body.date } : {});
+    res.json({ saved });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Recent dailies (for the Daily tab feed). Uses the local better-sqlite3 `db`
+// (synchronous .prepare().all()), like the other server.js task routes.
+app.get('/api/daily', (req, res) => {
+  try {
+    const limit = req.query.limit ? parseInt(req.query.limit, 10) || 50 : 50;
+    const rows = db.prepare(
+      `SELECT id, summary, detail, people, execute_at FROM tasks
+       WHERE type = 'daily' ORDER BY datetime(execute_at) DESC LIMIT ?`,
+    ).all(limit);
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Contextual check-in suggestion for one person (AI cross-references dailies +
+// last Teams reply + open promises). Returns the suggested question for the TL
+// to approve — does NOT send anything.
+app.get('/api/daily/suggest/:person', async (req, res) => {
+  try {
+    const { buildCheckinSuggestion } = await import('../src/brain/daily.js');
+    res.json(await buildCheckinSuggestion(req.params.person));
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// --- API: Diagnosis & Segments (read-only) ---
+// Honest omission diagnosis: facts + traceable risks, no invented score.
+
+app.get('/api/diagnose', async (_req, res) => {
+  try { res.json(await diagnoseTeam()); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+app.get('/api/diagnose/:name', async (req, res) => {
+  try { res.json(await diagnosePerson(req.params.name)); }
+  catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Segments — slices of the same signals: people / themes / projects.
+app.get('/api/segments/:kind', async (req, res) => {
+  try {
+    if (req.params.kind === 'themes') return res.json(await byTheme());
+    if (req.params.kind === 'projects') return res.json(await byProject());
+    if (req.params.kind === 'people') return res.json(await listPeople());
+    return res.status(404).json({ error: 'unknown segment kind' });
+  } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// Behavior nudges (read-only) — the management promises SEAL is chasing.
+// Action buttons (Feito / re-cobrar) live on Telegram; the dashboard observes.
+app.get('/api/nudges', async (req, res) => {
+  try {
+    const limit = req.query.limit ? parseInt(req.query.limit, 10) || 100 : 100;
+    const rows = await listNudges({ limit });
+    res.json(rows);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Finalizar uma cobrança direto do dashboard, com nota de fechamento opcional.
+app.post('/api/nudges/:id/done', async (req, res) => {
+  try {
+    const updated = await completeNudge(req.params.id, req.body?.note || '');
+    if (!updated) return res.status(404).json({ error: 'cobrança não encontrada' });
+    res.json(updated);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 app.get('/api/proposals', async (req, res) => {
   const { decided, limit } = req.query;
   try {
@@ -795,7 +889,7 @@ app.post('/api/memories', async (req, res) => {
 // --- Fallback: serve index.html for SPA ---
 
 app.get('*', (_req, res) => {
-  res.sendFile(join(__dirname, 'public', 'index.html'));
+  res.sendFile(join(STATIC_ROOT, 'index.html'));
 });
 
 app.listen(PORT, () => {

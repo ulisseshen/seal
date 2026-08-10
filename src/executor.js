@@ -17,7 +17,7 @@ import { prefetch, sync as memorySync } from './memory.js';
 import { enhancePrompt, compressOutput, isRtkAvailable } from './rtk.js';
 import { checkClaudeAuth, LOGIN_EXPIRED_RESULT } from './auth.js';
 import { getClaudeBin } from './claude-bin.js';
-import { CronExpressionParser } from 'cron-parser';
+import { computeNextRun } from './recurrence.js';
 import path from 'path';
 import os from 'os';
 
@@ -270,11 +270,9 @@ export async function executeTask(task) {
             if (await checkMaxRuns(task.id)) {
               console.log(`[executor] Task ${task.id} reached max runs, marking done`);
             } else {
-              // Parse cron in the system's local timezone so expressions like
-              // "*/30 8-19 * * *" mean 8am-7:30pm LOCAL time, not UTC.
-              const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-              const interval = CronExpressionParser.parse(task.recurrence, { tz });
-              const nextRun = interval.next().toDate().toISOString();
+              // Cron in local tz ("*/30 8-19 * * *" = 8am-7:30pm LOCAL), or an
+              // "every:Nd" interval anchored on when this run actually finished.
+              const nextRun = computeNextRun(task.recurrence, new Date());
               await advanceRecurring(task.id, nextRun);
               console.log(`[executor] Task ${task.id} next run: ${nextRun}`);
             }
@@ -323,10 +321,8 @@ export async function executeTask(task) {
         if (task.recurrence) {
           try {
             if (!(await checkMaxRuns(task.id))) {
-              // Same local-timezone handling as the success path above.
-              const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-              const interval = CronExpressionParser.parse(task.recurrence, { tz });
-              const nextRun = interval.next().toDate().toISOString();
+              // Same dual cron / interval handling as the success path above.
+              const nextRun = computeNextRun(task.recurrence, new Date());
               await advanceRecurring(task.id, nextRun);
               console.log(`[executor] Task ${task.id} re-queued after failure, next run: ${nextRun}`);
             }
@@ -425,9 +421,7 @@ async function executeShellTask(task) {
             if (await checkMaxRuns(task.id)) {
               console.log(`[executor] Task ${task.id} reached max runs, marking done`);
             } else {
-              const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-              const interval = CronExpressionParser.parse(task.recurrence, { tz });
-              const nextRun = interval.next().toDate().toISOString();
+              const nextRun = computeNextRun(task.recurrence, new Date());
               await advanceRecurring(task.id, nextRun);
               console.log(`[executor] Task ${task.id} next run: ${nextRun}`);
             }
@@ -447,9 +441,7 @@ async function executeShellTask(task) {
         if (task.recurrence) {
           try {
             if (!(await checkMaxRuns(task.id))) {
-              const tz = Intl.DateTimeFormat().resolvedOptions().timeZone;
-              const interval = CronExpressionParser.parse(task.recurrence, { tz });
-              const nextRun = interval.next().toDate().toISOString();
+              const nextRun = computeNextRun(task.recurrence, new Date());
               await advanceRecurring(task.id, nextRun);
               console.log(`[executor] Task ${task.id} re-queued after failure, next run: ${nextRun}`);
             }

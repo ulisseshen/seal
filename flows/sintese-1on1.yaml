@@ -1,0 +1,68 @@
+name: sintese-1on1
+description: >
+  Lê todos os 1:1 de um ciclo (team/mobile/*/1-1-<mês>.md) e extrai os padrões
+  transversais — o trabalho manual que o TL fazia no bloco "Padrão do time".
+  Roda no fim de cada ciclo de 1:1; grava a síntese no vault para virar input de retro/planning.
+version: 1
+
+defaults:
+  # Pasta-raiz do time no vault Obsidian. Ajuste se mudar de máquina.
+  team_dir: /Users/ulisseshen/Documents/empresa/team/mobile
+  # Sufixo do mês a sintetizar — o flow casa arquivos *<cycle>*.md (case-insensitive).
+  cycle: Junho
+  out_dir: /Users/ulisseshen/Documents/empresa/team/mobile
+
+steps:
+  # 1. Junta todos os 1:1 do ciclo num único blob, com cabeçalho por pessoa.
+  - id: gather
+    action: shell.run
+    cmd: >
+      for f in $(find "{team_dir}" -type f -iname "*{cycle}*.md" -not -path "*/.obsidian/*" | sort); do
+        person=$(basename "$(dirname "$f")");
+        printf '\n\n===== %s (%s) =====\n' "$person" "$f";
+        cat "$f";
+      done
+    output: corpus
+
+  # 2. LLM extrai os padrões transversais como MARKDOWN pronto.
+  #    (Markdown direto em vez de JSON: a interpolação {x.y} do engine é de 1 nível
+  #    e renderizaria objetos aninhados como [object Object]. Texto é robusto aqui.)
+  - id: synthesize
+    action: llm.ask
+    prompt: |
+      Você é o copiloto de Tech Lead. Abaixo estão TODOS os 1:1 do ciclo "{cycle}",
+      um por membro do time, separados por "===== Pessoa =====".
+
+      Extraia APENAS o que aparece de forma TRANSVERSAL (em 2+ pessoas) ou que seja um
+      sinal de atenção individual relevante. NÃO invente, NÃO suavize, NÃO gere feedback novo —
+      apenas sintetize o que JÁ está escrito. Cite a pessoa entre parênteses no fim de cada item.
+
+      REGRA DE SAÍDA: responda SÓ com o markdown abaixo, começando direto no primeiro
+      "## ". Sem preâmbulo, sem "vou sintetizar", sem comentários sobre os arquivos.
+
+      Use exatamente estas 4 seções (listas com "- "):
+
+      ## Padrões transversais
+      ## Pedidos recorrentes
+      ## Sinais de atenção (individuais)
+      ## Ações para o TL
+
+      Os 1:1:
+      {corpus.stdout}
+    output: synth
+
+  # 3. Grava a síntese no vault, datada pelo ciclo.
+  #    Block scalar "|" preserva as newlines do heredoc (folded ">" colapsaria
+  #    tudo numa linha e o heredoc não fecharia). Aspas simples no delimitador
+  #    impedem expansão de $, ` e \ dentro do markdown do LLM.
+  - id: write
+    action: shell.run
+    cmd: |
+      cat > "{out_dir}/_sintese-ciclo-{cycle}.md" <<'SEAL_EOF'
+      # 🧠 Síntese do ciclo de 1:1 — {cycle}
+      _Gerado pelo SEAL (flow sintese-1on1). Revise antes de usar em retro/planning._
+
+      {synth}
+      SEAL_EOF
+      echo "Síntese gravada em {out_dir}/_sintese-ciclo-{cycle}.md"
+    output: written

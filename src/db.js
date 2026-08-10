@@ -553,6 +553,71 @@ export async function getPendingReminders() {
   `);
 }
 
+// Behavior nudges — type=person notes with a due follow-up. These are the
+// management promises SEAL cobra (e sugere). They were previously NEVER
+// dispatched (getPendingReminders only matches type='reminder'), so a person
+// note with a follow-up sat pending forever. The runner routes these through
+// the nudge-behavior action. `retry_count` caps re-nags; `last_notified_at`
+// throttles the 2-day insistence interval.
+export async function getPendingNudges({ maxRetries = 3, intervalDays = 2 } = {}) {
+  return db.all(`
+    SELECT * FROM tasks
+    WHERE type = 'person'
+      AND status IN ('pending', 'firing')
+      AND execute_at IS NOT NULL
+      AND datetime(execute_at) <= datetime('now')
+      AND COALESCE(retry_count, 0) < ?
+      AND (last_notified_at IS NULL OR datetime(last_notified_at, ?) <= datetime('now'))
+  `, [maxRetries, `+${intervalDays} days`]);
+}
+
+// Mark that a nudge fired: bump retry_count, stamp last_notified_at, and move
+// to 'firing' so it's clearly mid-insistence (not a fresh pending note).
+export async function markNudged(id) {
+  return db.run(`
+    UPDATE tasks
+    SET status = 'firing', retry_count = COALESCE(retry_count, 0) + 1, last_notified_at = datetime('now')
+    WHERE id = ?
+  `, [id]);
+}
+
+// Dashboard view of behavior nudges — every person note that has a follow-up
+// date, with its current state (pending / firing / done) and how many times
+// it's been cobrado (retry_count).
+export async function listNudges({ limit = 100 } = {}) {
+  return db.all(`
+    SELECT id, summary, detail, people, execute_at, status,
+           COALESCE(retry_count, 0) AS nudge_count, last_notified_at, completed_at
+    FROM tasks
+    WHERE type = 'person' AND execute_at IS NOT NULL
+    ORDER BY
+      CASE status WHEN 'firing' THEN 0 WHEN 'pending' THEN 1 ELSE 2 END,
+      datetime(execute_at) ASC
+    LIMIT ?
+  `, [limit]);
+}
+
+// Finaliza uma cobrança pela UI: marca 'done', carimba completed_at, e (se o TL
+// escreveu uma nota de fechamento) anexa ao detail com data. Espelha o que o
+// ✅ no Telegram faz, mais a nota opcional. Retorna a linha atualizada (ou null).
+export async function completeNudge(id, note = '') {
+  const row = await db.get(`SELECT id, detail FROM tasks WHERE id = ? AND type = 'person'`, [id]);
+  if (!row) return null;
+  let detail = row.detail || '';
+  const clean = (note || '').trim();
+  if (clean) {
+    const stamp = new Date().toISOString().slice(0, 10);
+    detail = `${detail}\n\nFECHAMENTO (${stamp}): ${clean}`.trim();
+  }
+  await db.run(
+    `UPDATE tasks SET status = 'done', completed_at = datetime('now'), detail = ? WHERE id = ?`,
+    [detail, id],
+  );
+  return db.get(`SELECT id, summary, detail, people, execute_at, status,
+                        COALESCE(retry_count,0) AS nudge_count, completed_at
+                 FROM tasks WHERE id = ?`, [id]);
+}
+
 export async function getFiringSupernova() {
   return db.all(`
     SELECT * FROM tasks WHERE status = 'firing' AND notify_type = 'supernova'

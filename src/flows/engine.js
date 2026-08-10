@@ -236,7 +236,13 @@ async function executeLlmStep(_method, step, ctx) {
   }
 
   const providerName = step.provider || cfg.provider || 'claude';
-  const model = step.model || cfg.model || undefined;
+  // Only inherit cfg.model when the step uses the SAME provider as chat-config.
+  // Otherwise a flow that switches provider (e.g. provider: claude while config
+  // is codex/gpt-5) would pass gpt-5 to claude and the CLI exits 1. Cross-provider
+  // model bleed. The step's own model always wins; cfg.model only fills in for its
+  // own provider.
+  const sameProvider = (step.provider || cfg.provider) === cfg.provider;
+  const model = step.model || (sameProvider ? cfg.model : undefined) || undefined;
   const systemPrompt = step.system || cfg.system_prompt || null;
   const userPrompt = resolveTemplate(step.prompt || '', ctx);
 

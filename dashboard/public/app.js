@@ -85,6 +85,7 @@ document.querySelectorAll('.sidebar-item').forEach(tab => {
     if (tabName === 'proposals') loadProposals();
     if (tabName === 'skills') loadSkills();
     if (tabName === 'ingest') loadIngest();
+    if (tabName === 'nudges') loadNudges();
     if (tabName === 'team') loadTeam();
   });
 });
@@ -1547,6 +1548,49 @@ async function onIngestAction(e) {
 }
 
 document.getElementById('btn-reload-ingest')?.addEventListener('click', loadIngest);
+
+// ─── Cobranças (behavior nudges) ──────────────────────────────
+async function loadNudges() {
+  const list = document.getElementById('nudges-list');
+  if (!list) return;
+  list.innerHTML = '<div class="empty-state"><p>Carregando…</p></div>';
+  try {
+    const res = await fetch(`${API}/api/nudges`);
+    const rows = await res.json();
+    if (!Array.isArray(rows) || rows.length === 0) {
+      list.innerHTML = `
+        <div class="empty-state">
+          <h3>Nenhuma cobrança ainda</h3>
+          <p>Notas de pessoa com data de follow-up aparecem aqui. Use <code>/seal:note-person</code> com um follow-up para o SEAL começar a cobrar.</p>
+        </div>`;
+      return;
+    }
+    list.innerHTML = rows.map(renderNudgeCard).join('');
+  } catch (err) {
+    list.innerHTML = `<div class="empty-state"><p>Falha ao carregar cobranças: ${escapeHtml(err.message)}</p></div>`;
+  }
+}
+
+function renderNudgeCard(n) {
+  let person = '';
+  try { person = JSON.parse(n.people || '[]')[0] || ''; } catch {}
+  const statusLabel = { firing: '🔔 cobrando', pending: '⏳ aguardando prazo', done: '✅ feito' }[n.status] || n.status;
+  const count = n.nudge_count > 0 ? ` · cobrado ${n.nudge_count}×` : '';
+  const due = n.execute_at ? fmtRelative(n.execute_at) : '';
+  return `
+    <div class="nudge-card ${n.status}">
+      <div class="nudge-header">
+        ${person ? `<span class="nudge-person">${escapeHtml(person)}</span>` : ''}
+        <span class="nudge-status">${statusLabel}${count}</span>
+        <span class="nudge-due">${due}</span>
+      </div>
+      <div class="nudge-summary">${escapeHtml(n.summary || '')}</div>
+      ${n.detail ? `<details><summary>nota</summary><pre><code>${escapeHtml(n.detail)}</code></pre></details>` : ''}
+    </div>
+  `;
+}
+
+document.getElementById('btn-reload-nudges')?.addEventListener('click', loadNudges);
 
 document.getElementById('btn-ingest-poke')?.addEventListener('click', async () => {
   const source = document.getElementById('ingest-poke-source').value.trim() || 'manual';
