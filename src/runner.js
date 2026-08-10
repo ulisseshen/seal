@@ -64,6 +64,7 @@ import {
   db,
 } from './db.js';
 import { executeTask, getRunningSlots } from './executor.js';
+import { computeNextRun } from './recurrence.js';
 import { notify } from './notify.js';
 import { setBreakerNotifier } from './circuit-breaker.js';
 import { loadConfig, saveDefaultConfig } from './config.js';
@@ -484,6 +485,42 @@ async function pollTasks() {
     for (const reminder of reminders) {
       const level = reminder.notify_type || 'sound';
       notify(reminder, level);
+
+      // Rituals carry their prep template in `detail` — that template IS the
+      // reminder. A macOS notification truncates it, so push the full body to
+      // the task's channel (Telegram). Without this the ritual fires but the
+      // user only sees a title and still has to go dig up the checklist.
+      if (reminder.type === 'ritual' && reminder.notify_channel && reminder.notify_channel !== 'system') {
+        try {
+          const { notifyTaskLifecycle } = await import('./channel-notify.js');
+          await notifyTaskLifecycle(reminder, 'start', reminder.detail || '');
+        } catch (err) {
+          console.error(`[seal] Ritual channel notify failed for ${reminder.id}:`, err.message);
+        }
+      }
+
+      // Recurring reminders/rituals must be rescheduled here. Only executeTask()
+      // knew how to advance a recurrence, and prompt-less rituals never reach it
+      // — so a daily ritual would fire once, get marked 'done', and never return.
+      // advanceRecurring() also bumps run_count, which is what makes "fired N
+      // times vs acknowledged M times" measurable after the fact.
+      if (reminder.recurrence) {
+        try {
+          const { checkMaxRuns, advanceRecurring } = await import('./db.js');
+          if (await checkMaxRuns(reminder.id)) {
+            const { updateStatus } = await import('./db.js');
+            await updateStatus(reminder.id, 'done');
+            console.log(`[seal] Ritual ${reminder.id} reached max runs, marking done`);
+          } else {
+            const nextRun = computeNextRun(reminder.recurrence, new Date());
+            await advanceRecurring(reminder.id, nextRun);
+            console.log(`[seal] Ritual ${reminder.id} next run: ${nextRun}`);
+          }
+        } catch (err) {
+          console.error(`[seal] Failed to reschedule ${reminder.id}:`, err.message);
+        }
+        continue;
+      }
 
       if (level === 'supernova') {
         await setFiring(reminder.id);

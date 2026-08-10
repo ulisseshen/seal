@@ -547,9 +547,25 @@ export async function claimPendingTasks(limit = 5) {
   return rows || [];
 }
 
+// Reminders AND prompt-less rituals. A ritual is a recurring reminder that
+// carries a prep template — it has `prompt = NULL` by design, because it fires
+// a notification instead of executing an agent. That combination used to fall
+// through a gap: `claimPendingTasks` skips it (requires `prompt IS NOT NULL`)
+// and this query skipped it too (matched only `type = 'reminder'`), so every
+// ritual sat pending forever and silently never fired. Same class of bug the
+// nudge comment below describes for `type = 'person'`.
+//
+// Rituals WITH a prompt are deliberately excluded here — those are executable
+// and still belong to claimPendingTasks, which claims them atomically.
 export async function getPendingReminders() {
   return db.all(`
-    SELECT * FROM tasks WHERE status = 'pending' AND type = 'reminder' AND datetime(execute_at) <= datetime('now')
+    SELECT * FROM tasks
+    WHERE status = 'pending'
+      AND datetime(execute_at) <= datetime('now')
+      AND (
+        type = 'reminder'
+        OR (type = 'ritual' AND (prompt IS NULL OR prompt = ''))
+      )
   `);
 }
 
