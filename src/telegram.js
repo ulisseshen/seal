@@ -151,6 +151,36 @@ async function handleVoice(msg, chatId, config) {
 // que a revisão de 14 dias vai ler.
 const ROUTE_CONFIDENCE_FLOOR = 0.6;
 
+/** Escapa texto para o parse_mode HTML do Telegram. */
+function esc(s) {
+  return String(s ?? '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;');
+}
+
+/**
+ * Envia com formatação HTML, caindo para texto puro se o Telegram recusar o
+ * parse. Mesmo padrão que o gateway já usa — o telegram.js estava mandando
+ * texto cru, o que deixava toda resposta de áudio sem negrito, sem itálico e
+ * visualmente achatada.
+ *
+ * IMPORTANTE: quem chama deve escapar o conteúdo dinâmico com esc(). A fala
+ * transcrita pode conter "<" ou "&" e derrubaria o envio inteiro.
+ */
+async function sendHtml(chatId, html, extra = {}) {
+  try {
+    return await bot.sendMessage(chatId, html, { parse_mode: 'HTML', ...extra });
+  } catch (err) {
+    if (String(err.message).includes('parse')) {
+      const plain = html.replace(/<[^>]+>/g, '');
+      console.warn('[telegram] HTML parse failed, sending plain:', err.message);
+      return bot.sendMessage(chatId, plain, extra);
+    }
+    throw err;
+  }
+}
+
 // Resposta de ritual aguardando o usuário desambiguar ("1" ou "2").
 const pendingRoute = new Map();
 
@@ -178,13 +208,13 @@ async function tryHandleCorrection(text, chatId) {
   if (m[2] === 'tudo' || m[2] === 'todos') {
     for (const item of saved) await deleteTask(item.id);
     lastSaved.delete(chatId);
-    await bot.sendMessage(chatId, `SEAL: apaguei os ${saved.length}.`);
+    await sendHtml(chatId, `🗑️ <b>Apaguei os ${saved.length}.</b>`);
     return true;
   }
 
   const n = parseInt(m[2], 10);
   if (!n || n < 1 || n > saved.length) {
-    await bot.sendMessage(chatId, `SEAL: só tenho ${saved.length} item(ns). Manda um número de 1 a ${saved.length}.`);
+    await sendHtml(chatId, `<i>Só tenho ${saved.length} item(ns). Manda um número de 1 a ${saved.length}.</i>`);
     return true;
   }
 
@@ -192,7 +222,7 @@ async function tryHandleCorrection(text, chatId) {
   await deleteTask(alvo.id);
   saved.splice(n - 1, 1);
   lastSaved.set(chatId, saved);
-  await bot.sendMessage(chatId, `SEAL: apaguei "${alvo.resumo}".`);
+  await sendHtml(chatId, `🗑️ <b>Apaguei:</b> <i>"${esc(alvo.resumo)}"</i>`);
   return true;
 }
 
@@ -356,7 +386,7 @@ async function tryRouteToRitual(text, chatId) {
     // Teste de microfone não é conteúdo. Responde e NÃO grava nada.
     if (isMicTest(text)) {
       console.log(`[telegram] Mic test ignored: "${text.slice(0, 40)}"`);
-      await bot.sendMessage(chatId, `SEAL: te ouvi 👍 ("${text.trim()}")\n\nNão salvei nada — isso foi teste de áudio.`);
+      await sendHtml(chatId, `👍 <b>Te ouvi</b>\n<i>"${esc(text.trim())}"</i>\n\n<i>Não salvei nada — isso foi teste de áudio.</i>`);
       return true;
     }
 
@@ -376,7 +406,7 @@ async function tryRouteToRitual(text, chatId) {
     const { extractItems, renderItems } = await import('./brain/route-voice.js');
     // Mostra a transcrição já — assim o usuário confere as palavras enquanto a
     // IA quebra em itens, e vê na hora se o whisper errou um nome.
-    await bot.sendMessage(chatId, `📝 "${text.trim()}"\n\nseparando...`);
+    await sendHtml(chatId, `📝 <i>"${esc(text.trim())}"</i>\n\n<i>separando...</i>`);
     const { itens, degraded } = await extractItems(text);
     console.log(`[telegram] Extracted ${itens.length} item(s): ${itens.map(i => i.tipo).join(', ')}`);
 
@@ -389,10 +419,12 @@ async function tryRouteToRitual(text, chatId) {
     lastSaved.set(chatId, saved);
 
     const plural = saved.length === 1 ? 'coisa' : 'coisas';
-    await bot.sendMessage(chatId,
-      `SEAL: entendi ${saved.length} ${plural}:\n\n${renderItems(saved)}\n\n` +
-      (degraded ? '⚠️ IA fora do ar — salvei a fala inteira sem quebrar.\n\n' : '') +
-      `Errei algum? Manda "apaga N" (ex: "apaga 2") ou "apaga tudo".`);
+    await sendHtml(chatId,
+      `✅ <b>Entendi ${saved.length} ${plural}</b>\n` +
+      `<i>─────────────────</i>\n\n` +
+      `${renderItems(saved)}\n\n` +
+      (degraded ? `⚠️ <i>IA fora do ar — salvei a fala inteira sem quebrar.</i>\n\n` : '') +
+      `<i>Errei algum? Manda</i> <code>apaga 2</code> <i>ou</i> <code>apaga tudo</code>`);
     return true;
   } catch (err) {
     console.error('[telegram] Ritual routing failed:', err.message);
@@ -505,15 +537,32 @@ export function isTelegramConnected() {
  * Send a message to a Telegram chat from outside this module (used by executor lifecycle).
  * Returns true on success, false if not connected or send failed.
  */
-export async function sendTelegramMessage(chatId, text) {
+export async function sendTelegramMessage(chatId, text, { html = true } = {}) {
   if (!chatId) return false;
+
+  // Envia como HTML por padrão: os rituais chegam formatados por
+  // brain/format-ritual.js e sem parse_mode as tags apareceriam literais na
+  // tela — pior que o texto cru original. Se o parse falhar, tira as tags e
+  // reenvia como texto puro, para a mensagem nunca se perder por formatação.
+  const opts = html ? { parse_mode: 'HTML' } : {};
+  const plain = () => text.replace(/<[^>]+>/g, '');
 
   // If the ingestion bot is running, use it directly
   if (bot) {
     try {
-      await bot.sendMessage(chatId, text);
+      await bot.sendMessage(chatId, text, opts);
       return true;
     } catch (err) {
+      if (html && String(err.message).includes('parse')) {
+        try {
+          console.warn('[telegram] HTML parse failed, retrying plain:', err.message);
+          await bot.sendMessage(chatId, plain());
+          return true;
+        } catch (retryErr) {
+          console.error('[telegram] plain retry failed:', retryErr.message);
+          return false;
+        }
+      }
       console.error('[telegram] sendMessage via bot failed:', err.message);
       return false;
     }
@@ -531,10 +580,20 @@ export async function sendTelegramMessage(chatId, text) {
     const res = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: chatId, text }),
+      body: JSON.stringify({ chat_id: chatId, text, ...(html ? { parse_mode: 'HTML' } : {}) }),
     });
     const data = await res.json();
     if (!data.ok) {
+      // Mesmo fallback do caminho do bot: HTML inválido não pode engolir a
+      // mensagem inteira.
+      if (html && /parse/i.test(data.description || '')) {
+        const retry = await fetch(`https://api.telegram.org/bot${token}/sendMessage`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ chat_id: chatId, text: plain() }),
+        });
+        return (await retry.json()).ok === true;
+      }
       console.error('[telegram] sendMessage HTTP failed:', data.description);
       return false;
     }

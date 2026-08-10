@@ -493,7 +493,8 @@ async function pollTasks() {
       if (reminder.type === 'ritual' && reminder.notify_channel && reminder.notify_channel !== 'system') {
         try {
           const { notifyTaskLifecycle } = await import('./channel-notify.js');
-          await notifyTaskLifecycle(reminder, 'start', reminder.detail || '');
+          const { formatRitualMessage } = await import('./brain/format-ritual.js');
+          await notifyTaskLifecycle(reminder, 'start', formatRitualMessage(reminder));
         } catch (err) {
           console.error(`[seal] Ritual channel notify failed for ${reminder.id}:`, err.message);
         }

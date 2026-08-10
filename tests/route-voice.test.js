@@ -37,7 +37,7 @@ test('renderItems mostra o campo do TL Log e a pessoa citada', () => {
   ]);
 
   assert.match(out, /ajudei/, 'campo do tl-log deve aparecer');
-  assert.match(out, /\(Carla\)/, 'pessoa citada deve aparecer');
+  assert.match(out, /Carla/, 'pessoa citada deve aparecer');
 });
 
 test('renderItems lida com um item só sem quebrar', () => {

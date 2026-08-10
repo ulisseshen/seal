@@ -310,19 +310,39 @@ const TYPE_LABEL = {
   outro: 'NOTA',
 };
 
+function escHtml(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 /**
  * Monta a lista numerada que o usuário vê. É isso que torna o erro visível na
  * hora em vez de aparecer contaminado na revisão de 25/08.
+ *
+ * Formata em HTML do Telegram: o rótulo do tipo em negrito, o conteúdo em linha
+ * própria. Sem isso vira um bloco de texto corrido em que não dá para bater o
+ * olho e achar o item errado — que é justamente o ponto da confirmação.
+ *
+ * @param {boolean} html - false devolve texto puro (usado nos testes e no
+ *                         fallback quando o Telegram recusa o parse).
  */
-export function renderItems(itens) {
+export function renderItems(itens, { html = true } = {}) {
   const lines = [];
   itens.forEach((item, idx) => {
     const icon = TYPE_ICON[item.tipo] || '📄';
     const label = TYPE_LABEL[item.tipo] || 'NOTA';
-    const campo = item.tipo === 'tl-log' && item.campo ? ` — ${item.campo}` : '';
-    const quem = item.pessoa ? ` (${item.pessoa})` : '';
-    lines.push(`${idx + 1}. ${icon} ${label}${campo}${quem}`);
-    lines.push(`   ${item.resumo}`);
+    const campo = item.tipo === 'tl-log' && item.campo ? ` · ${item.campo}` : '';
+    const quem = item.pessoa ? ` · ${item.pessoa}` : '';
+
+    if (html) {
+      lines.push(`${idx + 1}. ${icon} <b>${escHtml(label)}</b><i>${escHtml(campo + quem)}</i>`);
+      lines.push(`     ${escHtml(item.resumo)}`);
+    } else {
+      lines.push(`${idx + 1}. ${icon} ${label}${campo}${quem}`);
+      lines.push(`     ${item.resumo}`);
+    }
+    // Linha em branco entre itens: numa lista de 5, o bloco colado é ilegível
+    // no celular, que é onde ele vai ler isso.
+    if (idx < itens.length - 1) lines.push('');
   });
   return lines.join('\n');
 }

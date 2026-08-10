@@ -54,7 +54,10 @@ export async function notifyTaskLifecycle(task, phase, message) {
       try {
         console.log(`[channel-notify] Sending to ${channel} (target=${target})`);
         if (channel === 'telegram') {
-          const ok = await sendTelegramMessage(target, `SEAL: ${formatted}`);
+          // Mensagem já formatada (ritual) chega com HTML e o próprio título —
+          // prefixar "SEAL:" quebraria o layout. Só prefixa texto simples.
+          const isFormatted = /^[⏰✅🔴📕📗📘📙📓🎙️📝]|^<b>/.test(formatted);
+          const ok = await sendTelegramMessage(target, isFormatted ? formatted : `SEAL: ${formatted}`);
           console.log(`[channel-notify] Telegram result: ${ok}`);
         } else if (channel === 'discord') {
           await sendDiscordMessage(target, `**SEAL:** ${formatted}`);
