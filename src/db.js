@@ -569,6 +569,30 @@ export async function getPendingReminders() {
   `);
 }
 
+/**
+ * Rituais que dispararam há pouco — usados como PISTA para rotear uma resposta
+ * solta (áudio no Telegram sem dizer a que ritual se refere).
+ *
+ * Deliberadamente uma pista, não uma resposta: o usuário pode responder o TL
+ * Log das 17:30 na manhã seguinte, ou mandar um áudio não relacionado logo
+ * depois do ritual. Quem decide é o conteúdo; isto só desempata.
+ *
+ * Depende de `last_notified_at`, que o loop de lembretes carimba ao disparar.
+ * Não dá para usar `next_run` no lugar: assim que o ritual dispara, o
+ * advanceRecurring já empurrou next_run para a PRÓXIMA ocorrência (futuro), o
+ * que não diz nada sobre quando ele de fato tocou.
+ */
+export async function getRecentlyFiredRituals({ windowHours = 20 } = {}) {
+  return db.all(`
+    SELECT id, summary, detail, next_run, last_notified_at, run_count
+    FROM tasks
+    WHERE type = 'ritual'
+      AND last_notified_at IS NOT NULL
+      AND datetime(last_notified_at) >= datetime('now', ?)
+    ORDER BY datetime(last_notified_at) DESC
+  `, [`-${windowHours} hours`]);
+}
+
 // Behavior nudges — type=person notes with a due follow-up. These are the
 // management promises SEAL cobra (e sugere). They were previously NEVER
 // dispatched (getPendingReminders only matches type='reminder'), so a person

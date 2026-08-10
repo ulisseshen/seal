@@ -122,10 +122,141 @@ async function handleVoice(msg, chatId, config) {
     const text = transcribeBuffer(buffer, `tg_${Date.now()}.${ext}`, config);
 
     console.log(`[telegram] Transcribed: "${text.slice(0, 60)}..."`);
+
+    // Antes de virar tarefa solta, tenta rotear para um ritual. O usuário
+    // responde os rituais "na sequência" — manda o áudio sem dizer a que se
+    // refere. Se não for resposta de ritual, cai no fluxo normal de tarefa.
+    const routed = await tryRouteToRitual(text, chatId);
+    if (routed) return;
+
     await handleText(text, chatId, config);
   } catch (err) {
     console.error('[telegram] Voice transcription failed:', err.message);
     await bot.sendMessage(chatId, 'SEAL: Voice transcription failed.');
+  }
+}
+
+// Confiança mínima para gravar sem perguntar. Abaixo disso o SEAL pergunta em
+// vez de adivinhar: classificar errado em silêncio corrompe justamente o dado
+// que a revisão de 14 dias vai ler.
+const ROUTE_CONFIDENCE_FLOOR = 0.6;
+
+// Resposta de ritual aguardando o usuário desambiguar ("1" ou "2").
+const pendingRoute = new Map();
+
+const RITUAL_LABEL = { 'tl-log': 'TL Log', radar: 'Radar de incidentes' };
+
+/**
+ * Grava a resposta de um ritual: estrutura via IA e insere como type='person'
+ * (nota), vinculada ao ritual pelo project. Devolve o texto renderizado para a
+ * confirmação.
+ */
+async function saveRitualResponse(kind, text, chatId) {
+  const { structureResponse, renderStructured } = await import('./brain/route-voice.js');
+  const { structured, degraded } = await structureResponse(text, kind);
+  const rendered = renderStructured(kind, structured, text);
+
+  const label = RITUAL_LABEL[kind] || kind;
+  const today = new Date().toISOString().slice(0, 10);
+
+  await insertTask({
+    id: crypto.randomUUID().slice(0, 8),
+    type: 'person',
+    summary: `${label} — ${today}`,
+    // Guarda o texto cru junto: a transcrição pode ter errado um nome, e o
+    // original é a única forma de recuperar o que foi dito de fato.
+    detail: `${rendered}\n\n---\ntranscrição original:\n${text.trim()}`,
+    execute_at: null,
+    recurrence: null,
+    next_run: null,
+    prompt: null,
+    project: 'techlead-90d',
+    allowed_tools: '[]',
+    permission_mode: 'auto',
+    notify_type: 'silent',
+    notify_channel: 'telegram',
+    notify_target: String(chatId),
+    people: '[]',
+    priority: 'medium',
+    status: 'done',
+    created: new Date().toISOString(),
+    max_runs: null,
+  });
+
+  return { rendered, degraded };
+}
+
+/**
+ * Tenta interpretar a mensagem como resposta a um ritual.
+ * Retorna true se tratou (o chamador não deve seguir para handleText).
+ */
+async function tryRouteToRitual(text, chatId) {
+  // O usuário está respondendo "1" ou "2" a uma pergunta de desambiguação?
+  const waiting = pendingRoute.get(chatId);
+  if (waiting) {
+    const answer = text.trim().toLowerCase();
+    const pick =
+      /^1\b|tl.?log/.test(answer) ? 'tl-log' :
+      /^2\b|radar|incidente/.test(answer) ? 'radar' :
+      /^3\b|nenhum|outro/.test(answer) ? 'none' : null;
+
+    if (pick) {
+      pendingRoute.delete(chatId);
+      if (pick === 'none') {
+        await handleText(waiting.text, chatId, waiting.config);
+        return true;
+      }
+      const { rendered, degraded } = await saveRitualResponse(pick, waiting.text, chatId);
+      await bot.sendMessage(chatId,
+        `SEAL: ${RITUAL_LABEL[pick]} salvo.\n\n${rendered}` +
+        (degraded ? '\n\n(IA fora do ar — salvei o texto cru, sem estruturar.)' : ''));
+      return true;
+    }
+    // Não era resposta à pergunta — segue o fluxo normal com a msg nova.
+    pendingRoute.delete(chatId);
+  }
+
+  try {
+    const { classifyMessage } = await import('./brain/route-voice.js');
+    const { getRecentlyFiredRituals } = await import('./db.js');
+
+    const fired = await getRecentlyFiredRituals({ windowHours: 20 });
+    const hint = fired[0]
+      ? {
+          summary: fired[0].summary,
+          hoursAgo: Math.round(
+            (Date.now() - new Date(fired[0].last_notified_at + 'Z').getTime()) / 3_600_000
+          ),
+        }
+      : null;
+
+    const result = await classifyMessage(text, { pendingRitual: hint });
+    console.log(`[telegram] Route: kind=${result.kind} conf=${result.confidence} src=${result.source}`);
+
+    if (result.kind === 'unknown' || result.confidence < ROUTE_CONFIDENCE_FLOOR) {
+      // Só pergunta se havia mesmo um ritual esperando. Sem isso, qualquer
+      // tarefa solta ("lembra de pagar o boleto") viraria uma pergunta chata.
+      if (!fired.length) return false;
+
+      pendingRoute.set(chatId, { text, config: null });
+      await bot.sendMessage(chatId,
+        `SEAL: não tenho certeza do que é isso. Responde com o número:\n\n` +
+        `1 — TL Log\n2 — Radar de incidentes\n3 — Nenhum dos dois (vira tarefa)\n\n` +
+        `"${text.slice(0, 100)}${text.length > 100 ? '…' : ''}"`);
+      return true;
+    }
+
+    const { rendered, degraded } = await saveRitualResponse(result.kind, text, chatId);
+    // Sempre mostra o que entendeu. Se classificou errado, o usuário vê agora —
+    // não em 25/08 com o dado já contaminado.
+    await bot.sendMessage(chatId,
+      `SEAL: ${RITUAL_LABEL[result.kind]} salvo.\n\n${rendered}\n\n` +
+      (degraded ? '(IA fora do ar — texto cru, sem estruturar.)\n' : '') +
+      `Se eu errei o ritual, manda "corrigir".`);
+    return true;
+  } catch (err) {
+    console.error('[telegram] Ritual routing failed:', err.message);
+    return false; // degrada para o fluxo normal de tarefa
   }
 }
 

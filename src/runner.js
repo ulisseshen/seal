@@ -504,6 +504,19 @@ async function pollTasks() {
       // — so a daily ritual would fire once, get marked 'done', and never return.
       // advanceRecurring() also bumps run_count, which is what makes "fired N
       // times vs acknowledged M times" measurable after the fact.
+      // Carimba QUANDO disparou. advanceRecurring vai empurrar next_run para a
+      // próxima ocorrência (futuro), então sem isto não sobra registro do
+      // disparo — e o roteador de voz não teria como saber que ritual está
+      // esperando resposta.
+      if (reminder.type === 'ritual') {
+        try {
+          const { updateLastNotified } = await import('./db.js');
+          await updateLastNotified(reminder.id);
+        } catch (err) {
+          console.error(`[seal] Failed to stamp last_notified_at for ${reminder.id}:`, err.message);
+        }
+      }
+
       if (reminder.recurrence) {
         try {
           const { checkMaxRuns, advanceRecurring } = await import('./db.js');
