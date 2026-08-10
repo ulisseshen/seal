@@ -115,9 +115,13 @@ async function handleVoice(msg, chatId, config) {
   if (!fileId) return;
 
   try {
-    // Transcrição (~10s) + extração (~8-18s) somam meio minuto de silêncio. Sem
-    // sinal de vida o usuário reenvia o áudio achando que caiu.
-    await bot.sendMessage(chatId, '🎙️ SEAL: ouvindo...');
+    // UMA mensagem de status, que depois vira o resultado por edição. Antes
+    // eram três ("ouvindo" → transcrição → "entendi N"), o que fazia o SEAL
+    // narrar o próprio processo interno em vez de só trabalhar e reportar.
+    // O usuário quer confirmação de recebimento + resultado, não pensamento
+    // em voz alta.
+    const status = await bot.sendMessage(chatId, '🎧 já ouvi, processando...');
+    statusMsg.set(chatId, status.message_id);
 
     const fileLink = await bot.getFileLink(fileId);
     const response = await fetch(fileLink);
@@ -142,7 +146,7 @@ async function handleVoice(msg, chatId, config) {
     await handleText(text, chatId, config, { askProject: false });
   } catch (err) {
     console.error('[telegram] Voice transcription failed:', err.message);
-    await bot.sendMessage(chatId, 'SEAL: Voice transcription failed.');
+    await finishStatus(chatId, `🔴 <b>não consegui transcrever</b>\n<i>${esc(err.message)}</i>`);
   }
 }
 
@@ -150,6 +154,43 @@ async function handleVoice(msg, chatId, config) {
 // vez de adivinhar: classificar errado em silêncio corrompe justamente o dado
 // que a revisão de 14 dias vai ler.
 const ROUTE_CONFIDENCE_FLOOR = 0.6;
+
+// Id da mensagem de status por chat. O resultado EDITA essa mensagem em vez de
+// mandar outra — assim o chat fica com uma linha por áudio, não com três.
+const statusMsg = new Map();
+
+/**
+ * Escreve o resultado no lugar da mensagem de status. Se a edição falhar
+ * (mensagem velha demais, apagada), manda nova — nunca perde o resultado.
+ */
+async function finishStatus(chatId, html) {
+  const messageId = statusMsg.get(chatId);
+  statusMsg.delete(chatId);
+
+  if (messageId) {
+    try {
+      await bot.editMessageText(html, { chat_id: chatId, message_id: messageId, parse_mode: 'HTML' });
+      return;
+    } catch (err) {
+      if (!String(err.message).includes('not modified')) {
+        console.warn('[telegram] edit failed, sending new:', err.message);
+      } else {
+        return;
+      }
+    }
+  }
+  await sendHtml(chatId, html);
+}
+
+/**
+ * Responde consumindo a mensagem de status se houver uma pendente (o comando
+ * veio por voz), senão manda nova (veio por texto). Sem isso a correção falada
+ * deixaria "processando..." pendurado para sempre.
+ */
+async function reply(chatId, html) {
+  if (statusMsg.has(chatId)) return finishStatus(chatId, html);
+  return sendHtml(chatId, html);
+}
 
 /** Escapa texto para o parse_mode HTML do Telegram. */
 function esc(s) {
@@ -199,7 +240,7 @@ async function tryHandleCorrection(text, chatId) {
 
   const saved = lastSaved.get(chatId);
   if (!saved || !saved.length) {
-    await bot.sendMessage(chatId, 'SEAL: não tenho nada recente para apagar.');
+    await reply(chatId, '<i>nada recente para apagar</i>');
     return true;
   }
 
@@ -208,13 +249,13 @@ async function tryHandleCorrection(text, chatId) {
   if (m[2] === 'tudo' || m[2] === 'todos') {
     for (const item of saved) await deleteTask(item.id);
     lastSaved.delete(chatId);
-    await sendHtml(chatId, `🗑️ <b>Apaguei os ${saved.length}.</b>`);
+    await reply(chatId, `🗑️ <b>${saved.length} apagado${saved.length === 1 ? '' : 's'}</b>`);
     return true;
   }
 
   const n = parseInt(m[2], 10);
   if (!n || n < 1 || n > saved.length) {
-    await sendHtml(chatId, `<i>Só tenho ${saved.length} item(ns). Manda um número de 1 a ${saved.length}.</i>`);
+    await reply(chatId, `<i>só tenho ${saved.length} item(ns) — manda 1 a ${saved.length}</i>`);
     return true;
   }
 
@@ -222,7 +263,7 @@ async function tryHandleCorrection(text, chatId) {
   await deleteTask(alvo.id);
   saved.splice(n - 1, 1);
   lastSaved.set(chatId, saved);
-  await sendHtml(chatId, `🗑️ <b>Apaguei:</b> <i>"${esc(alvo.resumo)}"</i>`);
+  await reply(chatId, `🗑️ <b>apagado:</b> <i>${esc(alvo.resumo)}</i>`);
   return true;
 }
 
@@ -386,7 +427,7 @@ async function tryRouteToRitual(text, chatId) {
     // Teste de microfone não é conteúdo. Responde e NÃO grava nada.
     if (isMicTest(text)) {
       console.log(`[telegram] Mic test ignored: "${text.slice(0, 40)}"`);
-      await sendHtml(chatId, `👍 <b>Te ouvi</b>\n<i>"${esc(text.trim())}"</i>\n\n<i>Não salvei nada — isso foi teste de áudio.</i>`);
+      await finishStatus(chatId, `👍 <b>te ouvi</b> — <i>nada registrado (teste de áudio)</i>`);
       return true;
     }
 
@@ -404,27 +445,28 @@ async function tryRouteToRitual(text, chatId) {
     // mistura incidente + aprendizado + tarefa, e escolher UM rótulo jogaria o
     // resto fora. `hint` continua sendo só contexto para a IA, nunca decisão.
     const { extractItems, renderItems } = await import('./brain/route-voice.js');
-    // Mostra a transcrição já — assim o usuário confere as palavras enquanto a
-    // IA quebra em itens, e vê na hora se o whisper errou um nome.
-    await sendHtml(chatId, `📝 <i>"${esc(text.trim())}"</i>\n\n<i>separando...</i>`);
     const { itens, degraded } = await extractItems(text);
     console.log(`[telegram] Extracted ${itens.length} item(s): ${itens.map(i => i.tipo).join(', ')}`);
 
     // Nada com conteúdo real e nenhum ritual esperando → não é assunto do SEAL.
     // Deixa cair no fluxo normal de tarefa em vez de forçar uma categoria.
     const todosVazios = itens.every((i) => i.tipo === 'outro' && i.confianca < 0.4);
-    if (todosVazios && !fired.length) return false;
+    if (todosVazios && !fired.length) {
+      // Cai no fluxo de tarefa; a mensagem de status é consumida lá.
+      return false;
+    }
 
     const saved = await saveItems(itens, text, chatId);
     lastSaved.set(chatId, saved);
 
-    const plural = saved.length === 1 ? 'coisa' : 'coisas';
-    await sendHtml(chatId,
-      `✅ <b>Entendi ${saved.length} ${plural}</b>\n` +
-      `<i>─────────────────</i>\n\n` +
+    // Log do que foi registrado. Sem narrar o processo — o que importa é o que
+    // ficou gravado, não como o SEAL chegou lá.
+    const plural = saved.length === 1 ? 'item' : 'itens';
+    await finishStatus(chatId,
+      `✅ <b>${saved.length} ${plural} registrado${saved.length === 1 ? '' : 's'}</b>\n\n` +
       `${renderItems(saved)}\n\n` +
-      (degraded ? `⚠️ <i>IA fora do ar — salvei a fala inteira sem quebrar.</i>\n\n` : '') +
-      `<i>Errei algum? Manda</i> <code>apaga 2</code> <i>ou</i> <code>apaga tudo</code>`);
+      (degraded ? `⚠️ <i>IA fora do ar — gravei a fala inteira sem separar.</i>\n\n` : '') +
+      `<i>errou? </i><code>apaga 2</code><i> · </i><code>apaga tudo</code>`);
     return true;
   } catch (err) {
     console.error('[telegram] Ritual routing failed:', err.message);
@@ -508,7 +550,9 @@ async function handleText(text, chatId, config, { askProject = true } = {}) {
   // Multiple projects — normally ask, but never for voice (see handleVoice).
   if (!askProject) {
     await insertTask(task);
-    await bot.sendMessage(chatId, `SEAL: ${summary}`);
+    // Veio de áudio: fecha a mensagem de status em vez de deixar "processando"
+    // pendurado e mandar outra embaixo.
+    await finishStatus(chatId, `✅ <b>1 item registrado</b>\n\n📘 <b>TAREFA</b>\n     ${esc(summary)}`);
     console.log(`[telegram] "${summary}" saved without project, no prompt (${task.id})`);
     return;
   }
