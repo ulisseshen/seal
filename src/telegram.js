@@ -55,9 +55,37 @@ export function startTelegram(config) {
 
   // Always attach an error handler — without one, polling errors become
   // unhandled `error` events and crash the Node process.
-  bot.on('polling_error', (err) => {
-    console.warn('[telegram] polling_error:', err?.code || err?.message || err);
+  // EFATAL é só o código genérico do node-telegram-bot-api; a causa real vive
+  // em err.message / err.cause. Logar só o code produziu 15.976 linhas de
+  // "EFATAL" sem nenhuma pista, enquanto o bot ficava mudo e as mensagens do
+  // usuário se acumulavam sem ninguém buscar.
+  // Polling morto que não se recupera: em 11/08 o bot acumulou 15.976 erros
+  // EFATAL enquanto ficava mudo, e um áudio de 53s ficou parado no servidor do
+  // Telegram sem ninguém buscar. O usuário só descobriu porque reclamou.
+  // Conta erros consecutivos e força um restart do polling — o Telegram
+  // reentrega o que estiver pendente, então nada se perde.
+  let pollFails = 0;
+  bot.on('polling_error', async (err) => {
+    const detail = err?.response?.body?.description || err?.cause?.message || err?.message || String(err);
+    pollFails++;
+    // Loga o 1º, o 10º, depois a cada 50 — sem inundar o log com 16k linhas
+    // iguais que escondem qualquer outra pista.
+    if (pollFails === 1 || pollFails === 10 || pollFails % 50 === 0) {
+      console.warn(`[telegram] polling_error #${pollFails}: ${err?.code || 'ERR'} — ${detail}`);
+    }
+    if (pollFails === 10) {
+      console.error('[telegram] polling travado — reiniciando');
+      try {
+        await bot.stopPolling();
+        await bot.startPolling();
+        pollFails = 0;
+        console.log('[telegram] polling reiniciado');
+      } catch (e) {
+        console.error('[telegram] restart do polling falhou:', e.message);
+      }
+    }
   });
+  bot.on('message', () => { pollFails = 0; });
   bot.on('error', (err) => {
     console.warn('[telegram] error:', err?.code || err?.message || err);
   });
@@ -456,8 +484,24 @@ async function tryRouteToRitual(text, chatId) {
       return false;
     }
 
-    const saved = await saveItems(itens, text, chatId);
+    // Grava ANTES de qualquer coisa que possa falhar (render, edição de
+    // mensagem, rede). Em 11/08 um áudio foi extraído em 6 itens e nenhum
+    // chegou ao banco: o processo morreu entre extrair e salvar, e a fala do
+    // usuário — um TL Log inteiro — evaporou sem deixar rastro nem aviso.
+    let saved;
+    try {
+      saved = await saveItems(itens, text, chatId);
+    } catch (err) {
+      console.error('[telegram] SAVE FAILED:', err.message);
+      // Devolve a transcrição para o usuário poder recuperar manualmente. Perder
+      // a fala em silêncio é o pior resultado possível.
+      await finishStatus(chatId,
+        `🔴 <b>não consegui gravar</b>\n<i>${esc(err.message)}</i>\n\n` +
+        `<b>tua fala, para não perder:</b>\n<code>${esc(text.trim())}</code>`);
+      return true;
+    }
     lastSaved.set(chatId, saved);
+    console.log(`[telegram] Saved ${saved.length} item(s): ${saved.map(s => s.id).join(', ')}`);
 
     // Log do que foi registrado. Sem narrar o processo — o que importa é o que
     // ficou gravado, não como o SEAL chegou lá.

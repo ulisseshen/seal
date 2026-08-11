@@ -62,7 +62,8 @@ export class TelegramGateway extends BaseGatewayPlugin {
       this._setupIncomingMessages();
       // Attach error handlers — without these, polling errors crash the Node process.
       this.bot.on('polling_error', (err) => {
-        console.warn('[seal:gateway:telegram] polling_error:', err?.code || err?.message || err);
+        const detail = err?.response?.body?.description || err?.cause?.message || err?.message || String(err);
+        console.warn(`[seal:gateway:telegram] polling_error: ${err?.code || 'ERR'} — ${detail}`);
       });
       this.bot.on('error', (err) => {
         console.warn('[seal:gateway:telegram] error:', err?.code || err?.message || err);
