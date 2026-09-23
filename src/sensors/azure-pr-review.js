@@ -447,7 +447,7 @@ async function prepareAndQueue({ repo, repos, pr, gate, sensorCfg }) {
   const workItems = await getWorkItemsWithStories(workItemIds);
   const { wtPath, mergeBase, targetBranch } = await createWorktree(repo, pr, gate.headSha);
   const pair = await findPairContext(repo, repos, pr, workItemIds);
-  const targetGate = checkTargetBranch({
+  const targetGate = repo.targetGate === false ? null : checkTargetBranch({
     source: branchOf(pr.sourceRefName),
     target: targetBranch,
     nextRelease: nextReleaseFrom(await mainVersion(repo.projectDir)),
@@ -461,6 +461,7 @@ async function prepareAndQueue({ repo, repos, pr, gate, sensorCfg }) {
     repo: repo.name,
     stack: repo.stack,
     repoSkill: repo.skill,
+    repoSkillPath: repo.skillPath && fs.existsSync(repo.skillPath) ? repo.skillPath : null,
     prId,
     prUrl: prWebUrl(repo.name, prId),
     title: pr.title,

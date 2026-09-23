@@ -115,8 +115,10 @@ Sem par: registre `pair:none` e siga. Não invente contrato do outro lado.
 
 ### 3. Skill de review do repo
 
-Invoque a skill `repoSkill` do contexto (`vue-review`, `smart-review` ou `yh-smart-review`) sobre o diff
-`mergeBase..headSha`, com estas regras sobrepostas às dela:
+Invoque a skill `repoSkill` do contexto (`vue-review`, `smart-review`, `yh-smart-review`…) sobre o diff
+`mergeBase..headSha`. Se `repoSkillPath` vier preenchido, **leia esse arquivo e siga-o** em vez de chamar a
+skill pelo nome (caminhos relativos citados nele partem da pasta do arquivo). Para o `code-review`, o ponto
+fixo é `mergeBase` e os padrões do repo são o `CLAUDE.md` e o `CONTEXT.md`. Regras sobrepostas às da skill:
 
 - **Modo só-relatório**: pule toda fase de postar, votar, commitar report, aplicar fix ou migrar código.
   Onde ela pediria confirmação, siga sem postar.
