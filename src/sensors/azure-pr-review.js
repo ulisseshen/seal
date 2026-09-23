@@ -151,6 +151,27 @@ async function writeToAzure(label, action) {
 
 let threadsCache = new Map();
 let lastBacklog = 0;
+const enqueueFailures = new Map();
+const ENQUEUE_BACKOFF_BASE_MS = 5 * 60 * 1000;
+const ENQUEUE_BACKOFF_MAX_MS = 6 * 60 * 60 * 1000;
+let stuckTickAlertedAt = 0;
+
+export async function reportStuckTick(timeoutMs) {
+  if (Date.now() - stuckTickAlertedAt < 60 * 60 * 1000) return;
+  stuckTickAlertedAt = Date.now();
+  await sendTelegram(`⚠️ Um tick da revisão automática passou de ${Math.round(timeoutMs / 60000)} min e foi abandonado. O próximo tick segue normalmente; se repetir, algo externo (Azure, git, disco) está travando.`);
+}
+
+function backoffActive(key, now) {
+  const failure = enqueueFailures.get(key);
+  return Boolean(failure && failure.until > now);
+}
+
+function recordEnqueueFailure(key, now, message) {
+  const count = (enqueueFailures.get(key)?.count || 0) + 1;
+  const wait = Math.min(ENQUEUE_BACKOFF_BASE_MS * 2 ** (count - 1), ENQUEUE_BACKOFF_MAX_MS);
+  enqueueFailures.set(key, { count, until: now + wait, message });
+}
 let prByIdCache = new Map();
 
 async function getThreads(repo, prId) {
@@ -634,7 +655,7 @@ function reviewTelegramText(entry, data, meta) {
 
 async function publishCompletedReviews(repos, state, { taskId = null } = {}) {
   const tasks = await db.all(
-    `SELECT id, summary, detail, result FROM tasks
+    `SELECT id, summary, detail, result, retry_count FROM tasks
      WHERE summary LIKE ? AND detail LIKE ? AND status = 'done' AND result IS NOT NULL
        AND result NOT LIKE ? AND result NOT LIKE ? AND (? IS NULL OR id = ?)`,
     [`${SUMMARY_PREFIX}%`, `%${PIPELINE_TAG}%`, `%${PUBLISHED_MARKER}%`, `%${PUBLISH_FAILED_MARKER}%`, taskId, taskId],
@@ -657,6 +678,12 @@ async function publishCompletedReviews(repos, state, { taskId = null } = {}) {
     const pr = await getPrById(prId);
     const parsed = parseReviewResult(task.result);
 
+    if (!parsed.ok && (task.retry_count || 0) < 1) {
+      console.warn(`[pr-review] !${prId}: unusable result (${parsed.error}), retrying the review once`);
+      await db.run(`UPDATE tasks SET status = 'pending', result = NULL, retry_count = COALESCE(retry_count, 0) + 1 WHERE id = ?`, [task.id]);
+      await db.run(`UPDATE pr_reviews SET status = 'queued', publish_started_at = NULL WHERE repo = ? AND pr_id = ? AND head_sha = ? AND status = 'publishing'`, [claim.repo, claim.prId, claim.headSha]);
+      continue;
+    }
     if (!parsed.ok) {
       console.warn(`[pr-review] !${prId}: unusable result (${parsed.error})`);
       await writeToAzure(`mark lock failed on !${prId}`, () =>
@@ -860,8 +887,8 @@ const REASON_LABEL = {
 
 const HEALTH_ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
-async function alertHealth(state, now) {
-  const issues = await healthIssues();
+async function alertHealth(state, now, extraIssues = []) {
+  const issues = [...(await healthIssues()), ...extraIssues];
   const notified = state.health?.notified || {};
   const fresh = issues.filter((issue) => !notified[issue.key] || now - new Date(notified[issue.key]).getTime() >= HEALTH_ALERT_COOLDOWN_MS);
   state.health = {
@@ -941,6 +968,7 @@ export async function runAzurePrReview(sensorCfg = {}) {
   let slots = Math.max(0, maxParallel - running.length);
   const stats = { repos: repos.length, prs: 0, created: 0, skipped: {} };
   const digest = [];
+  const listErrors = [];
   const sentMarks = readSentMarks();
   const seenActive = new Set();
   const candidates = [];
@@ -951,6 +979,7 @@ export async function runAzurePrReview(sensorCfg = {}) {
       prs = (await azRequest('GET', repoUrl(repo, '/pullRequests?searchCriteria.status=active&$top=100'))).value || [];
     } catch (err) {
       console.warn(`[pr-review] list failed for ${repo.name}: ${err.message}`);
+      listErrors.push({ repo: repo.name, message: err.message });
       continue;
     }
     const unique = [...new Map(prs.map((pr) => [pr.pullRequestId, pr])).values()];
@@ -1009,17 +1038,24 @@ export async function runAzurePrReview(sensorCfg = {}) {
 
   candidates.sort((left, right) => new Date(left.pr.creationDate).getTime() - new Date(right.pr.creationDate).getTime());
   for (const { repo, pr, gate } of candidates) {
+    const failureKey = `${repo.name}:${pr.pullRequestId}:${gate.headSha}`;
+    if (backoffActive(failureKey, now)) {
+      stats.skipped.backoff = (stats.skipped.backoff || 0) + 1;
+      continue;
+    }
     if (slots <= 0) {
       stats.skipped['no-slot'] = (stats.skipped['no-slot'] || 0) + 1;
       continue;
     }
     try {
       if (await enqueueReview({ repo, repos, pr, gate, sensorCfg })) {
+        enqueueFailures.delete(failureKey);
         slots--;
         stats.created++;
         console.log(`[pr-review] Queued ${repo.name} !${pr.pullRequestId} (${gate.action}, created ${pr.creationDate})`);
       }
     } catch (err) {
+      recordEnqueueFailure(failureKey, now, err.message);
       console.warn(`[pr-review] enqueue failed for ${repo.name} !${pr.pullRequestId}: ${err.message}`);
     }
   }
@@ -1032,8 +1068,25 @@ export async function runAzurePrReview(sensorCfg = {}) {
     }
   }
 
+  const extraIssues = [];
+  if (repos.length > 0 && listErrors.length === repos.length) {
+    const auth = listErrors.some((failure) => /Azure API (401|403)/.test(failure.message));
+    extraIssues.push({
+      key: auth ? 'azure-auth' : 'azure-unavailable',
+      text: auth
+        ? 'o Azure recusou o PAT em todos os repos (401/403): o token venceu ou perdeu permissão'
+        : `não consegui listar as PRs de nenhum repo: ${listErrors[0].message.slice(0, 120)}`,
+    });
+  }
+  const loginExpired = await db.get(`SELECT COUNT(*) AS total FROM tasks WHERE id LIKE 'seal_pr_%' AND status = 'failed' AND result LIKE '%login expired%'`).catch(() => null);
+  if (loginExpired?.total > 0) {
+    extraIssues.push({ key: 'claude-login', text: `o login do Claude expirou e ${loginExpired.total} review(s) estão parados até você rodar claude /login` });
+  }
+  for (const [key, failure] of enqueueFailures) {
+    if (failure.count >= 3) extraIssues.push({ key: `enqueue:${key}`, text: `falhei ${failure.count} vezes seguidas ao preparar ${key.split(':').slice(0, 2).join(' !')}: ${failure.message.slice(0, 120)}` });
+  }
   await sendDigest(digest);
-  await alertHealth(state, now).catch((err) => console.warn(`[pr-review] health: ${err.message}`));
+  await alertHealth(state, now, extraIssues).catch((err) => console.warn(`[pr-review] health: ${err.message}`));
   writeReviewState(state, now);
   await retryFailedReviews(repos).catch((err) => console.warn(`[pr-review] retry: ${err.message}`));
 

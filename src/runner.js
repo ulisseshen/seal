@@ -77,7 +77,7 @@ import { startWeb } from './web.js';
 import { ensureDefaultProfiles } from './sandbox.js';
 import { loadPolicy, policyRuleCount } from './policy.js';
 import { runPrWatcher } from './sensors/pr-watcher.js';
-import { runAzurePrReview, shouldTickNow } from './sensors/azure-pr-review.js';
+import { reportStuckTick, runAzurePrReview, shouldTickNow } from './sensors/azure-pr-review.js';
 import { ensurePalace } from './memory.js';
 import { isRtkAvailable, getStats as getRtkStats } from './rtk.js';
 import { loadFlows } from './flows/engine.js';
@@ -605,16 +605,23 @@ function startSensors() {
   const AZURE_PR_WATCH_MS = (cfg.sensors?.azure_pr_review_watch_sec || 20) * 1000;
   if (cfg.sensors?.azure_pr_review === true) {
     console.log(`[seal] azure-pr-review sensor enabled (every ${AZURE_PR_INTERVAL / 60_000} min, watch ${AZURE_PR_WATCH_MS / 1000}s)`);
+    const AZURE_PR_TICK_TIMEOUT_MS = (cfg.sensors?.azure_pr_review_tick_timeout_min || 10) * 60 * 1000;
     let ticking = false;
     const tickAzurePr = async (reason = 'interval') => {
       if (ticking) return;
       ticking = true;
+      let timer;
+      const timeout = new Promise((_, reject) => {
+        timer = setTimeout(() => reject(new Error('tick-timeout')), AZURE_PR_TICK_TIMEOUT_MS);
+      });
       try {
         if (reason !== 'interval') console.log(`[seal] azure-pr-review early tick: ${reason}`);
-        await runAzurePrReview(cfg.sensors || {});
+        await Promise.race([runAzurePrReview(cfg.sensors || {}), timeout]);
       } catch (err) {
         console.error('[seal] azure-pr-review error:', err.message);
+        if (err.message === 'tick-timeout') await reportStuckTick(AZURE_PR_TICK_TIMEOUT_MS).catch(() => {});
       } finally {
+        clearTimeout(timer);
         ticking = false;
       }
     };
@@ -643,6 +650,18 @@ function stopSensors() {
 }
 
 startSensors();
+
+const RUNNER_HEARTBEAT = path.join(os.homedir(), '.config', 'seal', 'run', 'runner.heartbeat');
+const writeHeartbeat = () => {
+  try {
+    fs.mkdirSync(path.dirname(RUNNER_HEARTBEAT), { recursive: true });
+    fs.writeFileSync(RUNNER_HEARTBEAT, String(Date.now()));
+  } catch (err) {
+    console.warn('[seal] heartbeat write failed:', err.message);
+  }
+};
+writeHeartbeat();
+setInterval(writeHeartbeat, 60_000);
 
 subsystemManager.register('sensors', {
   start: async () => startSensors(),
