@@ -1,4 +1,5 @@
 import { spawn } from 'child_process';
+import { randomUUID } from 'crypto';
 import { existsSync } from 'fs';
 import { join } from 'path';
 import {
@@ -8,6 +9,7 @@ import {
   insertTaskRun,
   finishTaskRun,
   setFiring,
+  db,
 } from './db.js';
 import { notifyTaskLifecycle } from './channel-notify.js';
 import { notify } from './notify.js';
@@ -196,6 +198,16 @@ export async function executeTask(task) {
 
   if (task.model) {
     claudeArgs.push('--model', task.model);
+  }
+
+  if (task.session_id) {
+    const sessionId = randomUUID();
+    claudeArgs.push('--session-id', sessionId);
+    try {
+      await db.run(`UPDATE tasks SET session_id = ? WHERE id = ?`, [sessionId, task.id]);
+    } catch (err) {
+      console.warn(`[executor] could not record session for ${task.id}:`, err.message);
+    }
   }
 
   // ─── Sandbox wrap ───────────────────────────────────

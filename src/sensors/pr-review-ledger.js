@@ -19,9 +19,15 @@ await db.exec(`
   CREATE INDEX IF NOT EXISTS idx_pr_reviews_pr ON pr_reviews(repo, pr_id);
 `);
 
-try {
-  await db.exec(`ALTER TABLE pr_reviews ADD COLUMN publish_started_at TEXT`);
-} catch {}
+for (const ddl of [
+  `ALTER TABLE pr_reviews ADD COLUMN publish_started_at TEXT`,
+  `ALTER TABLE pr_reviews ADD COLUMN session_id TEXT`,
+  `ALTER TABLE pr_reviews ADD COLUMN worktree TEXT`,
+]) {
+  try {
+    await db.exec(ddl);
+  } catch {}
+}
 
 const changed = (result) => (result?.changes ?? result?.rowsAffected ?? 0) > 0;
 
@@ -49,10 +55,20 @@ export async function beginPublish({ repo, prId, headSha }) {
   return changed(result);
 }
 
-export async function finishReview({ repo, prId, headSha, status, verdict = null, findings = null, error = null }) {
+export async function finishReview({ repo, prId, headSha, status, verdict = null, findings = null, error = null, sessionId = null, worktree = null }) {
   await db.run(
-    `UPDATE pr_reviews SET status = ?, verdict = ?, findings = ?, error = ?, finished_at = datetime('now') WHERE repo = ? AND pr_id = ? AND head_sha = ?`,
-    [status, verdict, findings, error, repo, prId, headSha],
+    `UPDATE pr_reviews SET status = ?, verdict = ?, findings = ?, error = ?, finished_at = datetime('now'),
+       session_id = COALESCE(?, session_id), worktree = COALESCE(?, worktree)
+     WHERE repo = ? AND pr_id = ? AND head_sha = ?`,
+    [status, verdict, findings, error, sessionId, worktree, repo, prId, headSha],
+  );
+}
+
+export async function lastConversableReview(prId) {
+  return db.get(
+    `SELECT * FROM pr_reviews WHERE pr_id = ? AND status = 'published' AND session_id IS NOT NULL
+     ORDER BY datetime(finished_at) DESC, id DESC LIMIT 1`,
+    [prId],
   );
 }
 

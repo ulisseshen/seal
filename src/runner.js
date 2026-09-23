@@ -77,7 +77,7 @@ import { startWeb } from './web.js';
 import { ensureDefaultProfiles } from './sandbox.js';
 import { loadPolicy, policyRuleCount } from './policy.js';
 import { runPrWatcher } from './sensors/pr-watcher.js';
-import { reportStuckTick, runAzurePrReview, shouldTickNow } from './sensors/azure-pr-review.js';
+import { hasPendingChat, processNextChatRequest, reportStuckTick, runAzurePrReview, shouldTickNow } from './sensors/azure-pr-review.js';
 import { ensurePalace } from './memory.js';
 import { isRtkAvailable, getStats as getRtkStats } from './rtk.js';
 import { loadFlows } from './flows/engine.js';
@@ -626,6 +626,9 @@ function startSensors() {
       }
     };
     const watchAzurePr = async () => {
+      if (hasPendingChat()) {
+        processNextChatRequest(cfg.sensors || {}).catch((err) => console.error('[seal] review chat error:', err.message));
+      }
       if (ticking) return;
       try {
         const reason = await shouldTickNow();

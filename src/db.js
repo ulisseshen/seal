@@ -137,6 +137,7 @@ try {
 for (const ddl of [
   `ALTER TABLE tasks ADD COLUMN model TEXT`,
   `ALTER TABLE tasks ADD COLUMN disallowed_tools TEXT`,
+  `ALTER TABLE tasks ADD COLUMN session_id TEXT`,
 ]) {
   try {
     await db.exec(ddl);
@@ -505,12 +506,12 @@ export async function insertTaskIfNew(task) {
   const result = await db.run(`
     INSERT OR IGNORE INTO tasks (id, type, summary, detail, execute_at, recurrence, next_run,
       prompt, project, allowed_tools, permission_mode, notify_type, notify_channel, notify_target,
-      people, priority, status, created, max_runs, model, disallowed_tools)
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      people, priority, status, created, max_runs, model, disallowed_tools, session_id)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
   `, [task.id, task.type, task.summary, task.detail, task.execute_at, task.recurrence,
       task.next_run, task.prompt, task.project, task.allowed_tools, task.permission_mode,
       task.notify_type, task.notify_channel, task.notify_target || null, task.people, task.priority, task.status,
-      task.created, task.max_runs, task.model || null, task.disallowed_tools || null]);
+      task.created, task.max_runs, task.model || null, task.disallowed_tools || null, task.session_id || null]);
   // better-sqlite3 → .changes, libsql → .rowsAffected
   return (result?.changes ?? result?.rowsAffected ?? 0) > 0;
 }

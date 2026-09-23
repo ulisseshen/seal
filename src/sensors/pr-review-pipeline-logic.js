@@ -383,3 +383,50 @@ export function postedFindingTitles(threads, myEmail) {
   }
   return titles;
 }
+
+export const CHAT_BLOCK_START = '<<<SEAL_CHAT_ACTIONS';
+export const CHAT_BLOCK_END = 'SEAL_CHAT_ACTIONS>>>';
+
+export function buildChatPrompt({ prId, question }) {
+  return [
+    `Pergunta do dono do SEAL sobre a sua revisão da PR !${prId}:`,
+    '',
+    question.trim(),
+    '',
+    'Responda em português, direto, citando arquivo:linha quando falar de código. Você pode reler o código deste worktree.',
+    'Não poste, não vote, não edite arquivos: quem executa qualquer mudança é o sensor.',
+    `Só se você concluir que um achado seu publicado NÃO se sustenta, termine a resposta com o bloco abaixo, usando o título exato do achado:`,
+    `${CHAT_BLOCK_START}`,
+    '{"resolve": [{"title": "título exato do achado", "reason": "por que ele não se sustenta"}]}',
+    `${CHAT_BLOCK_END}`,
+    'Se nenhum achado deve ser resolvido, não inclua o bloco.',
+  ].join('\n');
+}
+
+export function parseChatReply(text) {
+  const source = String(text || '');
+  const start = source.lastIndexOf(CHAT_BLOCK_START);
+  const end = start >= 0 ? source.indexOf(CHAT_BLOCK_END, start) : -1;
+  if (start < 0 || end < 0) return { answer: source.trim(), resolves: [] };
+  let resolves = [];
+  try {
+    const parsed = JSON.parse(source.slice(start + CHAT_BLOCK_START.length, end).trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, ''));
+    resolves = (Array.isArray(parsed?.resolve) ? parsed.resolve : [])
+      .map((item) => ({ title: String(item?.title || '').trim(), reason: String(item?.reason || '').trim() }))
+      .filter((item) => item.title);
+  } catch {
+    resolves = [];
+  }
+  return { answer: (source.slice(0, start) + source.slice(end + CHAT_BLOCK_END.length)).trim(), resolves };
+}
+
+export function findingThreadIdsByTitle(threads, myEmail) {
+  const byTitle = new Map();
+  for (const thread of threads || []) {
+    const [first] = thread.comments || [];
+    if (!first || first.isDeleted || !isMine(first.author, myEmail)) continue;
+    const match = (first.content || '').match(FINDING_TITLE_RE);
+    if (match && !byTitle.has(match[1].trim())) byTitle.set(match[1].trim(), thread.id);
+  }
+  return byTitle;
+}

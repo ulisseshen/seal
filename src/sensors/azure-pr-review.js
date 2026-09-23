@@ -15,6 +15,10 @@ import {
   RESULT_BLOCK_START,
   RESULT_BLOCK_END,
   applyUsScenarioFinding,
+  buildChatPrompt,
+  findingThreadIdsByTitle,
+  parseChatReply,
+  reviewedMarker,
   buildThreadPayload,
   checkTargetBranch,
   countOpenBotThreads,
@@ -34,8 +38,10 @@ import {
   shouldNotify,
 } from './pr-review-pipeline-logic.js';
 import { resolveReviewRepos } from './pr-review-repos.js';
+import { appendChatEntry, completeChatRequest, pendingChatRequests, readChatLog } from './pr-review-chat.js';
+import { getClaudeBin } from '../claude-bin.js';
 import { escapeHtml, readReviewState, readSentMarks, sendTelegram, upsertPrEntry, writeReviewState } from './pr-review-state.js';
-import { beginPublish, claimReview, finishReview, healthIssues, lastPublishedReview, releaseClaim, releaseOrphanClaims, resumeStalePublishing, reviewForSha } from './pr-review-ledger.js';
+import { beginPublish, claimReview, finishReview, healthIssues, lastConversableReview, lastPublishedReview, releaseClaim, releaseOrphanClaims, resumeStalePublishing, reviewForSha } from './pr-review-ledger.js';
 
 const execFileP = promisify(execFile);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -543,6 +549,7 @@ async function prepareAndQueue({ repo, repos, pr, gate, sensorCfg }) {
     project: wtPath,
     allowed_tools: '[]',
     disallowed_tools: JSON.stringify(DENIED_TOOLS),
+    session_id: 'pending',
     model: sensorCfg.azure_pr_review_model || null,
     permission_mode: 'bypassPermissions',
     notify_type: 'silent',
@@ -575,10 +582,11 @@ export async function upsertReviewTask(task) {
   const reused = await db.run(
     `UPDATE tasks SET summary = ?, detail = ?, execute_at = ?, prompt = ?, project = ?, allowed_tools = ?, disallowed_tools = ?,
        model = ?, permission_mode = ?, notify_type = ?, notify_channel = ?, notify_target = ?, people = ?, priority = ?,
-       status = 'pending', result = NULL, retry_count = 0, completed_at = NULL, last_notified_at = NULL
+       session_id = ?, status = 'pending', result = NULL, retry_count = 0, completed_at = NULL, last_notified_at = NULL
      WHERE id = ? AND status IN ('done', 'failed', 'archived', 'acknowledged')`,
     [task.summary, task.detail, task.execute_at, task.prompt, task.project, task.allowed_tools, task.disallowed_tools,
-      task.model, task.permission_mode, task.notify_type, task.notify_channel, task.notify_target, task.people, task.priority, task.id],
+      task.model, task.permission_mode, task.notify_type, task.notify_channel, task.notify_target, task.people, task.priority,
+      task.session_id || null, task.id],
   );
   if ((reused?.changes ?? reused?.rowsAffected ?? 0) > 0) return true;
   return insertTaskIfNew(task);
@@ -655,7 +663,7 @@ function reviewTelegramText(entry, data, meta) {
 
 async function publishCompletedReviews(repos, state, { taskId = null } = {}) {
   const tasks = await db.all(
-    `SELECT id, summary, detail, result, retry_count FROM tasks
+    `SELECT id, summary, detail, result, retry_count, session_id, project FROM tasks
      WHERE summary LIKE ? AND detail LIKE ? AND status = 'done' AND result IS NOT NULL
        AND result NOT LIKE ? AND result NOT LIKE ? AND (? IS NULL OR id = ?)`,
     [`${SUMMARY_PREFIX}%`, `%${PIPELINE_TAG}%`, `%${PUBLISHED_MARKER}%`, `%${PUBLISH_FAILED_MARKER}%`, taskId, taskId],
@@ -748,7 +756,7 @@ async function publishCompletedReviews(repos, state, { taskId = null } = {}) {
 
     await sendTelegram(reviewTelegramText(entry, data, meta));
     await db.run(`UPDATE tasks SET result = result || ? WHERE id = ?`, [`\n\n${PUBLISHED_MARKER} ${data.verdict} findings=${data.findings.length} failures=${failures}`, task.id]);
-    await finishReview({ ...claim, status: 'published', verdict: data.verdict, findings: data.findings.length });
+    await finishReview({ ...claim, status: 'published', verdict: data.verdict, findings: data.findings.length, sessionId: task.session_id, worktree: task.project });
     published++;
     console.log(`[pr-review] Published !${prId} (${repo.name}): ${data.verdict}, ${data.findings.length} finding(s)`);
   }
@@ -1155,3 +1163,122 @@ export async function shouldTickNow() {
   const inFlight = await db.get(`SELECT id FROM tasks WHERE summary LIKE ? AND status IN ('pending', 'running', 'firing') LIMIT 1`, [`${SUMMARY_PREFIX}%`]);
   return inFlight ? null : 'backlog-free-slot';
 }
+
+let chatting = false;
+
+async function ensureReviewWorktree(repo, row) {
+  if (fs.existsSync(row.worktree)) return;
+  fs.mkdirSync(path.dirname(row.worktree), { recursive: true });
+  await fetchRefs(repo.projectDir, [], [row.head_sha]);
+  await git(repo.projectDir, ['worktree', 'prune']).catch(() => {});
+  await git(repo.projectDir, ['worktree', 'add', '--detach', row.worktree, row.head_sha], 120_000);
+  const nodeModules = path.join(repo.projectDir, 'node_modules');
+  if (fs.existsSync(nodeModules)) fs.symlinkSync(nodeModules, path.join(row.worktree, 'node_modules'));
+  fs.writeFileSync(path.join(row.worktree, '.mcp.json'), JSON.stringify(reviewMcpConfig(), null, 2));
+}
+
+async function askReviewAgent(row, question) {
+  const { stdout } = await execFileP(
+    getClaudeBin(),
+    [
+      '-p', buildChatPrompt({ prId: row.pr_id, question }),
+      '--resume', row.session_id,
+      '--output-format', 'text',
+      '--permission-mode', 'bypassPermissions',
+      '--strict-mcp-config', '--mcp-config', path.join(row.worktree, '.mcp.json'),
+      '--disallowedTools', DENIED_TOOLS.join(','),
+    ],
+    { cwd: row.worktree, timeout: 10 * 60 * 1000, maxBuffer: 16 * 1024 * 1024, env: process.env },
+  );
+  return stdout.trim();
+}
+
+async function resolveFromChat(repo, row, resolves) {
+  const prId = row.pr_id;
+  threadsCache.delete(`${repo.id}:${prId}`);
+  const { ok, threads } = await getThreads(repo, prId);
+  if (!ok) return { resolved: [], missing: resolves.map((item) => item.title), approved: false };
+  const byTitle = findingThreadIdsByTitle(threads, MY_EMAIL);
+  const resolved = [];
+  const missing = [];
+  for (const item of resolves) {
+    const threadId = byTitle.get(item.title);
+    if (!threadId) {
+      missing.push(item.title);
+      continue;
+    }
+    await azRequest('POST', repoUrl(repo, `/pullRequests/${prId}/threads/${threadId}/comments`), {
+      parentCommentId: 1,
+      content: `🤖 Resolvido depois de uma conversa com o revisor: ${item.reason || 'o achado não se sustenta.'}`,
+      commentType: 1,
+    });
+    await azRequest('PATCH', repoUrl(repo, `/pullRequests/${prId}/threads/${threadId}`), { status: 3 });
+    resolved.push(item.title);
+  }
+  threadsCache.delete(`${repo.id}:${prId}`);
+  const after = await getThreads(repo, prId);
+  const stillOpen = after.ok ? countOpenBotThreads(after.threads, MY_EMAIL) : 1;
+  const approved = resolved.length > 0 && stillOpen === 0;
+  if (approved) {
+    await azRequest('POST', repoUrl(repo, `/pullRequests/${prId}/threads`), {
+      comments: [{ parentCommentId: 0, content: `**✅ Aprovado** — os pontos pendentes foram resolvidos na conversa com o revisor.\n\n${reviewedMarker(row.head_sha)}`, commentType: 1 }],
+      status: 4,
+    });
+    await setMyVote(prId, VOTE_MAP.approved, repo);
+  }
+  return { resolved, missing, approved };
+}
+
+export async function processNextChatRequest(sensorCfg = {}) {
+  if (chatting) return false;
+  const [request] = pendingChatRequests();
+  if (!request) return false;
+  chatting = true;
+  try {
+    const logged = (readChatLog()[String(request.prId)] || []).some((entry) => entry.requestId === request.id && entry.role === 'user');
+    if (!logged) appendChatEntry(request.prId, { role: 'user', text: request.question, source: request.source, at: request.createdAt, requestId: request.id });
+    const missing = configureAzure(sensorCfg);
+    if (missing.length > 0) throw new Error(`ingest.json sensors is missing ${missing.join(', ')}`);
+    const repos = resolveReviewRepos(sensorCfg.azure_pr_review_repos);
+    const row = await lastConversableReview(request.prId);
+    let answer;
+    let outcome = { resolved: [], missing: [], approved: false };
+    if (!row) {
+      answer = `Não tenho uma revisão com sessão guardada para a !${request.prId}. Só as revisões feitas depois desta função guardam a conversa; a próxima revisão desta PR já vai permitir.`;
+    } else {
+      const repo = repos.find((candidate) => candidate.name === row.repo);
+      if (!repo) throw new Error(`repo ${row.repo} não está configurado`);
+      await ensureReviewWorktree(repo, row);
+      const reply = parseChatReply(await askReviewAgent(row, request.question));
+      answer = reply.answer || '(o revisor não respondeu nada)';
+      if (reply.resolves.length > 0 && !TEST_DRY) outcome = await resolveFromChat(repo, row, reply.resolves);
+      if (outcome.approved) {
+        const state = readReviewState();
+        const entry = state.prs[String(request.prId)];
+        if (entry) {
+          Object.assign(entry, { verdict: 'approved', needsAction: (entry.needsAction || []).filter((item) => item.reason !== 'blocker') });
+          writeReviewState(state);
+        }
+      }
+    }
+    const actions = [
+      ...outcome.resolved.map((title) => `resolvido: ${title}`),
+      ...outcome.missing.map((title) => `não achei a thread de: ${title}`),
+      ...(outcome.approved ? ['PR aprovada: não sobrou comentário aberto'] : []),
+    ];
+    appendChatEntry(request.prId, { role: 'agent', text: answer, actions, at: new Date().toISOString(), requestId: request.id });
+    const lines = [`🤖 <b>Revisor da !${request.prId}</b>`, '', escapeHtml(answer.slice(0, 3500))];
+    if (actions.length > 0) lines.push('', ...actions.map((action) => `• ${escapeHtml(action)}`));
+    await sendTelegram(lines.join('\n'));
+  } catch (err) {
+    console.warn(`[pr-review] chat !${request.prId} failed: ${err.message}`);
+    appendChatEntry(request.prId, { role: 'agent', text: `Não consegui falar com o revisor: ${err.message.slice(0, 300)}`, actions: [], at: new Date().toISOString(), requestId: request.id, error: true });
+    await sendTelegram(`⚠️ Não consegui falar com o revisor da !${request.prId}: ${escapeHtml(err.message.slice(0, 300))}`);
+  } finally {
+    completeChatRequest(request);
+    chatting = false;
+  }
+  return true;
+}
+
+export const hasPendingChat = () => pendingChatRequests().length > 0;

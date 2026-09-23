@@ -125,6 +125,8 @@ export function startTelegram(config) {
           return;
         }
 
+        if (await tryHandleReviewChat(msg, chatId)) return;
+
         // "apaga 2" tem que ser tratado ANTES de tudo, senão vira tarefa nova.
         if (await tryHandleCorrection(msg.text, chatId)) return;
 
@@ -136,6 +138,30 @@ export function startTelegram(config) {
   });
 
   return bot;
+}
+
+const REVIEW_CHAT_COMMAND = /^\/(?:pr|revisor)\s+!?(\d{3,7})\s+([\s\S]+)$/i;
+const REVIEW_MESSAGE_PR = /!(\d{3,7})/;
+
+async function tryHandleReviewChat(msg, chatId) {
+  let prId = null;
+  let question = null;
+  const command = msg.text.match(REVIEW_CHAT_COMMAND);
+  if (command) {
+    prId = Number(command[1]);
+    question = command[2];
+  } else if (msg.reply_to_message?.from?.is_bot && msg.reply_to_message.text) {
+    const match = msg.reply_to_message.text.match(REVIEW_MESSAGE_PR);
+    if (match) {
+      prId = Number(match[1]);
+      question = msg.text;
+    }
+  }
+  if (!prId || !question?.trim()) return false;
+  const { enqueueChatRequest } = await import('./sensors/pr-review-chat.js');
+  enqueueChatRequest({ prId, question, source: 'telegram', chatId });
+  await bot.sendMessage(chatId, `🤖 Perguntei ao revisor da !${prId}. A resposta chega aqui (e no painel) quando ele terminar.`);
+  return true;
 }
 
 async function handleVoice(msg, chatId, config) {

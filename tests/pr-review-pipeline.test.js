@@ -15,6 +15,11 @@ import {
   formatSummaryComment,
   isMarkedSent,
   postedFindingTitles,
+  buildChatPrompt,
+  parseChatReply,
+  findingThreadIdsByTitle,
+  CHAT_BLOCK_START,
+  CHAT_BLOCK_END,
   sentKey,
   applyUsScenarioFinding,
   countOpenBotThreads,
@@ -379,4 +384,27 @@ test('a resumed publish skips findings already on the PR, matched by title', () 
   ];
   assert.deepEqual([...postedFindingTitles(threads, ME)].sort(), ['Falta teste do fechamento', 'PR sem US vinculada']);
   assert.equal(formatFindingComment({ severity: 'WARNING', kind: 'code', title: 'Falta teste do fechamento' }).match(/^\*\*\[[^\]]+\]\s*(.+?)\*\*/)[1], 'Falta teste do fechamento');
+});
+
+test('chat prompt carries the question and the only way the agent can ask for a change', () => {
+  const prompt = buildChatPrompt({ prId: 10116, question: '  por que o C2 é bloqueador?  ' });
+  assert.match(prompt, /PR !44700/);
+  assert.match(prompt, /por que o C2 é bloqueador\?/);
+  assert.ok(prompt.includes(CHAT_BLOCK_START) && prompt.includes(CHAT_BLOCK_END));
+});
+
+test('chat reply splits the answer from the resolve actions; no block means no action', () => {
+  const reply = `Você tem razão, o backend já ordena.\n${CHAT_BLOCK_START}\n{"resolve":[{"title":"firstAllowedDay supõe ordem","reason":"o backend garante"},{"title":""}]}\n${CHAT_BLOCK_END}`;
+  assert.deepEqual(parseChatReply(reply), { answer: 'Você tem razão, o backend já ordena.', resolves: [{ title: 'firstAllowedDay supõe ordem', reason: 'o backend garante' }] });
+  assert.deepEqual(parseChatReply('Mantenho o achado.'), { answer: 'Mantenho o achado.', resolves: [] });
+  assert.deepEqual(parseChatReply(`ok\n${CHAT_BLOCK_START}\n{quebrado\n${CHAT_BLOCK_END}`).resolves, []);
+});
+
+test('finding threads are found by title, only among the bot own threads', () => {
+  const threads = [
+    { id: 11, comments: [myComment('**[WARNING] firstAllowedDay supõe ordem**\n\ncorpo')] },
+    { id: 12, comments: [{ author: { uniqueName: AUTHOR }, content: '**[WARNING] firstAllowedDay supõe ordem**' }] },
+    { id: 13, comments: [myComment(`resumo\n${reviewedMarker(HEAD)}`)] },
+  ];
+  assert.deepEqual([...findingThreadIdsByTitle(threads, ME)], [['firstAllowedDay supõe ordem', 11]]);
 });
