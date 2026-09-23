@@ -185,6 +185,19 @@ export async function executeTask(task) {
     } catch {}
   }
 
+  if (task.disallowed_tools) {
+    try {
+      const tools = JSON.parse(task.disallowed_tools);
+      if (tools.length > 0) {
+        claudeArgs.push('--disallowedTools', tools.join(','));
+      }
+    } catch {}
+  }
+
+  if (task.model) {
+    claudeArgs.push('--model', task.model);
+  }
+
   // ─── Sandbox wrap ───────────────────────────────────
   const profileName = profileForPermissionMode(task.permission_mode);
 
