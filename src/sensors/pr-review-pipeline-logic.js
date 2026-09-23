@@ -360,3 +360,13 @@ export function checkTargetBranch({ source, target, nextRelease, defaultBranch =
     suggestion: `Trocar o destino para \`${nextRelease}\` (ou uma release futura, se for para depois).`,
   };
 }
+
+const STICKY_SENT_REASONS = new Set(['blocker', 'pair-desync']);
+
+export const sentKey = (prId, item) => `${prId}:${item.reason}:${item.since || ''}`;
+
+export function isMarkedSent(sent, prId, item, now = Date.now()) {
+  const at = sent?.[sentKey(prId, item)];
+  if (!at) return false;
+  return STICKY_SENT_REASONS.has(item.reason) || now - new Date(at).getTime() < DAY_MS;
+}

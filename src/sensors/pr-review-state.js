@@ -5,6 +5,17 @@ import path from 'path';
 const CONFIG_DIR = path.join(os.homedir(), '.config', 'seal');
 export const PR_REVIEW_STATE_PATH = process.env.SEAL_PR_REVIEW_STATE || path.join(CONFIG_DIR, 'pr-review-state.json');
 const GATEWAY_PATH = path.join(CONFIG_DIR, 'gateway.json');
+const SENT_PATH = process.env.SEAL_PR_REVIEW_SENT || path.join(CONFIG_DIR, 'pr-review-sent.json');
+
+export function readSentMarks() {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(SENT_PATH, 'utf8'));
+    return parsed && typeof parsed.sent === 'object' ? parsed.sent : {};
+  } catch {
+    return {};
+  }
+}
+
 const CLOSED_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 
 export function readReviewState() {

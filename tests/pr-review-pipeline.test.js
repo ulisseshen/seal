@@ -13,6 +13,8 @@ import {
   followUpReasons,
   formatFindingComment,
   formatSummaryComment,
+  isMarkedSent,
+  sentKey,
   applyUsScenarioFinding,
   countOpenBotThreads,
   verdictFor,
@@ -209,14 +211,16 @@ test('notification cooldown is one day per reason', () => {
   assert.equal(shouldNotify({ blocker: '2026-09-25T11:00:00Z' }, 'blocker', now), true);
 });
 
-test('repo config pairs flutter↔old backend and vue↔new backend, and overrides merge by name', () => {
-  const repos = resolveReviewRepos();
-  const pairOf = (name) => repos.find((repo) => repo.name === name).pair;
-  assert.equal(pairOf('app-mobile'), 'api-legada');
-  assert.equal(pairOf('app-web'), 'api-nova');
-  const overridden = resolveReviewRepos([{ name: 'api-legada', enabled: false }, { name: 'app-web', skill: 'x' }]);
-  assert.equal(overridden.some((repo) => repo.name === 'api-legada'), false);
-  assert.equal(overridden.find((repo) => repo.name === 'app-web').skill, 'x');
+test('repo config comes only from ingest.json: incomplete or disabled entries are dropped, ~ is expanded', () => {
+  assert.deepEqual(resolveReviewRepos(), []);
+  const repos = resolveReviewRepos([
+    { name: 'front', id: 'guid-1', projectDir: '~/projects/front', skill: 'review', pair: 'back' },
+    { name: 'back', id: 'guid-2', projectDir: '/abs/back', skill: 'review', enabled: false },
+    { name: 'no-id', projectDir: '/x', skill: 'review' },
+  ]);
+  assert.deepEqual(repos.map((repo) => repo.name), ['front']);
+  assert.ok(!repos[0].projectDir.startsWith('~'));
+  assert.ok(repos[0].projectDir.endsWith('/projects/front'));
 });
 
 test('next release is main version + 1 minor', () => {
@@ -351,4 +355,16 @@ test('re-review with no new comment but bot threads still open stays waiting for
 test('summary mixes new and still-open comments in plain language', () => {
   const summary = formatSummaryComment({ data: { blockingReason: 'falta teste do cenário C2', findings: [{ title: 'x' }] }, headSha: HEAD, priorOpen: 1 });
   assert.match(summary, /1 comentário nesta PR, com o prompt de correção\. 1 comentário da revisão anterior continua aberto\./);
+});
+
+test('a nudge marked as sent stays quiet until there is a new reason; time-based nudges come back after a day', () => {
+  const now = new Date('2026-09-23T12:00:00Z').getTime();
+  const blocker = { reason: 'blocker', since: '2026-09-22T20:00:00Z' };
+  const openLong = { reason: 'open-over-1d', since: '2026-09-21T10:00:00Z' };
+  const sent = { [sentKey(10116, blocker)]: '2026-09-22T21:00:00Z', [sentKey(10116, openLong)]: '2026-09-22T21:00:00Z' };
+  assert.equal(isMarkedSent(sent, 10116, blocker, now), true);
+  assert.equal(isMarkedSent(sent, 10116, { reason: 'blocker', since: '2026-09-23T09:00:00Z' }, now), false);
+  assert.equal(isMarkedSent(sent, 10116, openLong, now), true);
+  assert.equal(isMarkedSent(sent, 10116, openLong, now + 24 * 60 * 60 * 1000), false);
+  assert.equal(isMarkedSent({}, 10116, blocker, now), false);
 });

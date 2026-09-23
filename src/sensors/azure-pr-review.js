@@ -25,6 +25,7 @@ import {
   followUpReasons,
   formatFindingComment,
   formatSummaryComment,
+  isMarkedSent,
   matchPairedPrs,
   messageDraftFor,
   nextReleaseFrom,
@@ -32,15 +33,16 @@ import {
   shouldNotify,
 } from './pr-review-pipeline-logic.js';
 import { resolveReviewRepos } from './pr-review-repos.js';
-import { escapeHtml, readReviewState, sendTelegram, upsertPrEntry, writeReviewState } from './pr-review-state.js';
+import { escapeHtml, readReviewState, readSentMarks, sendTelegram, upsertPrEntry, writeReviewState } from './pr-review-state.js';
 import { beginPublish, claimReview, finishReview, lastPublishedReview, releaseClaim, releaseOrphanClaims, reviewForSha } from './pr-review-ledger.js';
 
 const execFileP = promisify(execFile);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 
-const ORG = process.env.SEAL_AZURE_ORG || 'org';
-const PROJECT = process.env.SEAL_AZURE_PROJECT || 'Projeto';
-const MY_EMAIL = (process.env.SEAL_AZURE_MY_EMAIL || 'pessoa@example.com').toLowerCase();
+let ORG = '';
+let PROJECT = '';
+let MY_EMAIL = '';
+let ORG_BASE = '';
 const MY_AZURE_ID = (process.env.SEAL_AZURE_MY_ID || '').toLowerCase();
 const TEST_PRS = new Set(
   (process.env.SEAL_AZURE_TEST_PRS || '')
@@ -51,7 +53,6 @@ const TEST_PRS = new Set(
 const TEST_DRY = process.env.SEAL_AZURE_TEST_DRY === '1';
 const PAT = process.env.AZURE_DEVOPS_PAT || process.env.AZURE_DEVOPS_EXT_PAT || '';
 const API_VERSION = 'api-version=7.1';
-const ORG_BASE = `https://dev.azure.com/${ORG}/${PROJECT}/_apis`;
 
 const SUMMARY_PREFIX = 'smart-review PR #';
 const PIPELINE_TAG = 'pr-review-pipeline:v2';
@@ -85,9 +86,23 @@ function resolveOcrBin() {
 
 const OCR_BIN = resolveOcrBin();
 
-const FALLBACK_MCP_CONFIG = {
+const fallbackMcpConfig = () => ({
   mcpServers: { 'azure-devops': { type: 'stdio', command: 'npx', args: ['@azure-devops/mcp', ORG], env: {} } },
-};
+});
+
+export function configureAzure(sensorCfg = {}) {
+  ORG = process.env.SEAL_AZURE_ORG || sensorCfg.azure_pr_review_org || '';
+  PROJECT = process.env.SEAL_AZURE_PROJECT || sensorCfg.azure_pr_review_project || '';
+  MY_EMAIL = (process.env.SEAL_AZURE_MY_EMAIL || sensorCfg.azure_pr_review_my_email || '').toLowerCase();
+  ORG_BASE = `https://dev.azure.com/${ORG}/${PROJECT}/_apis`;
+  const missing = [
+    !ORG && 'azure_pr_review_org',
+    !PROJECT && 'azure_pr_review_project',
+    !MY_EMAIL && 'azure_pr_review_my_email',
+    !(sensorCfg.azure_pr_review_repos || []).length && 'azure_pr_review_repos',
+  ].filter(Boolean);
+  return missing;
+}
 
 function authHeaders() {
   return {
@@ -293,7 +308,7 @@ async function createWorktree(repo, pr, headSha) {
   const projectMcp = path.join(repo.projectDir, '.mcp.json');
   const worktreeMcp = path.join(wtPath, '.mcp.json');
   if (fs.existsSync(projectMcp)) fs.copyFileSync(projectMcp, worktreeMcp);
-  else fs.writeFileSync(worktreeMcp, JSON.stringify(FALLBACK_MCP_CONFIG, null, 2));
+  else fs.writeFileSync(worktreeMcp, JSON.stringify(fallbackMcpConfig(), null, 2));
 
   return { wtPath, mergeBase, sourceBranch, targetBranch };
 }
@@ -798,7 +813,7 @@ async function retryFailedReviews(repos) {
   }
 }
 
-function collectFollowUps({ state, repo, pr, threads, now, digest }) {
+function collectFollowUps({ state, repo, pr, threads, now, digest, sentMarks }) {
   const entry = upsertPrEntry(state, pr, repo.name, ORG, PROJECT);
   const pairedStatuses = (entry.pairedPrs || []).map((paired) => prByIdCache.get(paired.prId)?.status || paired.status);
   const reasons = followUpReasons({ pr, threads, myEmail: MY_EMAIL, now, pairedStatuses });
@@ -814,6 +829,7 @@ function collectFollowUps({ state, repo, pr, threads, now, digest }) {
     })),
   ];
   for (const item of entry.needsAction) {
+    if (isMarkedSent(sentMarks, entry.prId, item, now)) continue;
     if (!shouldNotify(entry.notified, item.reason, now)) continue;
     entry.notified = { ...entry.notified, [item.reason]: new Date(now).toISOString() };
     digest.push({ entry, item });
@@ -864,6 +880,11 @@ export async function runAzurePrReview(sensorCfg = {}) {
     console.warn('[pr-review] No AZURE_DEVOPS_PAT in env — skipping');
     return { skipped: true, reason: 'no-pat' };
   }
+  const missing = configureAzure(sensorCfg);
+  if (missing.length > 0) {
+    console.warn(`[pr-review] ingest.json sensors is missing ${missing.join(', ')} — skipping`);
+    return { skipped: true, reason: 'missing-config', missing };
+  }
   threadsCache = new Map();
   prByIdCache = new Map();
 
@@ -886,6 +907,7 @@ export async function runAzurePrReview(sensorCfg = {}) {
   let slots = Math.max(0, maxParallel - running.length);
   const stats = { repos: repos.length, prs: 0, created: 0, skipped: {} };
   const digest = [];
+  const sentMarks = readSentMarks();
   const seenActive = new Set();
   const candidates = [];
 
@@ -928,7 +950,7 @@ export async function runAzurePrReview(sensorCfg = {}) {
       if (!ok) continue;
       if (await clearZombieLocks(repo, pr, threads).catch(() => false)) continue;
 
-      collectFollowUps({ state, repo, pr, threads, now, digest });
+      collectFollowUps({ state, repo, pr, threads, now, digest, sentMarks });
 
       const inFlight = await db.get(`SELECT id FROM tasks WHERE id = ? AND status IN ('pending', 'running', 'firing')`, [`seal_pr_${pr.pullRequestId}`]);
       if (inFlight) continue;
@@ -989,6 +1011,8 @@ const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
 export async function runSinglePrReview({ repoName, prId, sensorCfg = {}, timeoutMs = 45 * 60 * 1000, pollMs = 15_000 }) {
   if (!PAT) throw new Error('AZURE_DEVOPS_PAT not set');
+  const missing = configureAzure(sensorCfg);
+  if (missing.length > 0) throw new Error(`ingest.json sensors is missing ${missing.join(', ')}`);
   threadsCache = new Map();
   prByIdCache = new Map();
   const repos = resolveReviewRepos(sensorCfg.azure_pr_review_repos).filter((repo) => fs.existsSync(repo.projectDir));
