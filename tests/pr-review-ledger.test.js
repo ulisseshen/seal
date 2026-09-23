@@ -52,7 +52,7 @@ test('a claim with a live or retryable task is never released', async () => {
   const live = { repo: 'r', prId: 3, headSha: 'ccc' };
   await ledger.claimReview({ ...live, mode: 'first-review', taskId: 'seal_pr_3' });
   await age(live, 30);
-  await db.run(`INSERT INTO tasks (id, type, summary, status, created, retry_count) VALUES ('seal_pr_3', 'task', 's', 'failed', datetime('now'), 1)`);
+  await db.run(`INSERT INTO tasks (id, type, summary, detail, status, created, retry_count) VALUES ('seal_pr_3', 'task', 's', '{"headSha":"ccc"}', 'failed', datetime('now'), 1)`);
   assert.deepEqual(await ledger.releaseOrphanClaims({ maxAgeMinutes: 10, maxRetries: 5 }), []);
   await db.run(`UPDATE tasks SET status = 'running' WHERE id = 'seal_pr_3'`);
   assert.deepEqual(await ledger.releaseOrphanClaims({ maxAgeMinutes: 10, maxRetries: 5 }), []);
@@ -83,4 +83,37 @@ test('a publish interrupted mid-way goes back to queued after the grace period, 
   assert.equal((await ledger.reviewForSha(stuck)).status, 'queued');
   assert.equal((await ledger.reviewForSha(recent)).status, 'publishing');
   assert.equal(await ledger.beginPublish(stuck), true);
+});
+
+test('a claim for a new commit is released when the only task is the finished one from the previous commit', async () => {
+  const previous = { repo: 'r', prId: 7, headSha: 'old7' };
+  const current = { repo: 'r', prId: 7, headSha: 'new7' };
+  await ledger.claimReview({ ...previous, mode: 'first-review', taskId: 'seal_pr_7' });
+  await ledger.beginPublish(previous);
+  await ledger.finishReview({ ...previous, status: 'published', verdict: 'needs-work', findings: 1 });
+  await db.run(`INSERT INTO tasks (id, type, summary, detail, status, created, result) VALUES ('seal_pr_7', 'task', 's', '{"headSha":"old7"}', 'done', datetime('now'), 'ok [seal:published] needs-work')`);
+  await ledger.claimReview({ ...current, mode: 're-review', taskId: 'seal_pr_7' });
+  await age(current, 30);
+  assert.deepEqual((await ledger.releaseOrphanClaims({ maxAgeMinutes: 10 })).map((row) => row.headSha), ['new7']);
+});
+
+test('a finished task still waiting to publish its own commit keeps the claim', async () => {
+  const waiting = { repo: 'r', prId: 8, headSha: 'wait8' };
+  await ledger.claimReview({ ...waiting, mode: 'first-review', taskId: 'seal_pr_8' });
+  await age(waiting, 30);
+  await db.run(`INSERT INTO tasks (id, type, summary, detail, status, created, result) VALUES ('seal_pr_8', 'task', 's', '{"headSha":"wait8"}', 'done', datetime('now'), 'review pronto')`);
+  assert.deepEqual(await ledger.releaseOrphanClaims({ maxAgeMinutes: 10 }), []);
+});
+
+test('health reports a stuck claim and a publish that never finished', async () => {
+  const stuck = { repo: 'h', prId: 9, headSha: 'stuck9' };
+  await ledger.claimReview({ ...stuck, mode: 'first-review', taskId: 'seal_pr_9' });
+  await age(stuck, 60);
+  const publishing = { repo: 'h', prId: 10, headSha: 'pub10' };
+  await ledger.claimReview({ ...publishing, mode: 'first-review', taskId: 'seal_pr_10' });
+  await ledger.beginPublish(publishing);
+  await db.run(`UPDATE pr_reviews SET publish_started_at = datetime('now', '-30 minutes') WHERE pr_id = 10`);
+  const texts = (await ledger.healthIssues()).map((issue) => issue.text);
+  assert.ok(texts.some((text) => text.includes('h !9')));
+  assert.ok(texts.some((text) => text.includes('publicação parada') && text.includes('h !10')));
 });

@@ -21,7 +21,7 @@ const CLOSED_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
 export function readReviewState() {
   try {
     const parsed = JSON.parse(fs.readFileSync(PR_REVIEW_STATE_PATH, 'utf8'));
-    return { updatedAt: parsed.updatedAt || null, prs: parsed.prs && typeof parsed.prs === 'object' ? parsed.prs : {} };
+    return { updatedAt: parsed.updatedAt || null, prs: parsed.prs && typeof parsed.prs === 'object' ? parsed.prs : {}, health: parsed.health || null };
   } catch {
     return { updatedAt: null, prs: {} };
   }
@@ -33,7 +33,7 @@ export function writeReviewState(state, now = Date.now()) {
       delete state.prs[prId];
     }
   }
-  const next = { updatedAt: new Date(now).toISOString(), prs: state.prs };
+  const next = { updatedAt: new Date(now).toISOString(), prs: state.prs, health: state.health || null };
   const tmp = `${PR_REVIEW_STATE_PATH}.tmp`;
   fs.mkdirSync(path.dirname(PR_REVIEW_STATE_PATH), { recursive: true });
   fs.writeFileSync(tmp, JSON.stringify(next, null, 2));

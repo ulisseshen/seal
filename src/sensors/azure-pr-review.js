@@ -35,7 +35,7 @@ import {
 } from './pr-review-pipeline-logic.js';
 import { resolveReviewRepos } from './pr-review-repos.js';
 import { escapeHtml, readReviewState, readSentMarks, sendTelegram, upsertPrEntry, writeReviewState } from './pr-review-state.js';
-import { beginPublish, claimReview, finishReview, lastPublishedReview, releaseClaim, releaseOrphanClaims, resumeStalePublishing, reviewForSha } from './pr-review-ledger.js';
+import { beginPublish, claimReview, finishReview, healthIssues, lastPublishedReview, releaseClaim, releaseOrphanClaims, resumeStalePublishing, reviewForSha } from './pr-review-ledger.js';
 
 const execFileP = promisify(execFile);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -858,6 +858,22 @@ const REASON_LABEL = {
   'pair-desync': 'PR par já fechada no outro repo',
 };
 
+const HEALTH_ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
+
+async function alertHealth(state, now) {
+  const issues = await healthIssues();
+  const notified = state.health?.notified || {};
+  const fresh = issues.filter((issue) => !notified[issue.key] || now - new Date(notified[issue.key]).getTime() >= HEALTH_ALERT_COOLDOWN_MS);
+  state.health = {
+    checkedAt: new Date(now).toISOString(),
+    issues: issues.map((issue) => issue.text),
+    notified: Object.fromEntries(Object.entries(notified).filter(([key]) => issues.some((issue) => issue.key === key))),
+  };
+  if (fresh.length === 0) return;
+  for (const issue of fresh) state.health.notified[issue.key] = new Date(now).toISOString();
+  await sendTelegram(['⚠️ <b>Revisão automática travada</b>', ...fresh.map((issue) => `• ${escapeHtml(issue.text)}`)].join('\n'));
+}
+
 const REASON_PRIORITY = ['blocker', 'stale-no-response', 'pair-desync', 'open-over-1d'];
 
 async function sendDigest(digest) {
@@ -1017,6 +1033,7 @@ export async function runAzurePrReview(sensorCfg = {}) {
   }
 
   await sendDigest(digest);
+  await alertHealth(state, now).catch((err) => console.warn(`[pr-review] health: ${err.message}`));
   writeReviewState(state, now);
   await retryFailedReviews(repos).catch((err) => console.warn(`[pr-review] retry: ${err.message}`));
 

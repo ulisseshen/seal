@@ -76,9 +76,13 @@ export async function releaseOrphanClaims({ maxAgeMinutes = 10, maxRetries = 5 }
        AND datetime(r.claimed_at) < datetime('now', ?)
        AND (
          t.id IS NULL
-         OR t.status IN ('archived', 'acknowledged')
-         OR (t.status = 'failed' AND COALESCE(t.retry_count, 0) >= ?)
          OR EXISTS (SELECT 1 FROM pr_reviews newer WHERE newer.repo = r.repo AND newer.pr_id = r.pr_id AND newer.id > r.id)
+         OR NOT (
+           t.status IN ('pending', 'running', 'firing')
+           OR (t.detail LIKE '%' || r.head_sha || '%' AND t.status = 'done'
+               AND COALESCE(t.result, '') NOT LIKE '%[seal:published]%' AND COALESCE(t.result, '') NOT LIKE '%[seal:publish-failed]%')
+           OR (t.detail LIKE '%' || r.head_sha || '%' AND t.status = 'failed' AND COALESCE(t.retry_count, 0) < ?)
+         )
        )`,
     [`-${maxAgeMinutes} minutes`, maxRetries],
   );
@@ -98,4 +102,28 @@ export async function resumeStalePublishing({ maxAgeMinutes = 10 } = {}) {
     await db.run(`UPDATE pr_reviews SET status = 'queued', publish_started_at = NULL WHERE repo = ? AND pr_id = ? AND head_sha = ? AND status = 'publishing'`, [row.repo, row.pr_id, row.head_sha]);
   }
   return stale.map((row) => ({ repo: row.repo, prId: row.pr_id, headSha: row.head_sha }));
+}
+
+export async function healthIssues({ stuckClaimMinutes = 30, runningMinutes = 45, publishingMinutes = 15 } = {}) {
+  const issues = [];
+  const stuck = await db.all(
+    `SELECT r.repo, r.pr_id FROM pr_reviews r LEFT JOIN tasks t ON t.id = r.task_id
+     WHERE r.status = 'queued' AND datetime(r.claimed_at) < datetime('now', ?)
+       AND (t.id IS NULL OR t.status NOT IN ('pending', 'running', 'firing'))`,
+    [`-${stuckClaimMinutes} minutes`],
+  );
+  for (const row of stuck) issues.push({ key: `stuck-claim:${row.repo}:${row.pr_id}`, text: `claim preso há mais de ${stuckClaimMinutes} min sem task ativa: ${row.repo} !${row.pr_id}` });
+  const running = await db.all(
+    `SELECT t.id, MAX(runs.started_at) AS started_at FROM tasks t JOIN task_runs runs ON runs.task_id = t.id
+     WHERE t.id LIKE 'seal_pr_%' AND t.status = 'running' GROUP BY t.id
+     HAVING datetime(MAX(runs.started_at)) < datetime('now', ?)`,
+    [`-${runningMinutes} minutes`],
+  );
+  for (const row of running) issues.push({ key: `long-run:${row.id}`, text: `review rodando há mais de ${runningMinutes} min: ${row.id.replace('seal_pr_', '!')}` });
+  const publishing = await db.all(
+    `SELECT repo, pr_id FROM pr_reviews WHERE status = 'publishing' AND datetime(COALESCE(publish_started_at, claimed_at)) < datetime('now', ?)`,
+    [`-${publishingMinutes} minutes`],
+  );
+  for (const row of publishing) issues.push({ key: `publishing:${row.repo}:${row.pr_id}`, text: `publicação parada há mais de ${publishingMinutes} min: ${row.repo} !${row.pr_id}` });
+  return issues;
 }
