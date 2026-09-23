@@ -370,3 +370,16 @@ export function isMarkedSent(sent, prId, item, now = Date.now()) {
   if (!at) return false;
   return STICKY_SENT_REASONS.has(item.reason) || now - new Date(at).getTime() < DAY_MS;
 }
+
+const FINDING_TITLE_RE = /^\*\*\[[^\]]+\]\s*(.+?)\*\*/;
+
+export function postedFindingTitles(threads, myEmail) {
+  const titles = new Set();
+  for (const thread of threads || []) {
+    const [first] = thread.comments || [];
+    if (!first || first.isDeleted || !isMine(first.author, myEmail)) continue;
+    const match = (first.content || '').match(FINDING_TITLE_RE);
+    if (match) titles.add(match[1].trim());
+  }
+  return titles;
+}

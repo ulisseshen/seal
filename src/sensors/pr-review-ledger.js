@@ -19,6 +19,10 @@ await db.exec(`
   CREATE INDEX IF NOT EXISTS idx_pr_reviews_pr ON pr_reviews(repo, pr_id);
 `);
 
+try {
+  await db.exec(`ALTER TABLE pr_reviews ADD COLUMN publish_started_at TEXT`);
+} catch {}
+
 const changed = (result) => (result?.changes ?? result?.rowsAffected ?? 0) > 0;
 
 export async function claimReview({ repo, prId, headSha, mode, taskId }) {
@@ -39,7 +43,7 @@ export async function releaseClaim({ repo, prId, headSha, error }) {
 
 export async function beginPublish({ repo, prId, headSha }) {
   const result = await db.run(
-    `UPDATE pr_reviews SET status = 'publishing' WHERE repo = ? AND pr_id = ? AND head_sha = ? AND status = 'queued'`,
+    `UPDATE pr_reviews SET status = 'publishing', publish_started_at = datetime('now') WHERE repo = ? AND pr_id = ? AND head_sha = ? AND status = 'queued'`,
     [repo, prId, headSha],
   );
   return changed(result);
@@ -82,4 +86,16 @@ export async function releaseOrphanClaims({ maxAgeMinutes = 10, maxRetries = 5 }
     await db.run(`DELETE FROM pr_reviews WHERE repo = ? AND pr_id = ? AND head_sha = ? AND status = 'queued'`, [orphan.repo, orphan.pr_id, orphan.head_sha]);
   }
   return orphans.map((orphan) => ({ repo: orphan.repo, prId: orphan.pr_id, headSha: orphan.head_sha, taskStatus: orphan.task_status }));
+}
+
+export async function resumeStalePublishing({ maxAgeMinutes = 10 } = {}) {
+  const stale = await db.all(
+    `SELECT repo, pr_id, head_sha FROM pr_reviews
+     WHERE status = 'publishing' AND datetime(COALESCE(publish_started_at, claimed_at)) < datetime('now', ?)`,
+    [`-${maxAgeMinutes} minutes`],
+  );
+  for (const row of stale) {
+    await db.run(`UPDATE pr_reviews SET status = 'queued', publish_started_at = NULL WHERE repo = ? AND pr_id = ? AND head_sha = ? AND status = 'publishing'`, [row.repo, row.pr_id, row.head_sha]);
+  }
+  return stale.map((row) => ({ repo: row.repo, prId: row.pr_id, headSha: row.head_sha }));
 }

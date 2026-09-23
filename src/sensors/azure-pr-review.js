@@ -26,6 +26,7 @@ import {
   formatFindingComment,
   formatSummaryComment,
   isMarkedSent,
+  postedFindingTitles,
   matchPairedPrs,
   messageDraftFor,
   nextReleaseFrom,
@@ -34,7 +35,7 @@ import {
 } from './pr-review-pipeline-logic.js';
 import { resolveReviewRepos } from './pr-review-repos.js';
 import { escapeHtml, readReviewState, readSentMarks, sendTelegram, upsertPrEntry, writeReviewState } from './pr-review-state.js';
-import { beginPublish, claimReview, finishReview, lastPublishedReview, releaseClaim, releaseOrphanClaims, reviewForSha } from './pr-review-ledger.js';
+import { beginPublish, claimReview, finishReview, lastPublishedReview, releaseClaim, releaseOrphanClaims, resumeStalePublishing, reviewForSha } from './pr-review-ledger.js';
 
 const execFileP = promisify(execFile);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -647,7 +648,9 @@ async function publishCompletedReviews(repos, state, { taskId = null } = {}) {
     const prId = meta.prId;
     const claim = { repo: repo.name, prId, headSha: meta.headSha };
     if (!(await beginPublish(claim))) {
-      console.log(`[pr-review] !${prId}@${meta.headSha.slice(0, 8)} is not queued in the ledger (already published?), marking task`);
+      const row = await reviewForSha(claim);
+      if (row?.status === 'publishing') continue;
+      console.log(`[pr-review] !${prId}@${meta.headSha.slice(0, 8)} is ${row?.status || 'missing'} in the ledger, marking task`);
       await db.run(`UPDATE tasks SET result = result || ? WHERE id = ?`, [`\n\n${PUBLISHED_MARKER} skipped-by-ledger`, task.id]);
       continue;
     }
@@ -676,7 +679,9 @@ async function publishCompletedReviews(repos, state, { taskId = null } = {}) {
     const priorOpen = before.ok ? countOpenBotThreads(before.threads, MY_EMAIL, { excludeThreadIds: [meta.lockThreadId].filter(Boolean) }) : 0;
     data.verdict = verdictFor(data.findings.length, priorOpen);
     let failures = 0;
+    const alreadyPosted = before.ok ? postedFindingTitles(before.threads, MY_EMAIL) : new Set();
     for (const finding of data.findings) {
+      if (alreadyPosted.has(finding.title)) continue;
       try {
         await writeToAzure(`post finding on !${prId}: ${finding.title}`, () => postFinding(repo, prId, finding));
       } catch (err) {
@@ -905,6 +910,9 @@ export async function runAzurePrReview(sensorCfg = {}) {
   const now = Date.now();
 
   await unblockLoginExpired().catch((err) => console.warn(`[seal:auth] sweep: ${err.message}`));
+  await resumeStalePublishing()
+    .then((resumed) => resumed.forEach((row) => console.warn(`[pr-review] Resuming interrupted publish ${row.repo} !${row.prId}@${row.headSha.slice(0, 8)}`)))
+    .catch((err) => console.warn(`[pr-review] resume publishing: ${err.message}`));
   await releaseOrphanClaims({ maxRetries: MAX_RETRIES })
     .then((released) => released.forEach((orphan) => console.warn(`[pr-review] Released orphan claim ${orphan.repo} !${orphan.prId}@${orphan.headSha.slice(0, 8)} (task: ${orphan.taskStatus || 'missing'})`)))
     .catch((err) => console.warn(`[pr-review] orphan claims: ${err.message}`));
@@ -1068,7 +1076,8 @@ export async function runSinglePrReview({ repoName, prId, sensorCfg = {}, timeou
 
 export async function shouldTickNow() {
   const awaitingPublish = await db.get(
-    `SELECT id FROM tasks WHERE summary LIKE ? AND detail LIKE ? AND status = 'done' AND result IS NOT NULL AND result NOT LIKE ? AND result NOT LIKE ? LIMIT 1`,
+    `SELECT id FROM tasks WHERE summary LIKE ? AND detail LIKE ? AND status = 'done' AND result IS NOT NULL AND result NOT LIKE ? AND result NOT LIKE ?
+       AND id NOT IN (SELECT task_id FROM pr_reviews WHERE status = 'publishing' AND task_id IS NOT NULL) LIMIT 1`,
     [`${SUMMARY_PREFIX}%`, `%${PIPELINE_TAG}%`, `%${PUBLISHED_MARKER}%`, `%${PUBLISH_FAILED_MARKER}%`],
   );
   if (awaitingPublish) return 'review-finished';

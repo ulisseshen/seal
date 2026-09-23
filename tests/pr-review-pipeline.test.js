@@ -14,6 +14,7 @@ import {
   formatFindingComment,
   formatSummaryComment,
   isMarkedSent,
+  postedFindingTitles,
   sentKey,
   applyUsScenarioFinding,
   countOpenBotThreads,
@@ -367,4 +368,15 @@ test('a nudge marked as sent stays quiet until there is a new reason; time-based
   assert.equal(isMarkedSent(sent, 10116, openLong, now), true);
   assert.equal(isMarkedSent(sent, 10116, openLong, now + 24 * 60 * 60 * 1000), false);
   assert.equal(isMarkedSent({}, 10116, blocker, now), false);
+});
+
+test('a resumed publish skips findings already on the PR, matched by title', () => {
+  const threads = [
+    { comments: [myComment('**[WARNING] Falta teste do fechamento**\n\ncorpo')] },
+    { comments: [myComment('**[BLOCKER · Documentação] PR sem US vinculada**')] },
+    { comments: [{ author: { uniqueName: AUTHOR }, content: '**[WARNING] Falta teste do fechamento**' }] },
+    { comments: [{ ...myComment('**[NIT] apagado**'), isDeleted: true }] },
+  ];
+  assert.deepEqual([...postedFindingTitles(threads, ME)].sort(), ['Falta teste do fechamento', 'PR sem US vinculada']);
+  assert.equal(formatFindingComment({ severity: 'WARNING', kind: 'code', title: 'Falta teste do fechamento' }).match(/^\*\*\[[^\]]+\]\s*(.+?)\*\*/)[1], 'Falta teste do fechamento');
 });

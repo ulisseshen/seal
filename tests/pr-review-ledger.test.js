@@ -70,3 +70,17 @@ test('a stale claim superseded by a newer commit of the same PR is released even
   assert.deepEqual((await ledger.releaseOrphanClaims({ maxAgeMinutes: 10 })).map((row) => row.headSha), ['old1']);
   assert.equal((await ledger.reviewForSha(current)).status, 'queued');
 });
+
+test('a publish interrupted mid-way goes back to queued after the grace period, a recent one is left alone', async () => {
+  const stuck = { repo: 'r', prId: 5, headSha: 'pub1' };
+  const recent = { repo: 'r', prId: 6, headSha: 'pub2' };
+  for (const claim of [stuck, recent]) {
+    await ledger.claimReview({ ...claim, mode: 'first-review', taskId: `seal_pr_${claim.prId}` });
+    assert.equal(await ledger.beginPublish(claim), true);
+  }
+  await db.run(`UPDATE pr_reviews SET publish_started_at = datetime('now', '-30 minutes') WHERE pr_id = 5`);
+  assert.deepEqual((await ledger.resumeStalePublishing({ maxAgeMinutes: 10 })).map((row) => row.prId), [5]);
+  assert.equal((await ledger.reviewForSha(stuck)).status, 'queued');
+  assert.equal((await ledger.reviewForSha(recent)).status, 'publishing');
+  assert.equal(await ledger.beginPublish(stuck), true);
+});
