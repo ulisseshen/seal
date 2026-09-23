@@ -86,8 +86,17 @@ function resolveOcrBin() {
 
 const OCR_BIN = resolveOcrBin();
 
-const fallbackMcpConfig = () => ({
-  mcpServers: { 'azure-devops': { type: 'stdio', command: 'npx', args: ['@azure-devops/mcp', ORG], env: {} } },
+const MCP_DOMAINS = ['core', 'repositories', 'work-items'];
+
+const reviewMcpConfig = () => ({
+  mcpServers: {
+    'azure-devops': {
+      type: 'stdio',
+      command: 'npx',
+      args: ['-y', '@azure-devops/mcp', ORG, '--authentication', 'pat', '-d', ...MCP_DOMAINS],
+      env: { PERSONAL_ACCESS_TOKEN: '${PERSONAL_ACCESS_TOKEN}' },
+    },
+  },
 });
 
 export function configureAzure(sensorCfg = {}) {
@@ -95,6 +104,9 @@ export function configureAzure(sensorCfg = {}) {
   PROJECT = process.env.SEAL_AZURE_PROJECT || sensorCfg.azure_pr_review_project || '';
   MY_EMAIL = (process.env.SEAL_AZURE_MY_EMAIL || sensorCfg.azure_pr_review_my_email || '').toLowerCase();
   ORG_BASE = `https://dev.azure.com/${ORG}/${PROJECT}/_apis`;
+  if (PAT && MY_EMAIL && !process.env.PERSONAL_ACCESS_TOKEN) {
+    process.env.PERSONAL_ACCESS_TOKEN = Buffer.from(`${MY_EMAIL}:${PAT}`).toString('base64');
+  }
   const missing = [
     !ORG && 'azure_pr_review_org',
     !PROJECT && 'azure_pr_review_project',
@@ -305,10 +317,7 @@ async function createWorktree(repo, pr, headSha) {
   if (fs.existsSync(nodeModules) && !fs.existsSync(path.join(wtPath, 'node_modules'))) {
     fs.symlinkSync(nodeModules, path.join(wtPath, 'node_modules'));
   }
-  const projectMcp = path.join(repo.projectDir, '.mcp.json');
-  const worktreeMcp = path.join(wtPath, '.mcp.json');
-  if (fs.existsSync(projectMcp)) fs.copyFileSync(projectMcp, worktreeMcp);
-  else fs.writeFileSync(worktreeMcp, JSON.stringify(fallbackMcpConfig(), null, 2));
+  fs.writeFileSync(path.join(wtPath, '.mcp.json'), JSON.stringify(reviewMcpConfig(), null, 2));
 
   return { wtPath, mergeBase, sourceBranch, targetBranch };
 }
