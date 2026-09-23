@@ -77,7 +77,7 @@ import { startWeb } from './web.js';
 import { ensureDefaultProfiles } from './sandbox.js';
 import { loadPolicy, policyRuleCount } from './policy.js';
 import { runPrWatcher } from './sensors/pr-watcher.js';
-import { runAzurePrReview } from './sensors/azure-pr-review.js';
+import { runAzurePrReview, shouldTickNow } from './sensors/azure-pr-review.js';
 import { ensurePalace } from './memory.js';
 import { isRtkAvailable, getStats as getRtkStats } from './rtk.js';
 import { loadFlows } from './flows/engine.js';
@@ -602,17 +602,34 @@ function startSensors() {
   }
 
   const AZURE_PR_INTERVAL = (cfg.sensors?.azure_pr_review_interval_min || 5) * 60 * 1000;
-  if (cfg.sensors?.azure_pr_review !== false) {
-    console.log(`[seal] azure-pr-review sensor enabled (every ${AZURE_PR_INTERVAL / 60_000} min)`);
-    const tickAzurePr = async () => {
+  const AZURE_PR_WATCH_MS = (cfg.sensors?.azure_pr_review_watch_sec || 20) * 1000;
+  if (cfg.sensors?.azure_pr_review === true) {
+    console.log(`[seal] azure-pr-review sensor enabled (every ${AZURE_PR_INTERVAL / 60_000} min, watch ${AZURE_PR_WATCH_MS / 1000}s)`);
+    let ticking = false;
+    const tickAzurePr = async (reason = 'interval') => {
+      if (ticking) return;
+      ticking = true;
       try {
-        await runAzurePrReview();
+        if (reason !== 'interval') console.log(`[seal] azure-pr-review early tick: ${reason}`);
+        await runAzurePrReview(cfg.sensors || {});
       } catch (err) {
         console.error('[seal] azure-pr-review error:', err.message);
+      } finally {
+        ticking = false;
       }
     };
-    sensorTimers.push(setInterval(tickAzurePr, AZURE_PR_INTERVAL));
-    sensorTimers.push(setTimeout(tickAzurePr, 8_000));
+    const watchAzurePr = async () => {
+      if (ticking) return;
+      try {
+        const reason = await shouldTickNow();
+        if (reason) await tickAzurePr(reason);
+      } catch (err) {
+        console.error('[seal] azure-pr-review watch error:', err.message);
+      }
+    };
+    sensorTimers.push(setInterval(() => tickAzurePr('interval'), AZURE_PR_INTERVAL));
+    sensorTimers.push(setInterval(watchAzurePr, AZURE_PR_WATCH_MS));
+    sensorTimers.push(setTimeout(() => tickAzurePr('startup'), 8_000));
   }
 }
 
