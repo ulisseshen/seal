@@ -688,6 +688,11 @@ export async function updateStatus(id, status, result = null) {
   `, [status, result, status, id]);
 }
 
+export async function deferTask(id, executeAt, result = null) {
+  return db.run(`UPDATE tasks SET status = 'pending', execute_at = ?, result = ?, completed_at = NULL WHERE id = ?`,
+    [executeAt, result, id]);
+}
+
 /**
  * Apaga uma tarefa de vez. Usado pela correção do áudio ("apaga 2"): quando o
  * SEAL quebra uma fala em itens e erra um, o item errado tem que sumir — marcar

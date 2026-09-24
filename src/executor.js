@@ -9,6 +9,7 @@ import {
   insertTaskRun,
   finishTaskRun,
   setFiring,
+  deferTask,
   db,
 } from './db.js';
 import { notifyTaskLifecycle } from './channel-notify.js';
@@ -18,6 +19,10 @@ import { evaluatePolicy } from './policy.js';
 import { prefetch, sync as memorySync } from './memory.js';
 import { enhancePrompt, compressOutput, isRtkAvailable } from './rtk.js';
 import { checkClaudeAuth, LOGIN_EXPIRED_RESULT } from './auth.js';
+import {
+  parseUsageLimit, resumeAt, usageLimitResult, usageLimitMessage, markUsageLimit, usagePausedUntil,
+  RESUME_GRACE_MS, USAGE_LIMIT_PREFIX,
+} from './usage-limit.js';
 import { getClaudeBin } from './claude-bin.js';
 import { computeNextRun } from './recurrence.js';
 import path from 'path';
@@ -123,6 +128,14 @@ export async function executeTask(task) {
     // Don't fail tasks just because the probe itself crashed — let the
     // normal flow run and surface the real error if any.
     console.warn(`[seal:auth] Pre-flight check errored (continuing): ${err.message}`);
+  }
+
+  const pausedUntil = usagePausedUntil();
+  if (pausedUntil) {
+    const at = new Date(pausedUntil.getTime() + RESUME_GRACE_MS).toISOString();
+    await deferTask(task.id, at, `${USAGE_LIMIT_PREFIX} aguardando o reset do limite do Claude`);
+    console.log(`[seal:usage] ${task.id} adiada para ${at}: limite do Claude esgotado`);
+    return;
   }
 
   running++;
@@ -315,6 +328,17 @@ export async function executeTask(task) {
         // Detect Anthropic API auth failures in stdout/stderr — pre-flight probe
         // sometimes passes (cached/stale token) but the real API call returns 401.
         const combinedOutput = `${stdout}\n${stderr}`;
+        const usageLimit = parseUsageLimit(combinedOutput);
+        if (usageLimit) {
+          const at = resumeAt(usageLimit);
+          await deferTask(task.id, at.toISOString(), usageLimitResult(usageLimit));
+          console.warn(`[seal:usage] ${task.id} bateu no limite ${usageLimit.kind} do Claude; retoma em ${at.toISOString()}`);
+          if (markUsageLimit(usageLimit)) {
+            await notifyTaskLifecycle(task, 'failed', usageLimitMessage(usageLimit, task.summary));
+          }
+          resolve();
+          return;
+        }
         const isApiAuthError = /Invalid authentication credentials|API Error: 401|authentication_error/i.test(combinedOutput);
 
         let error;

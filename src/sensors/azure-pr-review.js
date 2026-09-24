@@ -4,7 +4,8 @@ import { fileURLToPath } from 'url';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { insertTaskIfNew, insertEvent, db, updateLastNotified } from '../db.js';
+import { insertTaskIfNew, insertEvent, db, updateLastNotified, deferTask } from '../db.js';
+import { parseUsageLimit, resumeAt, usageLimitResult, isUsageLimitResult } from '../usage-limit.js';
 import { notify } from '../notify.js';
 import { checkClaudeAuth, isLoginExpiredResult } from '../auth.js';
 import { VOTE_MAP } from './azure-pr-review-logic.js';
@@ -946,6 +947,20 @@ async function clearZombieLocks(repo, pr, threads) {
   return true;
 }
 
+async function usageLimitOf(taskId, result) {
+  if (isUsageLimitResult(result)) {
+    const resetAt = Date.parse(result.split('resets ').pop());
+    if (Number.isFinite(resetAt)) return { kind: result.split(' ')[2] || 'usage', resetAt: new Date(resetAt) };
+  }
+  const run = await db.get(
+    `SELECT stdout_preview, stderr_preview, finished_at FROM task_runs WHERE task_id = ? ORDER BY started_at DESC LIMIT 1`,
+    [taskId],
+  );
+  if (!run) return null;
+  const failedAt = run.finished_at ? new Date(run.finished_at) : new Date();
+  return parseUsageLimit(`${run.stdout_preview || ''}\n${run.stderr_preview || ''}`, failedAt);
+}
+
 async function retryFailedReviews(repos) {
   const recoverable = ['sigterm', 'exit code 143', 'exit code -2', 'orphaned', 'enoent', 'no such file', 'worktree missing'];
   const failed = await db.all(
@@ -955,6 +970,13 @@ async function retryFailedReviews(repos) {
   for (const task of failed) {
     const result = task.result || '';
     if (isLoginExpiredResult(result)) continue;
+    const usageLimit = await usageLimitOf(task.id, result);
+    if (usageLimit) {
+      const at = resumeAt(usageLimit);
+      await deferTask(task.id, at.toISOString(), usageLimitResult(usageLimit));
+      console.log(`[pr-review] ${task.id} parou no limite ${usageLimit.kind} do Claude; retoma em ${at.toISOString()}`);
+      continue;
+    }
     const retryCount = task.retry_count || 0;
     const isRecoverable = result === '' || recoverable.some((pattern) => result.toLowerCase().includes(pattern));
     if (isRecoverable && retryCount < MAX_RETRIES && fs.existsSync(task.project || '')) {
@@ -968,6 +990,12 @@ async function retryFailedReviews(repos) {
     }
     notify({ ...task, summary: `FAILED: ${task.summary} — ${result.slice(0, 200) || 'unknown'}`, priority: 'high' }, 'sticky');
     await updateLastNotified(task.id);
+    const partMeta = parseDetailTagged(task.detail, PART_TAG);
+    if (partMeta && (retryCount >= MAX_RETRIES || !isRecoverable)) {
+      await db.run(`UPDATE tasks SET status = 'archived' WHERE id = ?`, [task.id]);
+      console.log(`[pr-review] ${task.id} arquivada sem conserto; a consolidação segue sem essa parte`);
+      continue;
+    }
     const meta = parseDetail(task.detail);
     const repo = meta && repos.find((candidate) => candidate.name === meta.repo);
     if (repo && (retryCount >= MAX_RETRIES || !isRecoverable)) {
