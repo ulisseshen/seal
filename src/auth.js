@@ -86,7 +86,7 @@ function probeClaudeAuth() {
 
     const timer = setTimeout(() => {
       try { proc.kill('SIGKILL'); } catch {}
-      finish({ ok: false, reason: 'auth probe timeout' });
+      finish({ ok: true, uncertain: true, reason: 'auth probe timeout' });
     }, AUTH_PROBE_TIMEOUT_MS);
 
     proc.stdout.on('data', (d) => { stdout += d.toString(); });
@@ -118,10 +118,8 @@ function probeClaudeAuth() {
         'oauth',
       ];
       const looksLikeAuth = authMarkers.some((m) => out.includes(m));
-      const reason = looksLikeAuth
-        ? `auth failure (exit ${code})`
-        : `claude probe failed (exit ${code})`;
-      finish({ ok: false, reason });
+      if (looksLikeAuth) return finish({ ok: false, reason: `auth failure (exit ${code})` });
+      finish({ ok: true, uncertain: true, reason: `claude probe failed (exit ${code})` });
     });
   });
 }
