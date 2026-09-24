@@ -16,6 +16,7 @@ try {
   sensorCfg = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.config', 'seal', 'ingest.json'), 'utf8')).sensors || {};
 } catch {}
 
-const outcome = await runSinglePrReview({ repoName: args.repo, prId: Number(args.pr), sensorCfg });
+const timeoutMs = (Number(args['timeout-min']) || 45) * 60 * 1000;
+const outcome = await runSinglePrReview({ repoName: args.repo, prId: Number(args.pr), sensorCfg, timeoutMs });
 console.log(JSON.stringify(outcome, null, 2));
 process.exit(0);

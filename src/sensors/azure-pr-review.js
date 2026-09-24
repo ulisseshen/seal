@@ -1237,9 +1237,12 @@ export async function runSinglePrReview({ repoName, prId, sensorCfg = {}, timeou
     if (task && ['done', 'failed', 'archived'].includes(task.status)) break;
     await sleep(pollMs);
   }
-  if (!task || task.status !== 'done') {
-    await finishReview({ repo: repo.name, prId, headSha: gate.headSha, status: 'failed', error: `task ${task?.status || 'timeout'}` });
-    return { failed: task?.status || 'timeout', result: task?.result?.slice(0, 500) };
+  if (!task || !['done', 'failed', 'archived'].includes(task.status)) {
+    return { waiting: true, note: 'o runner continua a revisão e publica sozinho quando terminar' };
+  }
+  if (task.status !== 'done') {
+    await finishReview({ repo: repo.name, prId, headSha: gate.headSha, status: 'failed', error: `task ${task.status}` });
+    return { failed: task.status, result: task.result?.slice(0, 500) };
   }
   const state = readReviewState();
   const published = await publishCompletedReviews(repos, state, { taskId });
