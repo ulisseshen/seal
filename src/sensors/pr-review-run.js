@@ -16,6 +16,13 @@ try {
   sensorCfg = JSON.parse(fs.readFileSync(path.join(os.homedir(), '.config', 'seal', 'ingest.json'), 'utf8')).sensors || {};
 } catch {}
 
+if (args['requeue-parts']) {
+  const { requeueReviewParts } = await import('./azure-pr-review.js');
+  const parts = String(args['requeue-parts']).split(',').map(Number).filter(Number.isFinite);
+  console.log(JSON.stringify(await requeueReviewParts({ repoName: args.repo, prId: Number(args.pr), parts, sensorCfg }), null, 2));
+  process.exit(0);
+}
+
 const timeoutMs = (Number(args['timeout-min']) || 45) * 60 * 1000;
 const outcome = await runSinglePrReview({ repoName: args.repo, prId: Number(args.pr), sensorCfg, timeoutMs });
 console.log(JSON.stringify(outcome, null, 2));

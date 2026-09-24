@@ -305,7 +305,11 @@ Veredito — **a regra é do sensor e você a revisa**:
 
 ## Saída
 
-Sua mensagem final termina **exatamente** com este bloco (JSON válido, sem comentários):
+**Primeiro grave o resultado em arquivo:** use a ferramenta Write para salvar o objeto JSON (só o JSON, sem os
+delimitadores) no caminho `resultFile` do contexto (`.seal-review/result.json`, ou
+`.seal-review/part-<id>/result.json` no modo parte). É esse arquivo que o sensor lê: a saída de texto pode ser
+cortada em resultado grande. Depois, sua mensagem final termina **exatamente** com o mesmo conteúdo neste bloco
+(JSON válido, sem comentários):
 
 ```
 <<<SEAL_REVIEW_JSON

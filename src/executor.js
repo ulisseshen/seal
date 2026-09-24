@@ -277,7 +277,7 @@ export async function executeTask(task) {
       }
 
       if (code === 0) {
-        const result = stdout.trim().slice(0, 50000);
+        const result = stdout.trim().slice(0, 500000);
 
         // ─── Memory sync (MemPalace) — store outcome ────
         try {
@@ -437,7 +437,7 @@ async function executeShellTask(task) {
       }
 
       if (code === 0) {
-        const result = stdout.trim().slice(0, 50000);
+        const result = stdout.trim().slice(0, 500000);
         await updateStatus(task.id, 'done', result);
         console.log(`[executor] Shell task ${task.id} completed successfully`);
 

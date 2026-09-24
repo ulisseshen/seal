@@ -468,6 +468,24 @@ function buildPartPrompt(part, total) {
   ].join('\n');
 }
 
+function readResultFile(file) {
+  try {
+    const raw = fs.readFileSync(file, 'utf8').trim();
+    return raw ? `${RESULT_BLOCK_START}\n${raw}\n${RESULT_BLOCK_END}` : null;
+  } catch {
+    return null;
+  }
+}
+
+function parseTaskResult(taskResult, resultFile) {
+  const fromFile = resultFile ? readResultFile(resultFile) : null;
+  if (fromFile) {
+    const parsed = parseReviewResult(fromFile);
+    if (parsed.ok) return parsed;
+  }
+  return parseReviewResult(taskResult);
+}
+
 function buildPrompt() {
   return [
     `Read ${PIPELINE_SKILL_PATH} and follow it exactly.`,
@@ -495,7 +513,7 @@ async function enqueueReview(args) {
   }
 }
 
-async function prepareAndQueue({ repo, repos, pr, gate, sensorCfg }) {
+async function prepareAndQueue({ repo, repos, pr, gate, sensorCfg, onlyParts = null }) {
   const prId = pr.pullRequestId;
   const workItemIds = await getWorkItemIds(repo, prId);
   const workItems = await getWorkItemsWithStories(workItemIds);
@@ -548,11 +566,12 @@ async function prepareAndQueue({ repo, repos, pr, gate, sensorCfg }) {
     ? plan.chunks.map((chunk) => ({ ...chunk, diffCommand: `git diff ${mergeBase}..${gate.headSha} -- ${chunk.paths.map((file) => `'${file.replace(/'/g, "'\\''")}'`).join(' ')}` }))
     : [];
   context.review = chunked ? 'consolidate-parts' : 'single';
+  context.resultFile = '.seal-review/result.json';
   context.plan = { totalLines: plan.totalLines, totalFiles: plan.totalFiles, docLines: plan.docLines, parts: parts.map(({ paths, diffCommand, ...rest }) => ({ ...rest, files: paths.length })) };
   if (chunked) context.partsFindingsFile = '.seal-review/parts-findings.json';
   fs.writeFileSync(path.join(contextDir, 'context.json'), JSON.stringify(context, null, 2));
   for (const part of parts) {
-    fs.writeFileSync(path.join(contextDir, `part-${part.id}.json`), JSON.stringify({ ...context, review: 'part', part, partsTotal: parts.length }, null, 2));
+    fs.writeFileSync(path.join(contextDir, `part-${part.id}.json`), JSON.stringify({ ...context, review: 'part', part, partsTotal: parts.length, resultFile: `.seal-review/part-${part.id}/result.json` }, null, 2));
   }
 
   const lock = await writeToAzure(`post lock on ${repo.name} !${prId}`, () =>
@@ -610,6 +629,7 @@ async function prepareAndQueue({ repo, repos, pr, gate, sensorCfg }) {
     const saved = await upsertReviewTask(task);
     if (!saved) throw new Error(`task ${task.id} is still active`);
     for (const part of parts) {
+      if (onlyParts && !onlyParts.includes(part.id)) continue;
       const partSaved = await upsertReviewTask({
         ...task,
         id: `${task.id}_p${part.id}`,
@@ -737,7 +757,7 @@ async function publishCompletedReviews(repos, state, { taskId = null } = {}) {
       continue;
     }
     const pr = await getPrById(prId);
-    const parsed = parseReviewResult(task.result);
+    const parsed = parseTaskResult(task.result, task.project ? path.join(task.project, '.seal-review', 'result.json') : null);
 
     if (!parsed.ok && (task.retry_count || 0) < 1) {
       console.warn(`[pr-review] !${prId}: unusable result (${parsed.error}), retrying the review once`);
@@ -838,7 +858,7 @@ async function advanceChunkedReviews() {
     const summary = parts
       .sort((left, right) => left.meta.part - right.meta.part)
       .map((row) => {
-        const parsed = row.status === 'done' ? parseReviewResult(row.result) : { ok: false, error: `parte ${row.status}` };
+        const parsed = row.status === 'done' ? parseTaskResult(row.result, path.join(main.project, '.seal-review', `part-${row.meta.part}`, 'result.json')) : { ok: false, error: `parte ${row.status}` };
         return {
           part: row.meta.part,
           kind: row.meta.kind,
@@ -1388,3 +1408,20 @@ export async function processNextChatRequest(sensorCfg = {}) {
 }
 
 export const hasPendingChat = () => pendingChatRequests().length > 0;
+
+export async function requeueReviewParts({ repoName, prId, parts: onlyParts, sensorCfg = {} }) {
+  const missing = configureAzure(sensorCfg);
+  if (missing.length > 0) throw new Error(`ingest.json sensors is missing ${missing.join(', ')}`);
+  const repos = resolveReviewRepos(sensorCfg.azure_pr_review_repos);
+  const repo = repos.find((candidate) => candidate.name === repoName);
+  if (!repo) throw new Error(`repo ${repoName} is not configured`);
+  const pr = await azRequest('GET', repoUrl(repo, `/pullRequests/${prId}`));
+  const headSha = (pr.lastMergeSourceCommit?.commitId || '').toLowerCase();
+  const row = await reviewForSha({ repo: repo.name, prId, headSha });
+  if (!row) throw new Error(`no ledger row for !${prId}@${headSha.slice(0, 8)}; run a normal review instead`);
+  if (!['failed', 'queued'].includes(row.status)) throw new Error(`ledger row is ${row.status}; nothing to recover`);
+  await db.run(`UPDATE pr_reviews SET status = 'queued', error = NULL, finished_at = NULL WHERE id = ?`, [row.id]);
+  const gate = { action: row.mode, headSha, previousSha: null };
+  await prepareAndQueue({ repo, repos, pr, gate, sensorCfg, onlyParts });
+  return { requeued: onlyParts, headSha };
+}
