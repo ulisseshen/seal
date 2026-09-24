@@ -22,6 +22,8 @@ import {
   buildThreadPayload,
   checkTargetBranch,
   countOpenBotThreads,
+  needsChunking,
+  planReviewChunks,
   verdictFor,
   countBySeverity,
   deriveVerdict,
@@ -63,6 +65,8 @@ const API_VERSION = 'api-version=7.1';
 
 const SUMMARY_PREFIX = 'smart-review PR #';
 const PIPELINE_TAG = 'pr-review-pipeline:v2';
+const PART_TAG = 'pr-review-part:v1';
+const WAITING_FOR_PARTS_AT = '9999-12-31T00:00:00.000Z';
 const WORKTREE_ROOT = process.env.SEAL_PR_WORKTREE_ROOT || path.join(os.homedir(), '.seal-worktrees');
 const PIPELINE_SKILL_PATH = path.resolve(HERE, '..', '..', 'skills', 'pr-review-pipeline', 'SKILL.md');
 const DEFAULT_START = '2026-09-23T00:00:00Z';
@@ -442,6 +446,28 @@ async function findPairContext(repo, repos, pr, workItemIds) {
   return contexts;
 }
 
+async function planForDiff(wtPath, mergeBase, headSha) {
+  const out = await git(wtPath, ['diff', '--numstat', `${mergeBase}..${headSha}`], 60_000).catch(() => '');
+  const rows = out
+    .split('\n')
+    .filter(Boolean)
+    .map((line) => {
+      const [added, deleted, ...rest] = line.split('\t');
+      return { added: added === '-' ? 0 : added, deleted: deleted === '-' ? 0 : deleted, path: rest.join('\t') };
+    });
+  return planReviewChunks(rows);
+}
+
+function buildPartPrompt(part, total) {
+  return [
+    `Read ${PIPELINE_SKILL_PATH} and follow it exactly, in the "Modo parte" section.`,
+    `You review ONLY part ${part.id} of ${total}. The part context is in .seal-review/part-${part.id}.json (relative to the current directory).`,
+    'This is an unattended run: never ask the user anything, never post, vote, edit files, commit or push.',
+    `Write any intermediate file under .seal-review/part-${part.id}/ so parallel parts never overwrite each other.`,
+    `Your final message MUST end with the result block delimited by ${RESULT_BLOCK_START} and ${RESULT_BLOCK_END}.`,
+  ].join('\n');
+}
+
 function buildPrompt() {
   return [
     `Read ${PIPELINE_SKILL_PATH} and follow it exactly.`,
@@ -516,7 +542,18 @@ async function prepareAndQueue({ repo, repos, pr, gate, sensorCfg }) {
     pair,
     resultBlock: { start: RESULT_BLOCK_START, end: RESULT_BLOCK_END },
   };
+  const plan = await planForDiff(wtPath, mergeBase, gate.headSha);
+  const chunked = repo.chunkReviews !== false && needsChunking(plan);
+  const parts = chunked
+    ? plan.chunks.map((chunk) => ({ ...chunk, diffCommand: `git diff ${mergeBase}..${gate.headSha} -- ${chunk.paths.map((file) => `'${file.replace(/'/g, "'\\''")}'`).join(' ')}` }))
+    : [];
+  context.review = chunked ? 'consolidate-parts' : 'single';
+  context.plan = { totalLines: plan.totalLines, totalFiles: plan.totalFiles, docLines: plan.docLines, parts: parts.map(({ paths, diffCommand, ...rest }) => ({ ...rest, files: paths.length })) };
+  if (chunked) context.partsFindingsFile = '.seal-review/parts-findings.json';
   fs.writeFileSync(path.join(contextDir, 'context.json'), JSON.stringify(context, null, 2));
+  for (const part of parts) {
+    fs.writeFileSync(path.join(contextDir, `part-${part.id}.json`), JSON.stringify({ ...context, review: 'part', part, partsTotal: parts.length }, null, 2));
+  }
 
   const lock = await writeToAzure(`post lock on ${repo.name} !${prId}`, () =>
     azRequest('POST', repoUrl(repo, `/pullRequests/${prId}/threads`), {
@@ -541,8 +578,10 @@ async function prepareAndQueue({ repo, repos, pr, gate, sensorCfg }) {
       targetGate,
       testSkills: conventions.repoSkills.map((skill) => skill.name).filter((name) => /test|tdd/i.test(name)),
       prUrl: prWebUrl(repo.name, prId),
+      chunked,
+      parts: parts.length,
     }),
-    execute_at: new Date().toISOString(),
+    execute_at: chunked ? WAITING_FOR_PARTS_AT : new Date().toISOString(),
     recurrence: null,
     next_run: null,
     prompt: buildPrompt(),
@@ -563,12 +602,26 @@ async function prepareAndQueue({ repo, repos, pr, gate, sensorCfg }) {
   };
 
   if (TEST_DRY) {
+    if (chunked) console.log(`[pr-review] [dry] WOULD SPLIT ${repo.name} !${prId} into ${parts.length} parts: ${parts.map((part) => `${part.id}:${part.kind}:${part.lines}`).join(' ')}`);
     console.log(`[pr-review] [dry] WOULD CREATE task ${task.id} (${repo.name}, ${gate.action}, ${branchOf(pr.sourceRefName)} → ${targetBranch}, gate=${targetGate ? targetGate.severity : 'ok'}, pair=${pair.map((paired) => `${paired.repo}!${paired.prId}[${paired.reasons}]`).join(',') || '-'}, us=${workItemIds.join(',') || '-'})`);
     return false;
   }
   try {
     const saved = await upsertReviewTask(task);
     if (!saved) throw new Error(`task ${task.id} is still active`);
+    for (const part of parts) {
+      const partSaved = await upsertReviewTask({
+        ...task,
+        id: `${task.id}_p${part.id}`,
+        summary: `${SUMMARY_PREFIX}${prId}: parte ${part.id}/${parts.length} ${part.label}`.slice(0, 80),
+        detail: JSON.stringify({ tag: PART_TAG, repo: repo.name, prId, headSha: gate.headSha, part: part.id, parts: parts.length, kind: part.kind, label: part.label }),
+        execute_at: new Date().toISOString(),
+        prompt: buildPartPrompt(part, parts.length),
+        session_id: null,
+      });
+      if (!partSaved) throw new Error(`part ${part.id} of ${task.id} is still active`);
+    }
+    if (chunked) console.log(`[pr-review] ${repo.name} !${prId} split into ${parts.length} parts (${plan.totalLines} lines of code, ${plan.docLines} of docs)`);
     return true;
   } catch (err) {
     if (lock?.id && lock?.comments?.[0]?.id) {
@@ -761,6 +814,48 @@ async function publishCompletedReviews(repos, state, { taskId = null } = {}) {
     console.log(`[pr-review] Published !${prId} (${repo.name}): ${data.verdict}, ${data.findings.length} finding(s)`);
   }
   return published;
+}
+
+const parseDetailTagged = (detail, tag) => {
+  try {
+    const parsed = JSON.parse(detail || '');
+    return parsed?.tag === tag ? parsed : null;
+  } catch {
+    return null;
+  }
+};
+
+async function advanceChunkedReviews() {
+  const waiting = await db.all(`SELECT id, detail, project FROM tasks WHERE summary LIKE ? AND status = 'pending' AND execute_at = ?`, [`${SUMMARY_PREFIX}%`, WAITING_FOR_PARTS_AT]);
+  let released = 0;
+  for (const main of waiting) {
+    const meta = parseDetail(main.detail);
+    if (!meta?.chunked) continue;
+    const partRows = await db.all(`SELECT id, status, result, retry_count, detail FROM tasks WHERE id LIKE ?`, [`${main.id}_p%`]);
+    const parts = partRows.map((row) => ({ ...row, meta: parseDetailTagged(row.detail, PART_TAG) })).filter((row) => row.meta && row.meta.headSha === meta.headSha);
+    const finished = (row) => row.status === 'done' || row.status === 'archived' || (row.status === 'failed' && (row.retry_count || 0) >= MAX_RETRIES);
+    if (parts.length < meta.parts || !parts.every(finished)) continue;
+    const summary = parts
+      .sort((left, right) => left.meta.part - right.meta.part)
+      .map((row) => {
+        const parsed = row.status === 'done' ? parseReviewResult(row.result) : { ok: false, error: `parte ${row.status}` };
+        return {
+          part: row.meta.part,
+          kind: row.meta.kind,
+          label: row.meta.label,
+          ok: parsed.ok,
+          error: parsed.ok ? null : parsed.error,
+          summary: parsed.ok ? parsed.data.summary : null,
+          findings: parsed.ok ? parsed.data.findings.map((finding) => ({ ...finding, sources: [...new Set([...finding.sources, `part-${row.meta.part}`])] })) : [],
+        };
+      });
+    fs.writeFileSync(path.join(main.project, '.seal-review', 'parts-findings.json'), JSON.stringify({ parts: summary }, null, 2));
+    await db.run(`UPDATE tasks SET execute_at = ? WHERE id = ? AND status = 'pending' AND execute_at = ?`, [new Date().toISOString(), main.id, WAITING_FOR_PARTS_AT]);
+    released++;
+    const failed = summary.filter((part) => !part.ok);
+    console.log(`[pr-review] !${meta.prId}: ${summary.length} parts done (${failed.length} failed), releasing consolidation`);
+  }
+  return released;
 }
 
 async function unblockLoginExpired() {
@@ -967,6 +1062,7 @@ export async function runAzurePrReview(sensorCfg = {}) {
   await releaseOrphanClaims({ maxRetries: MAX_RETRIES })
     .then((released) => released.forEach((orphan) => console.warn(`[pr-review] Released orphan claim ${orphan.repo} !${orphan.prId}@${orphan.headSha.slice(0, 8)} (task: ${orphan.taskStatus || 'missing'})`)))
     .catch((err) => console.warn(`[pr-review] orphan claims: ${err.message}`));
+  await advanceChunkedReviews().catch((err) => console.warn(`[pr-review] parts: ${err.message}`));
   await publishCompletedReviews(repos, state).catch((err) => console.warn(`[pr-review] publish: ${err.message}`));
   await archiveMootTasks().catch((err) => console.warn(`[pr-review] archive: ${err.message}`));
   await cleanupWorktrees(repos).catch((err) => console.warn(`[pr-review] cleanup: ${err.message}`));
@@ -1159,6 +1255,13 @@ export async function shouldTickNow() {
     [`${SUMMARY_PREFIX}%`, `%${PIPELINE_TAG}%`, `%${PUBLISHED_MARKER}%`, `%${PUBLISH_FAILED_MARKER}%`],
   );
   if (awaitingPublish) return 'review-finished';
+  const waitingParts = await db.get(
+    `SELECT main.id FROM tasks main WHERE main.summary LIKE ? AND main.status = 'pending' AND main.execute_at = ?
+       AND NOT EXISTS (SELECT 1 FROM tasks part WHERE part.id LIKE main.id || '_p%' AND part.status IN ('pending', 'running', 'firing'))
+     LIMIT 1`,
+    [`${SUMMARY_PREFIX}%`, WAITING_FOR_PARTS_AT],
+  );
+  if (waitingParts) return 'parts-finished';
   if (lastBacklog === 0) return null;
   const inFlight = await db.get(`SELECT id FROM tasks WHERE summary LIKE ? AND status IN ('pending', 'running', 'firing') LIMIT 1`, [`${SUMMARY_PREFIX}%`]);
   return inFlight ? null : 'backlog-free-slot';

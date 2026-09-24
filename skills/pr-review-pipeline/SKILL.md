@@ -25,6 +25,28 @@ revisão), mas os achados continuam valendo contra o estado final do código.
 
 Guarde os artefatos intermediários em `.seal-review/` (é descartável).
 
+## PR grande: modo parte e modo consolidação
+
+Quando o diff revisável (sem lockfile, screenshot, golden e build) passa de ~1.500 linhas, o sensor divide a PR
+em partes por área e roda uma task por parte, depois uma consolidação. O campo `review` do contexto diz o modo:
+
+- `single` — PR normal: siga o grafo inteiro abaixo.
+- `part` — **Modo parte**. O contexto é `.seal-review/part-<id>.json`, e `part` traz `kind`, `label`, `paths` e
+  `diffCommand` (o diff **só** desses arquivos). Rode apenas as etapas que dependem do código da parte:
+  1 (checklist OCR dos arquivos da parte), 3 (skill do repo sobre esse diff), 4 (arquitetura), 5 (regras de
+  negócio) e 6 (testes). **Não** rode par, US nem cobrança de documentação da PR (isso é da consolidação).
+  Leia código fora da parte só para entender um uso ou contrato; não reporte achado fora dela.
+  Com `kind: "docs"`, a revisão é leve: o texto bate com o código? contradiz o `CLAUDE.md`/`CONTEXT.md`? promete
+  comportamento que não existe? Nada de OCR, regras de negócio ou testes.
+  Grave arquivos intermediários só em `.seal-review/part-<id>/`. Emita o bloco final normal, com `findings`
+  e um `summary` de 1 frase sobre a parte (`usCoverage` e `pairedPrs` vazios).
+- `consolidate-parts` — **Modo consolidação**. Não revise o diff de novo. Leia `partsFindingsFile`, que traz os
+  achados de cada parte (e quais partes falharam), e rode as etapas da PR inteira: 2 (par), 7 (cenários da US —
+  os testes podem estar em qualquer parte; use `diffCommand` com `--stat` e leia só os testes que precisar), 8
+  (documentação) e 9 (consolidação: deduplique achados repetidos entre partes, verifique cada BLOCKER lendo o
+  código, remova o que já está postado e aberto). Parte com `ok: false` entra no `summary` como "parte N (label)
+  não foi revisada" — não invente achados dela. O bloco final é o de sempre, com todos os achados da PR.
+
 ## Grafo de comportamento
 
 Siga este grafo. Cada nó só avança com a saída do anterior; nenhum nó posta nada.

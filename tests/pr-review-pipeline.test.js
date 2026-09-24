@@ -15,6 +15,9 @@ import {
   formatSummaryComment,
   isMarkedSent,
   postedFindingTitles,
+  planReviewChunks,
+  needsChunking,
+  isGeneratedPath,
   buildChatPrompt,
   parseChatReply,
   findingThreadIdsByTitle,
@@ -407,4 +410,36 @@ test('finding threads are found by title, only among the bot own threads', () =>
     { id: 13, comments: [myComment(`resumo\n${reviewedMarker(HEAD)}`)] },
   ];
   assert.deepEqual([...findingThreadIdsByTitle(threads, ME)], [['firstAllowedDay supõe ordem', 11]]);
+});
+
+test('generated files never enter the review', () => {
+  for (const file of ['package-lock.json', 'a/b/pubspec.lock', 'tests/vrt/__screenshots__/x.png', 'c/__golden__/menu.html', 'dist/index.js', 'x.snap']) {
+    assert.equal(isGeneratedPath(file), true, file);
+  }
+  assert.equal(isGeneratedPath('components/atoms/buttons/SmartButton.vue'), false);
+});
+
+test('a big PR is split by area, each part under the line and file caps, nothing lost', () => {
+  const rows = [
+    ...Array.from({ length: 30 }, (_, index) => ({ path: `components/atoms/buttons/B${String(index).padStart(2, '0')}.vue`, added: 40, deleted: 0 })),
+    { path: 'tokens/base.css', added: 200, deleted: 30 },
+    { path: 'tokens/Colors.stories.ts', added: 360, deleted: 0 },
+    { path: 'scripts/generate-facts.mjs', added: 430, deleted: 0 },
+    { path: 'package-lock.json', added: 5000, deleted: 200 },
+    { path: 'README.md', added: 20, deleted: 1 },
+  ];
+  const plan = planReviewChunks(rows, { maxLines: 900, maxFiles: 25 });
+  assert.equal(plan.totalFiles, 33);
+  assert.deepEqual(plan.chunks.filter((chunk) => chunk.kind === 'docs').map((chunk) => chunk.paths), [['README.md']]);
+  assert.equal(needsChunking(plan), true);
+  assert.ok(plan.chunks.filter((chunk) => chunk.kind === 'code').every((chunk) => chunk.lines <= 900 && chunk.paths.length <= 25));
+  const covered = plan.chunks.flatMap((chunk) => chunk.paths).sort();
+  assert.deepEqual(covered, rows.map((row) => row.path).filter((file) => file !== 'package-lock.json').sort());
+  assert.ok(plan.chunks.some((chunk) => chunk.label.includes('components/atoms/buttons')));
+});
+
+test('a small PR stays in one pass', () => {
+  const plan = planReviewChunks([{ path: 'src/a.ts', added: 100, deleted: 10 }, { path: 'src/b.ts', added: 50, deleted: 0 }]);
+  assert.equal(plan.chunks.length, 1);
+  assert.equal(needsChunking(plan), false);
 });

@@ -430,3 +430,74 @@ export function findingThreadIdsByTitle(threads, myEmail) {
   }
   return byTitle;
 }
+
+const GENERATED_PATH = /(^|\/)(package-lock\.json|yarn\.lock|pnpm-lock\.yaml|pubspec\.lock)$|\.(png|jpe?g|gif|webp|ico|snap)$|(^|\/)__golden__\/|(^|\/)__screenshots__\/|(^|\/)(dist|build|coverage)\//i;
+
+export const isGeneratedPath = (file) => GENERATED_PATH.test(file);
+
+const DOC_PATH = /(^|\/)docs\/|\.(md|mdx)$/i;
+
+export const isDocPath = (file) => DOC_PATH.test(file);
+
+function areaOf(file) {
+  const parts = file.split('/');
+  if (parts[0] === 'components' && parts.length > 3) return parts.slice(0, 3).join('/');
+  if (['src', 'lib', 'test', 'tests'].includes(parts[0]) && parts.length > 3) return parts.slice(0, 3).join('/');
+  if (parts.length > 2) return parts.slice(0, 2).join('/');
+  if (parts.length === 2) return parts[0];
+  return '(raiz)';
+}
+
+export function planReviewChunks(rows, { maxLines = 1500, maxFiles = 40 } = {}) {
+  const all = (rows || [])
+    .filter((row) => row.path && !isGeneratedPath(row.path))
+    .map((row) => ({ path: row.path, lines: (Number(row.added) || 0) + (Number(row.deleted) || 0) }));
+  const docs = all.filter((row) => isDocPath(row.path));
+  const reviewable = all.filter((row) => !isDocPath(row.path));
+  const areas = new Map();
+  for (const row of reviewable) {
+    const area = areaOf(row.path);
+    areas.set(area, [...(areas.get(area) || []), row]);
+  }
+  const chunks = [];
+  let current = null;
+  const flush = () => {
+    if (current && current.paths.length > 0) chunks.push(current);
+    current = null;
+  };
+  for (const [area, files] of [...areas.entries()].sort(([left], [right]) => left.localeCompare(right))) {
+    const areaLines = files.reduce((sum, file) => sum + file.lines, 0);
+    if (areaLines > maxLines || files.length > maxFiles) {
+      flush();
+      let part = null;
+      for (const file of [...files].sort((left, right) => left.path.localeCompare(right.path))) {
+        if (part && (part.lines + file.lines > maxLines || part.paths.length >= maxFiles)) {
+          chunks.push(part);
+          part = null;
+        }
+        part = part || { areas: [area], paths: [], lines: 0 };
+        part.paths.push(file.path);
+        part.lines += file.lines;
+      }
+      current = part;
+      continue;
+    }
+    if (current && (current.lines + areaLines > maxLines || current.paths.length + files.length > maxFiles)) flush();
+    current = current || { areas: [], paths: [], lines: 0 };
+    current.areas.push(area);
+    current.paths.push(...files.map((file) => file.path));
+    current.lines += areaLines;
+  }
+  flush();
+  const planned = chunks.map((chunk) => ({ kind: 'code', label: chunk.areas.join(', '), paths: chunk.paths, lines: chunk.lines }));
+  if (docs.length > 0) planned.push({ kind: 'docs', label: 'documentação', paths: docs.map((row) => row.path), lines: docs.reduce((sum, row) => sum + row.lines, 0) });
+  return {
+    totalLines: reviewable.reduce((sum, row) => sum + row.lines, 0),
+    totalFiles: reviewable.length,
+    docLines: docs.reduce((sum, row) => sum + row.lines, 0),
+    chunks: planned.map((chunk, index) => ({ id: index + 1, ...chunk })),
+  };
+}
+
+export const needsChunking = (plan, { maxLines = 1500, maxFiles = 40 } = {}) =>
+  plan.chunks.length > 1 && (plan.totalLines > maxLines || plan.totalFiles > maxFiles);
