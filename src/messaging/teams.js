@@ -8,7 +8,7 @@ export class TeamsConnector extends MessagingConnector {
     super('teams', 'Microsoft Teams');
     this.url = url.replace(/\/$/, '');
     this.fetch = fetchImpl;
-    this.capabilities = ['send_direct', 'list_conversations'];
+    this.capabilities = ['send_direct', 'list_conversations', 'resolve_person'];
   }
 
   async request(pathname, { method = 'GET', body, timeoutMs = QUICK_TIMEOUT_MS } = {}) {
@@ -34,8 +34,22 @@ export class TeamsConnector extends MessagingConnector {
     }
   }
 
+  async resolvePerson(query) {
+    const data = await this.request(`/api/people/resolve?q=${encodeURIComponent(query)}`, { timeoutMs: 120_000 });
+    return { status: data.status, person: data.person || null, candidates: data.candidates || [], rule: data.rule || null };
+  }
+
   async sendDirect(person, text) {
-    const to = person?.email || person?.name;
+    let to = person?.email || null;
+    if (!to && person?.name) {
+      const resolved = await this.resolvePerson(person.name);
+      if (resolved.status !== 'ok' || !resolved.person?.email) {
+        throw new Error(resolved.status === 'ambiguous'
+          ? `"${person.name}" bate com ${resolved.candidates.length} pessoas no Teams`
+          : `"${person.name}" não está no diretório do Teams`);
+      }
+      to = resolved.person.email;
+    }
     if (!to) throw new Error('destinatário sem e-mail nem nome');
     const data = await this.request('/api/send', {
       method: 'POST',

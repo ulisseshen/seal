@@ -3,6 +3,8 @@ import fs from 'fs';
 import { db, getRepoProfile, listRepoProfiles } from './db.js';
 import { loadConfig, CONFIG_PATH } from './config.js';
 import { onboardRepo } from './brain/onboard.js';
+import { triggerAction } from './actions/hub.js';
+import { getMessagingConnector, readMessagingConfig } from './messaging/index.js';
 
 const PORT = parseInt(process.env.SEAL_WEB_PORT || '3457', 10);
 
@@ -52,6 +54,11 @@ async function getTask(id) {
 
 async function handleAPI(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
+
+  if (url.pathname === '/api/actions/teams-message' && req.method === 'POST') {
+    await draftMessage(req, res);
+    return true;
+  }
 
   if (url.pathname === '/api/stats') {
     const stats = await getStats();
@@ -208,6 +215,41 @@ async function handleAPI(req, res) {
   }
 
   return false;
+}
+
+const LOCAL_ADDRESSES = new Set(['127.0.0.1', '::1', '::ffff:127.0.0.1']);
+
+async function draftMessage(req, res) {
+  if (!LOCAL_ADDRESSES.has(req.socket.remoteAddress)) {
+    res.writeHead(403, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify({ ok: false, error: 'only local callers can draft messages' }));
+    return;
+  }
+  let payload;
+  try { payload = JSON.parse(await readBody(req)); } catch { payload = null; }
+  const to = String(payload?.to || '').trim();
+  const message = String(payload?.message || '').trim();
+  const reply = (code, body) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(body)); };
+  if (!to || !message) return reply(400, { ok: false, error: 'Provide "to" (name or e-mail) and "message".' });
+  if (message.length > 4000) return reply(400, { ok: false, error: 'message too long (max 4000 characters)' });
+  const config = readMessagingConfig();
+  const connector = getMessagingConnector(payload?.connector || config.default);
+  if (!connector.supports('resolve_person')) return reply(400, { ok: false, error: `${connector.label} cannot resolve people` });
+  const resolved = await connector.resolvePerson(to);
+  if (resolved.status === 'ambiguous') {
+    return reply(409, { ok: false, status: 'ambiguous', error: `"${to}" matches ${resolved.candidates.length} people; use the e-mail`, candidates: resolved.candidates.slice(0, 15) });
+  }
+  if (resolved.status !== 'ok' || !resolved.person?.email) {
+    return reply(404, { ok: false, status: 'not_found', error: `"${to}" is not in the ${connector.label} directory` });
+  }
+  const actionId = await triggerAction('mensagem', {
+    connector: connector.id,
+    author: { name: resolved.person.name, email: resolved.person.email },
+    message,
+    origin: String(payload?.origin || 'sessão do Claude (MCP)').slice(0, 120),
+  });
+  if (!actionId) return reply(503, { ok: false, error: 'SEAL action system is not ready' });
+  return reply(202, { ok: true, status: 'awaiting_approval', actionId, to: resolved.person });
 }
 
 function readBody(req) {

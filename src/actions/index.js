@@ -35,6 +35,7 @@ export function createActionRegistry({ db, gateway, engine, insertTask }) {
   registry.register(new AssignWorkItemAction());
   registry.register(new NudgeBehaviorAction(db));
   registry.register(new SendChargeAction());
+  registry.register(new SendChargeAction({ name: 'mensagem', description: 'Envia uma mensagem direta pelo app de mensagens da empresa, depois da sua aprovação' }));
 
   // Wire up gateway callbacks
   registry.setupGatewayCallbacks();

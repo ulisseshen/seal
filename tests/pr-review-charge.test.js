@@ -53,16 +53,16 @@ test('marca enviada sem apagar marcas anteriores', () => {
   assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).sent, { 'old:x:': '2026-01-01', '10110:blocker:t': '2026-09-25T10:05:00Z' });
 });
 
-test('conector do Teams manda para o teamsbot o nome e o texto', async () => {
+test('conector do Teams manda para o teamsbot o e-mail e o texto', async () => {
   const calls = [];
   const fetchImpl = async (url, opts) => {
     calls.push({ url, body: JSON.parse(opts.body) });
     return { ok: true, status: 200, json: async () => ({ ok: true, to: 'Bruno Lima Costa', sentAt: '2026-09-25T10:05:00Z' }) };
   };
   const teams = new TeamsConnector({ url: 'http://127.0.0.1:4317/', fetchImpl });
-  const res = await teams.sendDirect({ name: 'Bruno Lima Costa' }, 'oi');
+  const res = await teams.sendDirect({ name: 'Bruno Lima Costa', email: 'pessoa@example.com' }, 'oi');
   assert.equal(calls[0].url, 'http://127.0.0.1:4317/api/send');
-  assert.deepEqual(calls[0].body, { to: 'Bruno Lima Costa', message: 'oi', headless: true });
+  assert.deepEqual(calls[0].body, { to: 'pessoa@example.com', message: 'oi', headless: true });
   assert.equal(res.sentAt, '2026-09-25T10:05:00Z');
 });
 
@@ -222,4 +222,40 @@ test('oferta que o Telegram não entregou é reenviada, não expira', async () =
   } finally {
     globalThis.setTimeout = originalSetTimeout;
   }
+});
+
+test('conector resolve a pessoa pelo teamsbot e manda pelo e-mail resolvido', async () => {
+  const calls = [];
+  const fetchImpl = async (url, opts) => {
+    calls.push({ url, body: opts?.body ? JSON.parse(opts.body) : null });
+    if (url.includes('/api/people/resolve')) {
+      return { ok: true, status: 200, json: async () => ({ ok: true, status: 'ok', person: { name: 'Diego Rocha Nunes', email: 'pessoa@example.com' } }) };
+    }
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  const teams = new TeamsConnector({ fetchImpl });
+  await teams.sendDirect({ name: 'Bruno Nunes' }, 'oi');
+  assert.match(calls[0].url, /\/api\/people\/resolve\?q=Bruno%20Zerino$/);
+  assert.equal(calls[1].body.to, 'pessoa@example.com');
+});
+
+test('nome ambíguo não envia para ninguém', async () => {
+  const sends = [];
+  const fetchImpl = async (url, opts) => {
+    if (url.includes('/api/people/resolve')) {
+      return { ok: true, status: 200, json: async () => ({ ok: true, status: 'ambiguous', candidates: [{ name: 'A' }, { name: 'B' }] }) };
+    }
+    sends.push(opts);
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  const teams = new TeamsConnector({ fetchImpl });
+  await assert.rejects(teams.sendDirect({ name: 'Bruno' }, 'oi'), /bate com 2 pessoas/);
+  assert.equal(sends.length, 0);
+});
+
+test('ação mensagem mostra destinatário com e-mail e quem pediu', async () => {
+  const action = new SendChargeAction({ name: 'mensagem', connectorFor: () => fakeConnector().connector, markSent: () => {} });
+  assert.equal(action.name, 'mensagem');
+  const preview = await action.preview({ author: { name: 'Bruno Nunes', email: 'pessoa@example.com' }, message: 'oi', origin: 'sessão do Claude Code (MCP do Teams)' });
+  assert.match(preview.summary, /para Bruno Nunes <Bruno\.Nunes@empresa\.com>\?\nPedido por: sessão do Claude Code/);
 });
