@@ -54,7 +54,7 @@ export function upsertPrEntry(state, pr, repoName, org, project) {
     title: pr.title,
     author: authorName,
     authorFirstName: authorName.split(' ')[0] || authorName,
-    authorEmail: (pr.createdBy?.uniqueName || '').toLowerCase(),
+    authorEmail: (pr.createdBy?.uniqueName || previous.authorEmail || '').toLowerCase(),
     url: `https://dev.azure.com/${org}/${project}/_git/${repoName}/pullrequest/${pr.pullRequestId}`,
     createdAt: pr.creationDate,
     status: pr.status || 'active',

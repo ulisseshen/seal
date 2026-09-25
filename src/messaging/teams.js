@@ -35,8 +35,8 @@ export class TeamsConnector extends MessagingConnector {
   }
 
   async sendDirect(person, text) {
-    const to = person?.name;
-    if (!to) throw new Error('destinatário sem nome');
+    const to = person?.email || person?.name;
+    if (!to) throw new Error('destinatário sem e-mail nem nome');
     const data = await this.request('/api/send', {
       method: 'POST',
       body: { to, message: text, headless: true },

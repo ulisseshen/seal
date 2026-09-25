@@ -8,6 +8,10 @@
 
 import crypto from 'crypto';
 
+const NETWORK_ERROR_RE = /EFATAL|ECONNRESET|EADDRNOTAVAIL|ETIMEDOUT|ENOTFOUND|EAI_AGAIN|socket hang up|fetch failed/i;
+const OFFER_RETRIES = 5;
+const OFFER_RETRY_BASE_MS = 15_000;
+
 export class ActionRegistry {
   /**
    * @param {object} db - SEAL database wrapper
@@ -73,16 +77,7 @@ export class ActionRegistry {
     };
 
     try {
-      // gateway.confirm() returns a promise that resolves when user clicks
-      // We don't await it here — the callback handler will process it
-      this.gateway.confirm(confirmAction).then(
-        (result) => this.handleConfirmation(actionId, result.choice, result.confirmedBy),
-        (err) => {
-          if (/shutting down/i.test(err.message)) return;
-          console.error(`[seal:actions] Confirmation failed for ${actionId}: ${err.message}`);
-          this._updateStatus(actionId, 'expired');
-        },
-      );
+      this._offer(actionId, confirmAction, 0);
     } catch (err) {
       console.error(`[seal:actions] Failed to send confirmation for ${actionId}: ${err.message}`);
       await this._updateStatus(actionId, 'error');
@@ -97,6 +92,23 @@ export class ActionRegistry {
    * @param {string} choice - 'approve' | 'deny' | 'edit'
    * @param {string} confirmedBy - Username/ID of who confirmed
    */
+  _offer(actionId, confirmAction, attempt) {
+    this.gateway.confirm(confirmAction).then(
+      (result) => this.handleConfirmation(actionId, result.choice, result.confirmedBy),
+      (err) => {
+        if (/shutting down/i.test(err.message)) return;
+        if (NETWORK_ERROR_RE.test(err.message) && attempt < OFFER_RETRIES) {
+          const wait = OFFER_RETRY_BASE_MS * 2 ** attempt;
+          console.warn(`[seal:actions] Confirmation ${actionId} not delivered (${err.message}); retrying in ${Math.round(wait / 1000)}s`);
+          setTimeout(() => this._offer(actionId, confirmAction, attempt + 1), wait);
+          return;
+        }
+        console.error(`[seal:actions] Confirmation failed for ${actionId}: ${err.message}`);
+        this._updateStatus(actionId, 'expired');
+      },
+    );
+  }
+
   async handleConfirmation(actionId, choice, confirmedBy) {
     // 1. Load pending action from DB
     const pending = await this.db.get(

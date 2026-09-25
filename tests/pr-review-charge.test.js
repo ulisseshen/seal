@@ -104,7 +104,9 @@ test('falha no envio não marca como enviada', async () => {
   const fake = fakeConnector({ fail: 'teamsbot fora do ar' });
   const marked = [];
   const action = new SendChargeAction({ connectorFor: () => fake.connector, markSent: (keys) => marked.push(...keys) });
-  await assert.rejects(action.execute({ author: { name: 'Bruno' }, message: 'x', sentKeys: ['k1'] }), /fora do ar/);
+  const result = await action.execute({ author: { name: 'Bruno' }, message: 'x', sentKeys: ['k1'] });
+  assert.equal(result.success, false);
+  assert.match(result.message, /teamsbot não respondeu/);
   assert.deepEqual(marked, []);
 });
 
@@ -162,4 +164,62 @@ test('desligar o SEAL não expira a cobrança pendente', async () => {
   const id = await registry.trigger('cobranca', { author: { name: 'Bruno' }, message: 'x' });
   await new Promise((resolve) => setImmediate(resolve));
   assert.equal(db.rows.get(id).status, 'pending');
+});
+
+import { friendlyError } from '../src/actions/send-charge.js';
+import { upsertPrEntry } from '../src/sensors/pr-review-state.js';
+
+test('conector do Teams manda pelo e-mail quando tem, não pelo nome do Azure', async () => {
+  const calls = [];
+  const fetchImpl = async (url, opts) => {
+    calls.push(JSON.parse(opts.body));
+    return { ok: true, status: 200, json: async () => ({ ok: true }) };
+  };
+  const teams = new TeamsConnector({ fetchImpl });
+  await teams.sendDirect({ name: 'Diego Rocha Nunes', email: 'pessoa@example.com' }, 'oi');
+  assert.equal(calls[0].to, 'pessoa@example.com');
+});
+
+test('recusa do Teams vira aviso claro e não marca como enviada', async () => {
+  const marked = [];
+  const connector = {
+    id: 'teams', label: 'Microsoft Teams', supports: () => true,
+    sendDirect: async () => { throw new Error('Refusing to send to "Bruno": open chat header does not match this person.'); },
+  };
+  const action = new SendChargeAction({ connectorFor: () => connector, markSent: (keys) => marked.push(...keys) });
+  const result = await action.execute({ author: { name: 'Diego Rocha Nunes' }, message: 'x', sentKeys: ['k'] });
+  assert.equal(result.success, false);
+  assert.match(result.message, /não enviei para Bruno: o Teams abriu uma conversa que não era dessa pessoa/);
+  assert.match(result.message, /Nada foi enviado/);
+  assert.deepEqual(marked, []);
+  assert.match(friendlyError('Teams web session is not authenticated. Open the login browser first.'), /sessão do Teams web caiu/);
+});
+
+test('se a consulta da PR falhar, o e-mail do autor não se perde', () => {
+  const state = { prs: {} };
+  upsertPrEntry(state, { pullRequestId: 10110, title: 't', status: 'active', createdBy: { displayName: 'Bruno Lima Costa', uniqueName: 'pessoa@example.com' } }, 'app-web', 'org', 'Projeto');
+  const entry = upsertPrEntry(state, { pullRequestId: 10110, title: 't', status: 'active' }, 'app-web', 'org', 'Projeto');
+  assert.equal(entry.authorEmail, 'pessoa@example.com');
+});
+
+test('oferta que o Telegram não entregou é reenviada, não expira', async () => {
+  const db = memoryDb();
+  let calls = 0;
+  const gateway = {
+    onMessage() {}, onOrphanConfirmation() {},
+    confirm: () => { calls += 1; return calls === 1 ? Promise.reject(new Error('EFATAL: Error: read EADDRNOTAVAIL')) : new Promise(() => {}); },
+    send: async () => {},
+  };
+  const originalSetTimeout = globalThis.setTimeout;
+  globalThis.setTimeout = (fn) => { fn(); return 0; };
+  try {
+    const registry = new ActionRegistry(db, gateway, null);
+    registry.register(new SendChargeAction({ connectorFor: () => fakeConnector().connector, markSent: () => {} }));
+    const id = await registry.trigger('cobranca', { author: { name: 'Bruno' }, message: 'x' });
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls, 2);
+    assert.equal(db.rows.get(id).status, 'pending');
+  } finally {
+    globalThis.setTimeout = originalSetTimeout;
+  }
 });
