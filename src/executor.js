@@ -23,6 +23,7 @@ import {
   parseUsageLimit, resumeAt, usageLimitResult, usageLimitMessage, markUsageLimit, usagePausedUntil,
   RESUME_GRACE_MS, USAGE_LIMIT_PREFIX,
 } from './usage-limit.js';
+import { quietUntil, awakeTimer } from './sleep-window.js';
 import { getClaudeBin } from './claude-bin.js';
 import { computeNextRun } from './recurrence.js';
 import path from 'path';
@@ -57,7 +58,16 @@ function nagLoginExpired(reason) {
  * Execute a task by spawning claude -p with the task's meta-prompt.
  * Returns a promise that resolves when claude finishes.
  */
+const TASK_AWAKE_LIMIT_MS = 30 * 60 * 1000;
+
 export async function executeTask(task) {
+  const sleepingUntil = quietUntil();
+  if (sleepingUntil) {
+    await deferTask(task.id, sleepingUntil.toISOString(), task.result || null);
+    console.log(`[seal:sono] ${task.id} adiada para ${sleepingUntil.toISOString()}: o SEAL dorme das 0h às 6h`);
+    return;
+  }
+
   // ─── Policy gate ────────────────────────────────────
   // This runs BEFORE we mark the task as running so the concurrency
   // slot isn't consumed by an ack-blocked task.
@@ -265,7 +275,10 @@ export async function executeTask(task) {
         HOME: process.env.HOME || os.homedir(),
       },
       cwd,
-      timeout: 1800000, // 30 min max per task
+    });
+    const limit = awakeTimer(TASK_AWAKE_LIMIT_MS, ({ awakeMs, sleptMs }) => {
+      console.warn(`[executor] ${task.id} passou de ${Math.round(awakeMs / 60000)} min acordada (dormiu ${Math.round(sleptMs / 60000)} min); encerrando`);
+      proc.kill('SIGTERM');
     });
 
     let stdout = '';
@@ -274,8 +287,10 @@ export async function executeTask(task) {
     proc.stdout.on('data', (data) => { stdout += data.toString(); });
     proc.stderr.on('data', (data) => { stderr += data.toString(); });
 
-    proc.on('close', async (code) => {
+    proc.on('close', async (code, signal) => {
       running--;
+      limit.stop();
+      if (limit.sleptMs() > 0) console.log(`[executor] ${task.id} dormiu ${Math.round(limit.sleptMs() / 60000)} min junto com o Mac`);
 
       // Finish audit record
       try {
@@ -324,7 +339,7 @@ export async function executeTask(task) {
         const message = buildDoneMessage(task, result);
         await notifyTaskLifecycle(task, 'done', message);
       } else {
-        const isSigterm = code === 143;
+        const isSigterm = code === 143 || signal === 'SIGTERM';
         // Detect Anthropic API auth failures in stdout/stderr — pre-flight probe
         // sometimes passes (cached/stale token) but the real API call returns 401.
         const combinedOutput = `${stdout}\n${stderr}`;
@@ -388,6 +403,7 @@ export async function executeTask(task) {
 
     proc.on('error', async (err) => {
       running--;
+      limit.stop();
       try {
         await finishTaskRun(runId, {
           exit_code: -1,
