@@ -6,6 +6,9 @@ import os from 'os';
 import path from 'path';
 import { insertTaskIfNew, insertEvent, db, updateLastNotified, deferTask } from '../db.js';
 import { parseUsageLimit, resumeAt, usageLimitResult, isUsageLimitResult } from '../usage-limit.js';
+import { triggerAction } from '../actions/hub.js';
+import { readMessagingConfig } from '../messaging/index.js';
+import { chargeMessage, chargeKeys } from './pr-review-charge.js';
 import { notify } from '../notify.js';
 import { checkClaudeAuth, isLoginExpiredResult } from '../auth.js';
 import { VOTE_MAP } from './azure-pr-review-logic.js';
@@ -735,6 +738,32 @@ function reviewTelegramText(entry, data, meta) {
   return lines.join('\n');
 }
 
+async function offerCharge(entry, data, meta, priorOpen) {
+  const config = readMessagingConfig();
+  if (config.charge?.enabled === false || !entry.author) return;
+  const message = chargeMessage({
+    author: entry.author,
+    prId: entry.prId,
+    title: entry.title,
+    url: entry.url,
+    verdict: data.verdict,
+    counts: entry.counts,
+    reReview: meta.mode === 're-review',
+    priorOpen,
+  });
+  try {
+    await triggerAction('cobranca', {
+      connector: config.default,
+      author: { name: entry.author, email: entry.authorEmail || null },
+      message,
+      prId: entry.prId,
+      sentKeys: chargeKeys(entry),
+    });
+  } catch (err) {
+    console.warn(`[pr-review] cobrança de !${entry.prId} não foi oferecida: ${err.message}`);
+  }
+}
+
 async function publishCompletedReviews(repos, state, { taskId = null } = {}) {
   const tasks = await db.all(
     `SELECT id, summary, detail, result, retry_count, session_id, project FROM tasks
@@ -829,6 +858,7 @@ async function publishCompletedReviews(repos, state, { taskId = null } = {}) {
     }
 
     await sendTelegram(reviewTelegramText(entry, data, meta));
+    await offerCharge(entry, data, meta, priorOpen);
     await db.run(`UPDATE tasks SET result = result || ? WHERE id = ?`, [`\n\n${PUBLISHED_MARKER} ${data.verdict} findings=${data.findings.length} failures=${failures}`, task.id]);
     await finishReview({ ...claim, status: 'published', verdict: data.verdict, findings: data.findings.length, sessionId: task.session_id, worktree: task.project });
     published++;

@@ -35,6 +35,7 @@ export class GatewayRouter {
    */
   register(plugin) {
     this.plugins.set(plugin.name, plugin);
+    if (this.orphanHandler && typeof plugin.onOrphanConfirmation === 'function') plugin.onOrphanConfirmation(this.orphanHandler);
     console.log(`[seal:gateway] Registered plugin: ${plugin.name} (${plugin.capabilities.join(', ')})`);
   }
 
@@ -118,6 +119,13 @@ export class GatewayRouter {
    * @param {string|number} [target]
    * @returns {Promise<import('./base.js').ConfirmationResult>}
    */
+  onOrphanConfirmation(handler) {
+    this.orphanHandler = handler;
+    for (const [, plugin] of this.plugins) {
+      if (typeof plugin.onOrphanConfirmation === 'function') plugin.onOrphanConfirmation(handler);
+    }
+  }
+
   async confirm(action, target) {
     const channelName = this.defaultChannel;
     const plugin = this.plugins.get(channelName);

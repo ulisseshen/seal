@@ -196,6 +196,10 @@ export class TelegramGateway extends BaseGatewayPlugin {
   /**
    * Graceful shutdown.
    */
+  onOrphanConfirmation(handler) {
+    this.orphanHandler = handler;
+  }
+
   async destroy() {
     // Clear all pending confirmations
     for (const [id, pending] of this.pendingConfirmations) {
@@ -222,6 +226,11 @@ export class TelegramGateway extends BaseGatewayPlugin {
   _resolveConfirmation(actionId, result) {
     const pending = this.pendingConfirmations.get(actionId);
     if (!pending) {
+      if (this.orphanHandler) {
+        console.log(`[seal:gateway:telegram] Confirmation ${actionId} arrived after a restart; resolving from the database`);
+        this.orphanHandler(actionId, result);
+        return;
+      }
       console.log(`[seal:gateway:telegram] No pending confirmation for ${actionId}`);
       return;
     }

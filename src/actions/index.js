@@ -10,9 +10,11 @@ import { CreateTaskAction } from './create-task.js';
 import { SendFollowupAction } from './send-followup.js';
 import { AssignWorkItemAction } from './assign-work-item.js';
 import { NudgeBehaviorAction } from './nudge-behavior.js';
+import { SendChargeAction } from './send-charge.js';
+import { setActionRegistry } from './hub.js';
 
 export { BaseAction } from './base.js';
-export { ActionRegistry, CreateTaskAction, SendFollowupAction, AssignWorkItemAction, NudgeBehaviorAction };
+export { ActionRegistry, CreateTaskAction, SendFollowupAction, AssignWorkItemAction, NudgeBehaviorAction, SendChargeAction };
 
 /**
  * Create and configure an ActionRegistry with all built-in actions.
@@ -32,9 +34,11 @@ export function createActionRegistry({ db, gateway, engine, insertTask }) {
   registry.register(new SendFollowupAction(gateway));
   registry.register(new AssignWorkItemAction());
   registry.register(new NudgeBehaviorAction(db));
+  registry.register(new SendChargeAction());
 
   // Wire up gateway callbacks
   registry.setupGatewayCallbacks();
+  setActionRegistry(registry);
 
   console.log(`[seal:actions] Action system ready (${registry.listActions().length} actions registered)`);
   return registry;

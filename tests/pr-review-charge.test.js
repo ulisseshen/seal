@@ -1,0 +1,165 @@
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
+import { chargeMessage, chargeKeys, markChargeSent } from '../src/sensors/pr-review-charge.js';
+import { TeamsConnector } from '../src/messaging/teams.js';
+import { SendChargeAction } from '../src/actions/send-charge.js';
+import { ActionRegistry } from '../src/actions/registry.js';
+
+const base = {
+  author: 'Bruno Lima Costa', prId: 10110, title: 'Task/store registration invites',
+  url: 'https://dev.azure.com/org/Projeto/_git/app-web/pullrequest/44642',
+};
+
+test('primeira revisão com pendências diz quantas e o que fazer', () => {
+  const msg = chargeMessage({ ...base, verdict: 'needs-work', counts: { blocker: 1, warning: 1, nit: 0 } });
+  assert.match(msg, /^Bruno, a revisão automática da !10110 \(Task\/store registration invites\) terminou: 2 comentários \(1 bloqueador\)\./);
+  assert.match(msg, /depois do push o bot revisa de novo/);
+  assert.ok(msg.endsWith(base.url));
+});
+
+test('re-revisão diz quanto ainda falta e quanto era antes', () => {
+  const msg = chargeMessage({ ...base, verdict: 'needs-work', counts: { warning: 2 }, reReview: true, priorOpen: 5 });
+  assert.match(msg, /re-revisei a !10110 .* depois do seu push: ainda faltam 2 comentários; eram 5\./);
+});
+
+test('re-revisão com um comentário usa singular', () => {
+  const msg = chargeMessage({ ...base, verdict: 'needs-work', counts: { blocker: 1 }, reReview: true, priorOpen: 1 });
+  assert.match(msg, /ainda falta 1 comentário \(1 bloqueador\)\./);
+  assert.doesNotMatch(msg, /eram/);
+});
+
+test('aprovada avisa que passou', () => {
+  assert.match(chargeMessage({ ...base, verdict: 'approved', counts: {}, reReview: true }),
+    /^Bruno, a !10110 .* passou na revisão automática depois do seu push, sem pendências\./);
+});
+
+test('título longo é cortado', () => {
+  const msg = chargeMessage({ ...base, title: 'x'.repeat(120), verdict: 'approved', counts: {} });
+  assert.ok(msg.includes('x'.repeat(59) + '…'));
+});
+
+test('chaves de enviada seguem o formato do painel', () => {
+  const entry = { prId: 10110, needsAction: [{ reason: 'blocker', since: '2026-09-25T10:00:00.000Z' }] };
+  assert.deepEqual(chargeKeys(entry), ['10110:blocker:2026-09-25T10:00:00.000Z']);
+});
+
+test('marca enviada sem apagar marcas anteriores', () => {
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'seal-sent-')), 'sent.json');
+  fs.writeFileSync(file, JSON.stringify({ sent: { 'old:x:': '2026-01-01' } }));
+  markChargeSent(['10110:blocker:t'], '2026-09-25T10:05:00Z', file);
+  assert.deepEqual(JSON.parse(fs.readFileSync(file, 'utf8')).sent, { 'old:x:': '2026-01-01', '10110:blocker:t': '2026-09-25T10:05:00Z' });
+});
+
+test('conector do Teams manda para o teamsbot o nome e o texto', async () => {
+  const calls = [];
+  const fetchImpl = async (url, opts) => {
+    calls.push({ url, body: JSON.parse(opts.body) });
+    return { ok: true, status: 200, json: async () => ({ ok: true, to: 'Bruno Lima Costa', sentAt: '2026-09-25T10:05:00Z' }) };
+  };
+  const teams = new TeamsConnector({ url: 'http://127.0.0.1:4317/', fetchImpl });
+  const res = await teams.sendDirect({ name: 'Bruno Lima Costa' }, 'oi');
+  assert.equal(calls[0].url, 'http://127.0.0.1:4317/api/send');
+  assert.deepEqual(calls[0].body, { to: 'Bruno Lima Costa', message: 'oi', headless: true });
+  assert.equal(res.sentAt, '2026-09-25T10:05:00Z');
+});
+
+test('conector do Teams propaga a recusa do teamsbot', async () => {
+  const fetchImpl = async () => ({ ok: false, status: 500, json: async () => ({ ok: false, error: 'Refusing to send: open chat header does not match' }) });
+  const teams = new TeamsConnector({ fetchImpl });
+  await assert.rejects(teams.sendDirect({ name: 'Bruno' }, 'oi'), /header does not match/);
+});
+
+function fakeConnector({ fail } = {}) {
+  const sent = [];
+  return {
+    sent,
+    connector: {
+      id: 'fake', label: 'Fake', supports: () => true,
+      sendDirect: async (person, text) => {
+        if (fail) throw new Error(fail);
+        sent.push({ person, text });
+        return { ok: true, sentAt: '2026-09-25T10:05:00Z' };
+      },
+    },
+  };
+}
+
+test('ação envia e só então marca como enviada', async () => {
+  const fake = fakeConnector();
+  const marked = [];
+  const action = new SendChargeAction({ connectorFor: () => fake.connector, markSent: (keys) => marked.push(...keys) });
+  const preview = await action.preview({ author: { name: 'Bruno Lima Costa' }, message: 'texto' });
+  assert.equal(preview.summary, '💬 Enviar no Fake para Bruno Lima Costa?');
+  assert.equal(preview.details, 'texto');
+  const result = await action.execute({ author: { name: 'Bruno Lima Costa' }, message: 'texto', sentKeys: ['k1'] });
+  assert.equal(result.success, true);
+  assert.deepEqual(fake.sent, [{ person: { name: 'Bruno Lima Costa' }, text: 'texto' }]);
+  assert.deepEqual(marked, ['k1']);
+});
+
+test('falha no envio não marca como enviada', async () => {
+  const fake = fakeConnector({ fail: 'teamsbot fora do ar' });
+  const marked = [];
+  const action = new SendChargeAction({ connectorFor: () => fake.connector, markSent: (keys) => marked.push(...keys) });
+  await assert.rejects(action.execute({ author: { name: 'Bruno' }, message: 'x', sentKeys: ['k1'] }), /fora do ar/);
+  assert.deepEqual(marked, []);
+});
+
+function memoryDb() {
+  const rows = new Map();
+  return {
+    rows,
+    async run(sql, params) {
+      if (/^\s*INSERT INTO pending_actions/i.test(sql)) {
+        const [id, action_name, context] = params;
+        rows.set(id, { id, action_name, context, status: 'pending' });
+      } else if (/SET status = 'confirmed'/.test(sql)) rows.get(params[2]).status = 'confirmed';
+      else if (/SET status = 'executed'/.test(sql)) rows.get(params[2]).status = 'executed';
+      else if (/SET status = 'error'/.test(sql)) rows.get(params[1]).status = 'error';
+      else if (/SET status = 'denied'/.test(sql)) rows.get(params[2]).status = 'denied';
+      else if (/SET status = \? WHERE id/.test(sql)) rows.get(params[1]).status = params[0];
+      return { changes: 1 };
+    },
+    async get(_sql, params) { return rows.get(params[0]); },
+  };
+}
+
+function gatewayStub({ rejectWith } = {}) {
+  const messages = [];
+  let orphan = null;
+  return {
+    messages,
+    clickAfterRestart: (actionId, choice) => orphan(actionId, { choice, confirmedBy: 'ulisses' }),
+    onMessage() {},
+    onOrphanConfirmation(handler) { orphan = handler; },
+    confirm: () => (rejectWith ? Promise.reject(new Error(rejectWith)) : new Promise(() => {})),
+    send: async (msg) => { messages.push(msg.text); },
+  };
+}
+
+test('clique em Enviar depois de um restart ainda envia', async () => {
+  const db = memoryDb();
+  const gateway = gatewayStub();
+  const fake = fakeConnector();
+  const registry = new ActionRegistry(db, gateway, null);
+  registry.register(new SendChargeAction({ connectorFor: () => fake.connector, markSent: () => {} }));
+  registry.setupGatewayCallbacks();
+  const id = await registry.trigger('cobranca', { author: { name: 'Bruno Lima Costa' }, message: 'texto' });
+  await gateway.clickAfterRestart(id, 'approve');
+  assert.equal(fake.sent.length, 1);
+  assert.equal(db.rows.get(id).status, 'executed');
+  assert.match(gateway.messages.at(-1), /enviada para Bruno no Fake/);
+});
+
+test('desligar o SEAL não expira a cobrança pendente', async () => {
+  const db = memoryDb();
+  const gateway = gatewayStub({ rejectWith: 'Gateway shutting down' });
+  const registry = new ActionRegistry(db, gateway, null);
+  registry.register(new SendChargeAction({ connectorFor: () => fakeConnector().connector, markSent: () => {} }));
+  const id = await registry.trigger('cobranca', { author: { name: 'Bruno' }, message: 'x' });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(db.rows.get(id).status, 'pending');
+});

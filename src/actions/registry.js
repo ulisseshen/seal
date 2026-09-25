@@ -64,10 +64,9 @@ export class ActionRegistry {
         preview.summary,
         '',
         preview.details,
-        '',
-        `Impact: ${preview.impact}`,
+        ...(preview.impact ? ['', `Impact: ${preview.impact}`] : []),
       ].join('\n'),
-      options: [
+      options: preview.options || [
         { label: '✅ Approve', callbackData: 'approve' },
         { label: '❌ Deny', callbackData: 'deny' },
       ],
@@ -79,6 +78,7 @@ export class ActionRegistry {
       this.gateway.confirm(confirmAction).then(
         (result) => this.handleConfirmation(actionId, result.choice, result.confirmedBy),
         (err) => {
+          if (/shutting down/i.test(err.message)) return;
           console.error(`[seal:actions] Confirmation failed for ${actionId}: ${err.message}`);
           this._updateStatus(actionId, 'expired');
         },
@@ -214,6 +214,11 @@ export class ActionRegistry {
         this.handleConfirmation(actionId, choice.toLowerCase(), msg.from);
       }
     });
+
+    if (typeof this.gateway.onOrphanConfirmation === 'function') {
+      this.gateway.onOrphanConfirmation((actionId, result) =>
+        this.handleConfirmation(actionId, result.choice, result.confirmedBy));
+    }
 
     console.log('[seal:actions] Gateway callbacks wired up');
   }
