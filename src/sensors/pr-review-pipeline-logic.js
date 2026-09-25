@@ -12,7 +12,14 @@ const KINDS = ['code', 'test-gap', 'doc-request'];
 const DAY_MS = 24 * 60 * 60 * 1000;
 
 const THREAD_STATUS_ACTIVE = 1;
+const THREAD_STATUS_CLOSED = 4;
 const THREAD_STATUS_PENDING = 6;
+const MISSING_CRITERIA_RE = /\bsem\s+crit[ée]rios?\s+de\s+aceite\b/i;
+export const REMINDER_LABEL = 'LEMBRETE · não bloqueia';
+
+export const isAcceptanceReminder = (finding) => finding?.kind === 'doc-request' && MISSING_CRITERIA_RE.test(finding?.title || '');
+export const isBlocking = (finding) => finding?.blocking !== false;
+export const blockingFindings = (findings) => (findings || []).filter(isBlocking);
 
 export const reviewedMarker = (sha) => `<!-- seal:reviewed ${sha} -->`;
 
@@ -102,13 +109,15 @@ function normalizeFinding(raw) {
   const severity = String(raw?.severity || '').toUpperCase();
   const kind = KINDS.includes(raw?.kind) ? raw.kind : 'code';
   const line = Number.isInteger(raw?.line) && raw.line > 0 ? raw.line : null;
+  const title = String(raw?.title || '').trim();
   return {
     severity: SEVERITIES.includes(severity) ? severity : 'WARNING',
+    blocking: raw?.blocking === false ? false : !isAcceptanceReminder({ kind, title }),
     kind,
     file: raw?.file ? String(raw.file).replace(/^\/+/, '') : null,
     line,
     endLine: Number.isInteger(raw?.endLine) && line && raw.endLine >= line ? raw.endLine : line,
-    title: String(raw?.title || '').trim(),
+    title,
     body: String(raw?.body || '').trim(),
     rule: raw?.rule ? String(raw.rule).trim() : null,
     suggestion: raw?.suggestion ? String(raw.suggestion).trim() : null,
@@ -175,7 +184,7 @@ export function applyUsScenarioFinding(findings, usCoverage, context) {
   return [finding, ...kept];
 }
 
-export const deriveVerdict = (findings) => (findings.length > 0 ? 'needs-work' : 'approved');
+export const deriveVerdict = (findings) => (blockingFindings(findings).length > 0 ? 'needs-work' : 'approved');
 
 export function parseReviewResult(text) {
   const block = extractBlock(text);
@@ -203,8 +212,10 @@ export function parseReviewResult(text) {
   };
 }
 
-export const countBySeverity = (findings) =>
-  SEVERITIES.reduce((counts, severity) => ({ ...counts, [severity.toLowerCase()]: findings.filter((finding) => finding.severity === severity).length }), {});
+export const countBySeverity = (findings) => {
+  const blocking = blockingFindings(findings);
+  return SEVERITIES.reduce((counts, severity) => ({ ...counts, [severity.toLowerCase()]: blocking.filter((finding) => finding.severity === severity).length }), {});
+};
 
 export const threadStatusFor = (severity) => (severity === 'NIT' ? THREAD_STATUS_PENDING : THREAD_STATUS_ACTIVE);
 
@@ -212,7 +223,8 @@ const KIND_LABEL = { 'test-gap': 'Teste faltando', 'doc-request': 'Documentaçã
 
 export function formatFindingComment(finding, { includeLocation = false } = {}) {
   const label = KIND_LABEL[finding.kind] ? ` · ${KIND_LABEL[finding.kind]}` : '';
-  const parts = [`**[${finding.severity}${label}] ${finding.title}**`];
+  const tag = isBlocking(finding) ? `${finding.severity}${label}` : REMINDER_LABEL;
+  const parts = [`**[${tag}] ${finding.title}**`];
   if (includeLocation && finding.file) parts.push(`\`${finding.file}${finding.line ? `:${finding.line}` : ''}\``);
   if (finding.body) parts.push(finding.body);
   const meta = [finding.rule && `**Regra**: ${finding.rule}`, finding.suggestion && `**Sugestão**: ${finding.suggestion}`].filter(Boolean);
@@ -237,14 +249,15 @@ export function countOpenBotThreads(threads, myEmail, { excludeThreadIds = [] } 
     const [first] = thread.comments || [];
     if (!first || first.isDeleted || !isMine(first.author, myEmail)) return false;
     const content = first.content || '';
-    return !content.includes(LOCK_TEXT) && !REVIEWED_MARKER_RE.test(content);
+    return !content.includes(LOCK_TEXT) && !REVIEWED_MARKER_RE.test(content) && !content.startsWith(`**[${REMINDER_LABEL}]`);
   }).length;
 }
 
 export const verdictFor = (newFindings, priorOpen = 0) => (newFindings + priorOpen > 0 ? 'needs-work' : 'approved');
 
 export function formatSummaryComment({ data, headSha, priorOpen = 0 }) {
-  const total = data.findings.length;
+  const total = blockingFindings(data.findings).length;
+  const reminders = data.findings.length - total;
   const pending = total + priorOpen;
   const priorText = priorOpen === 1 ? '1 comentário da revisão anterior continua aberto.' : `${priorOpen} comentários da revisão anterior continuam abertos.`;
   const fallbackReason = total > 0
@@ -258,6 +271,11 @@ export function formatSummaryComment({ data, headSha, priorOpen = 0 }) {
         `${detail ? `${detail} ` : ''}Resolva e faça push: a PR é revisada de novo no próximo commit.`,
       ]
     : ['**✅ Aprovado** — nenhum ponto pendente.'];
+  if (reminders > 0) {
+    lines.push('', reminders === 1
+      ? '📝 1 lembrete para o autor, que não bloqueia a aprovação.'
+      : `📝 ${reminders} lembretes para o autor, que não bloqueiam a aprovação.`);
+  }
   lines.push('', reviewedMarker(headSha));
   return lines.join('\n');
 }
@@ -265,7 +283,7 @@ export function formatSummaryComment({ data, headSha, priorOpen = 0 }) {
 export function buildThreadPayload(finding) {
   const payload = {
     comments: [{ parentCommentId: 0, content: formatFindingComment(finding), commentType: 1 }],
-    status: threadStatusFor(finding.severity),
+    status: isBlocking(finding) ? threadStatusFor(finding.severity) : THREAD_STATUS_CLOSED,
   };
   if (finding.file && finding.line) {
     payload.threadContext = {

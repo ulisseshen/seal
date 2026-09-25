@@ -29,6 +29,7 @@ import {
   needsChunking,
   planReviewChunks,
   verdictFor,
+  blockingFindings,
   countBySeverity,
   deriveVerdict,
   decideReviewGate,
@@ -815,7 +816,7 @@ async function publishCompletedReviews(repos, state, { taskId = null } = {}) {
     threadsCache.delete(`${repo.id}:${prId}`);
     const before = await getThreads(repo, prId);
     const priorOpen = before.ok ? countOpenBotThreads(before.threads, MY_EMAIL, { excludeThreadIds: [meta.lockThreadId].filter(Boolean) }) : 0;
-    data.verdict = verdictFor(data.findings.length, priorOpen);
+    data.verdict = verdictFor(blockingFindings(data.findings).length, priorOpen);
     let failures = 0;
     const alreadyPosted = before.ok ? postedFindingTitles(before.threads, MY_EMAIL) : new Set();
     for (const finding of data.findings) {

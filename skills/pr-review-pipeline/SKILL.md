@@ -72,7 +72,7 @@ flowchart TD
     T --> U{US vinculada?}
     U -- não --> U0[doc-request: vincular US]
     U -- sim --> UC{tem critério de aceite?}
-    UC -- não --> U1[doc-request: pedir critérios<br/>não deduzir do código]
+    UC -- não --> U1[lembrete: pedir critérios<br/>não bloqueia, não deduzir do código]
     UC -- sim --> U2[7. Cenários da US × testes<br/>test-gap por cenário sem teste]
     U0 --> D
     U1 --> D
@@ -263,9 +263,10 @@ A partir de `.seal-review/us.md`:
 
 Casos de borda — cobre em vez de inventar:
 - **Sem work item vinculado** → achado `kind: "doc-request"`, `WARNING`: vincular a US/bug na PR.
-- **Work item sem critério de aceite** (nem na US, nem na Task) → `doc-request`, `WARNING`: pedir os
-  critérios; não deduza cenários do código (isso só confirmaria o que o código faz, não o que deveria
-  fazer). `usCoverage.total = 0`.
+- **Work item sem critério de aceite** (nem na US, nem na Task) → `doc-request` com `"blocking": false`:
+  é um lembrete para o autor pedir os critérios, não um bloqueio. A falta de critério não é do dev e não
+  segura a PR. Título no formato "US N sem critério de aceite". Não deduza cenários do código (isso só
+  confirmaria o que o código faz, não o que deveria fazer). `usCoverage.total = 0`.
 
 ### 8. Cobrança de documentação
 
@@ -333,6 +334,7 @@ cortada em resultado grande. Depois, sua mensagem final termina **exatamente** c
     {
       "severity": "BLOCKER | WARNING | NIT",
       "kind": "code | test-gap | doc-request",
+      "blocking": "true | false (false só para lembrete, ex.: work item sem critério de aceite)",
       "file": "src/caminho/arquivo.ts",
       "line": 42,
       "endLine": 44,
