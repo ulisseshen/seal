@@ -30,6 +30,8 @@ import {
   planReviewChunks,
   verdictFor,
   blockingFindings,
+  relabelAsReminder,
+  severityOfComment,
   countBySeverity,
   deriveVerdict,
   decideReviewGate,
@@ -1484,3 +1486,72 @@ export async function requeueReviewParts({ repoName, prId, parts: onlyParts, sen
   await prepareAndQueue({ repo, repos, pr, gate, sensorCfg, onlyParts });
   return { requeued: onlyParts, headSha };
 }
+
+export async function relabelReminderThreads({ repoName, prId, sensorCfg = {} }) {
+  const missing = configureAzure(sensorCfg);
+  if (missing.length > 0) throw new Error(`ingest.json sensors is missing ${missing.join(', ')}`);
+  const repo = resolveReviewRepos(sensorCfg.azure_pr_review_repos).find((candidate) => candidate.name === repoName);
+  if (!repo) throw new Error(`repo ${repoName} is not configured`);
+  const mine = (comment) => (comment?.author?.uniqueName || '').toLowerCase() === MY_EMAIL;
+  const { ok, threads } = await getThreads(repo, prId);
+  if (!ok) throw new Error(`não consegui ler as threads de !${prId}`);
+
+  const relabeled = [];
+  for (const thread of threads) {
+    const [first] = thread.comments || [];
+    if (!first || first.isDeleted || thread.isDeleted || !mine(first)) continue;
+    const content = relabelAsReminder(first.content);
+    if (!content) continue;
+    await writeToAzure(`relabel reminder on !${prId}`, () => azRequest('PATCH', repoUrl(repo, `/pullRequests/${prId}/threads/${thread.id}/comments/${first.id}`), { content }));
+    await writeToAzure(`close reminder on !${prId}`, () => azRequest('PATCH', repoUrl(repo, `/pullRequests/${prId}/threads/${thread.id}`), { status: 4 }));
+    relabeled.push(thread.id);
+  }
+  if (!relabeled.length) return { prId, relabeled, summaryUpdated: false };
+
+  threadsCache.delete(`${repo.id}:${prId}`);
+  const fresh = (await getThreads(repo, prId)).threads;
+  const openFindings = fresh.filter((thread) => {
+    const [first] = thread.comments || [];
+    return first && !first.isDeleted && !thread.isDeleted && mine(first)
+      && (thread.status === 'active' || thread.status === 1 || thread.status === 'pending' || thread.status === 6)
+      && severityOfComment(first.content);
+  });
+  const counts = { blocker: 0, warning: 0, nit: 0 };
+  for (const thread of openFindings) counts[severityOfComment(thread.comments[0].content).toLowerCase()] += 1;
+  const reminders = fresh.filter((thread) => mine(thread.comments?.[0]) && (thread.comments[0].content || '').startsWith('**[LEMBRETE')).length;
+
+  let summaryUpdated = false;
+  const summary = fresh
+    .filter((thread) => mine(thread.comments?.[0]) && /seal:reviewed\s+([0-9a-f]{7,40})/i.test(thread.comments[0].content || ''))
+    .sort((a, b) => new Date(b.publishedDate || 0) - new Date(a.publishedDate || 0))[0];
+  if (summary) {
+    const first = summary.comments[0];
+    const headSha = /seal:reviewed\s+([0-9a-f]{7,40})/i.exec(first.content)[1];
+    const reason = /^\*\*⏸️ Aguardando autor\*\* — (.*)$/m.exec(first.content)?.[1];
+    const findings = [
+      ...openFindings.map(() => ({ blocking: true })),
+      ...Array.from({ length: reminders }, () => ({ blocking: false })),
+    ];
+    const content = formatSummaryComment({ data: { findings, blockingReason: openFindings.length ? reason : '' }, headSha });
+    await writeToAzure(`refresh summary on !${prId}`, () => azRequest('PATCH', repoUrl(repo, `/pullRequests/${prId}/threads/${summary.id}/comments/${first.id}`), { content }));
+    summaryUpdated = true;
+  }
+
+  let approved = false;
+  if (openFindings.length === 0) {
+    await writeToAzure(`vote approved on !${prId}`, () => setMyVote(prId, VOTE_MAP.approved, repo));
+    approved = true;
+  }
+  const state = readReviewState();
+  const entry = Object.values(state.prs || {}).find((candidate) => candidate.prId === prId);
+  if (entry) {
+    entry.counts = counts;
+    if (approved) {
+      entry.verdict = 'approved';
+      entry.needsAction = (entry.needsAction || []).filter((item) => item.reason !== 'blocker');
+    }
+    if (!TEST_DRY) writeReviewState(state);
+  }
+  return { prId, relabeled, summaryUpdated, counts, stillBlocking: openFindings.length, approved };
+}
+

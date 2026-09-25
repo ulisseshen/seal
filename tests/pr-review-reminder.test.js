@@ -65,3 +65,23 @@ test('resumo aprova e cita o lembrete', () => {
   assert.match(summary, /✅ Aprovado/);
   assert.match(summary, /1 lembrete para o autor, que não bloqueia a aprovação/);
 });
+
+import { relabelAsReminder, severityOfComment } from '../src/sensors/pr-review-pipeline-logic.js';
+
+test('comentário antigo de critério vira lembrete e mantém o corpo', () => {
+  const old = '**[WARNING · Documentação] US 64128 e Task 20226 sem critério de aceite**\n\nPeça os critérios ao PO.';
+  assert.equal(relabelAsReminder(old), '**[LEMBRETE · não bloqueia] US 64128 e Task 20226 sem critério de aceite**\n\nPeça os critérios ao PO.');
+  assert.equal(relabelAsReminder(relabelAsReminder(old)), null);
+});
+
+test('outros comentários do bot não são tocados', () => {
+  assert.equal(relabelAsReminder('**[WARNING · Documentação] Regras novas de anexo da negociação só existem no código**'), null);
+  assert.equal(relabelAsReminder('**[BLOCKER] Bloquear `body` quebra POST /send/push-notification**'), null);
+  assert.equal(relabelAsReminder('🔍 Revisando…'), null);
+});
+
+test('severidade é lida do rótulo, e lembrete não tem severidade', () => {
+  assert.equal(severityOfComment('**[BLOCKER] x**'), 'BLOCKER');
+  assert.equal(severityOfComment('**[WARNING · Teste faltando] x**'), 'WARNING');
+  assert.equal(severityOfComment('**[LEMBRETE · não bloqueia] x**'), null);
+});

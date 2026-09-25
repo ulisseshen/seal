@@ -255,6 +255,25 @@ export function countOpenBotThreads(threads, myEmail, { excludeThreadIds = [] } 
 
 export const verdictFor = (newFindings, priorOpen = 0) => (newFindings + priorOpen > 0 ? 'needs-work' : 'approved');
 
+const FINDING_HEADER_RE = /^\*\*\[([^\]]+)\] ([^\n]*?)\*\*/;
+
+export function relabelAsReminder(content) {
+  const match = FINDING_HEADER_RE.exec(content || '');
+  if (!match) return null;
+  const [header, tag, title] = match;
+  if (tag === REMINDER_LABEL) return null;
+  const kind = /Documentação/.test(tag) ? 'doc-request' : 'code';
+  if (!isAcceptanceReminder({ kind, title })) return null;
+  return content.replace(header, `**[${REMINDER_LABEL}] ${title}**`);
+}
+
+export function severityOfComment(content) {
+  const match = FINDING_HEADER_RE.exec(content || '');
+  if (!match || match[1] === REMINDER_LABEL) return null;
+  const severity = match[1].split(' · ')[0];
+  return SEVERITIES.includes(severity) ? severity : null;
+}
+
 export function formatSummaryComment({ data, headSha, priorOpen = 0 }) {
   const total = blockingFindings(data.findings).length;
   const reminders = data.findings.length - total;
