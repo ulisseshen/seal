@@ -1,4 +1,5 @@
 import { MessagingConnector } from './base.js';
+import { textToTeamsHtml } from './html.js';
 
 const SEND_TIMEOUT_MS = 180_000;
 const QUICK_TIMEOUT_MS = 10_000;
@@ -53,7 +54,7 @@ export class TeamsConnector extends MessagingConnector {
     if (!to) throw new Error('destinatário sem e-mail nem nome');
     const data = await this.request('/api/send', {
       method: 'POST',
-      body: { to, message: text, headless: true },
+      body: { to, message: text, html: textToTeamsHtml(text), headless: true },
       timeoutMs: SEND_TIMEOUT_MS,
     });
     return { ok: true, to: data.to || to, sentAt: data.sentAt || new Date().toISOString() };

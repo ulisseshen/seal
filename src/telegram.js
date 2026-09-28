@@ -1,12 +1,15 @@
 import TelegramBot from 'node-telegram-bot-api';
-import { insertTask } from './db.js';
+import { insertTask, db } from './db.js';
 import { transcribeBuffer } from './transcribe.js';
-import { detectProject, getKnownProjects } from './projects.js';
+import { detectProject, getKnownProjects, readProjectAliases, splitSummary } from './projects.js';
+
+const PROJECT_ANSWER_WINDOW_MS = 10 * 60 * 1000;
 import { resolveSecret } from './config.js';
 import { setSharedBot, getExistingBot } from './gateway/telegram/bot.js';
 import crypto from 'crypto';
 import path from 'path';
 import os from 'os';
+import { recordTelegram } from './telegram-outbox.js';
 
 let bot = null;
 
@@ -110,6 +113,8 @@ export function startTelegram(config) {
       }
 
       const chatId = msg.chat.id;
+      await recordTelegram({ source: 'recebida', text: msg.text || msg.caption || (msg.voice || msg.audio ? '[áudio]' : '[outro]'), ok: true });
+      console.log(`[telegram] recebida: ${(msg.text || msg.caption || '[mídia]').slice(0, 120).replace(/\n/g, ' ')}`);
 
       // Handle voice notes
       if (msg.voice || msg.audio) {
@@ -125,6 +130,7 @@ export function startTelegram(config) {
           return;
         }
 
+        if (await tryHandleRestCommand(msg.text, chatId)) return;
         if (await tryHandleReviewChat(msg, chatId)) return;
 
         // "apaga 2" tem que ser tratado ANTES de tudo, senão vira tarefa nova.
@@ -138,6 +144,26 @@ export function startTelegram(config) {
   });
 
   return bot;
+}
+
+const REST_COMMAND = /^\/(descanso|volta|estado)(?:\s+(\d{1,2}))?\s*$/i;
+const REST_REASON = { manual: 'você pediu', madrugada: 'madrugada (0h–6h)', bateria: 'Mac na bateria' };
+
+async function tryHandleRestCommand(text, chatId) {
+  const match = text.trim().match(REST_COMMAND);
+  if (!match) return false;
+  const { restState, setManualRest } = await import('./rest-mode.js');
+  const command = match[1].toLowerCase();
+  const hours = Number(match[2]) || (command === 'descanso' ? 12 : 3);
+  if (command === 'descanso') setManualRest('on', hours);
+  if (command === 'volta') setManualRest('off', hours);
+  const state = await restState();
+  const text2 = state.resting
+    ? `😴 SEAL em descanso (${REST_REASON[state.reason] || state.reason}). Não abre revisão nem lança o Claude; o que chegar fica na fila.`
+    : `⚡ SEAL trabalhando${state.reason === 'manual' ? ' (você pediu)' : ''}.`;
+  const suffix = command === 'estado' ? '' : `\nVale por ${hours} h; depois volta a regra automática (bateria e 0h–6h).`;
+  await bot.sendMessage(chatId, `${text2}${suffix}`);
+  return true;
 }
 
 const REVIEW_CHAT_COMMAND = /^\/(?:pr|revisor)\s+!?(\d{3,7})\s+([\s\S]+)$/i;
@@ -545,34 +571,24 @@ async function tryRouteToRitual(text, chatId) {
 }
 
 async function handleText(text, chatId, config, { askProject = true } = {}) {
-  // Check if this is a reply to a pending project question
   const pending = pendingProject.get(chatId);
-  if (pending) {
-    const projects = getKnownProjects();
+  if (pending && Date.now() - pending.timestamp < PROJECT_ANSWER_WINDOW_MS) {
     const answer = text.trim().toLowerCase();
-    const match = projects.find(p => p.toLowerCase() === answer);
-
+    const aliases = readProjectAliases();
+    const target = aliases[answer] || answer;
+    const match = getKnownProjects().find((p) => p.toLowerCase() === String(target).toLowerCase());
     if (match) {
-      pending.task.project = path.join(os.homedir(), 'projects', match);
-      await insertTask(pending.task);
       pendingProject.delete(chatId);
-      await bot.sendMessage(chatId, `SEAL: ${pending.task.summary} → ${match}`);
-      console.log(`[telegram] "${pending.task.summary}" → ${match} (${pending.task.id})`);
+      await db.run(`UPDATE tasks SET project = ? WHERE id = ?`, [path.join(os.homedir(), 'projects', match), pending.taskId]);
+      await bot.sendMessage(chatId, `👍 Coloquei em ${answer === match.toLowerCase() ? match : `${answer} (${match})`}.`);
+      console.log(`[telegram] ${pending.taskId} → ${match}`);
       return;
     }
-
-    // Not a valid project — save old task without project, process new message
-    await insertTask(pending.task);
-    pendingProject.delete(chatId);
-    console.log(`[telegram] "${pending.task.summary}" saved without project (${pending.task.id})`);
   }
+  pendingProject.delete(chatId);
 
-  // Detect project
-  const { project, projectName, cleanMessage } = detectProject(text);
-
-  const lines = cleanMessage.split('\n');
-  const summary = lines[0].slice(0, 80);
-  const detail = lines.length > 1 ? lines.slice(1).join('\n').trim() : null;
+  const { project, projectName, alias, cleanMessage } = detectProject(text);
+  const { summary, detail } = splitSummary(cleanMessage);
 
   const task = {
     id: crypto.randomUUID().slice(0, 8),
@@ -595,52 +611,25 @@ async function handleText(text, chatId, config, { askProject = true } = {}) {
     created: new Date().toISOString(),
     max_runs: null,
   };
+  await insertTask(task);
 
-  // Project found → save
   if (project) {
-    await insertTask(task);
-    await bot.sendMessage(chatId, `SEAL: ${summary} → ${projectName}`);
+    await bot.sendMessage(chatId, `📌 Anotei no ${alias || projectName}: ${summary}`);
     console.log(`[telegram] "${summary}" → ${projectName} (${task.id})`);
     return;
   }
 
-  // No project
-  const projects = getKnownProjects();
-
-  if (projects.length <= 1) {
-    if (projects.length === 1) {
-      task.project = path.join(os.homedir(), 'projects', projects[0]);
-    }
-    await insertTask(task);
-    await bot.sendMessage(chatId, `SEAL: ${summary}${projects[0] ? ' → ' + projects[0] : ''}`);
-    console.log(`[telegram] "${summary}" (${task.id})`);
-    return;
-  }
-
-  // Multiple projects — normally ask, but never for voice (see handleVoice).
   if (!askProject) {
-    await insertTask(task);
-    // Veio de áudio: fecha a mensagem de status em vez de deixar "processando"
-    // pendurado e mandar outra embaixo.
     await finishStatus(chatId, `✅ <b>1 item registrado</b>\n\n📘 <b>TAREFA</b>\n     ${esc(summary)}`);
     console.log(`[telegram] "${summary}" saved without project, no prompt (${task.id})`);
     return;
   }
 
-  pendingProject.set(chatId, { task, timestamp: Date.now() });
-
-  // Auto-expire after 5 minutes
-  setTimeout(async () => {
-    const still = pendingProject.get(chatId);
-    if (still && still.task.id === task.id) {
-      await insertTask(still.task);
-      pendingProject.delete(chatId);
-      console.log(`[telegram] "${summary}" expired, saved without project (${task.id})`);
-    }
-  }, 5 * 60 * 1000);
-
-  await bot.sendMessage(chatId, `SEAL: Which project?\n${projects.join(', ')}`);
-  console.log(`[telegram] Asking project for: "${summary}"`);
+  pendingProject.set(chatId, { taskId: task.id, timestamp: Date.now() });
+  const names = Object.keys(readProjectAliases()).slice(0, 4);
+  const hint = names.length ? ` (ex.: ${names.join(', ')})` : '';
+  await bot.sendMessage(chatId, `📌 Anotei: ${summary}\nSe for de algum projeto, me responde só com o nome${hint}.`);
+  console.log(`[telegram] "${summary}" saved without project (${task.id})`);
 }
 
 export function isTelegramConnected() {
@@ -651,7 +640,13 @@ export function isTelegramConnected() {
  * Send a message to a Telegram chat from outside this module (used by executor lifecycle).
  * Returns true on success, false if not connected or send failed.
  */
-export async function sendTelegramMessage(chatId, text, { html = true } = {}) {
+export async function sendTelegramMessage(chatId, text, options = {}) {
+  const ok = await deliverTelegramMessage(chatId, text, options);
+  if (chatId) await recordTelegram({ source: 'notify', text, ok });
+  return ok;
+}
+
+async function deliverTelegramMessage(chatId, text, { html = true } = {}) {
   if (!chatId) return false;
 
   // Envia como HTML por padrão: os rituais chegam formatados por

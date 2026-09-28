@@ -33,6 +33,7 @@
 import { exec } from 'node:child_process';
 import { readFileSync, existsSync, writeFileSync, mkdirSync } from 'node:fs';
 import { join } from 'node:path';
+import { recordTelegram } from '../telegram-outbox.js';
 
 const SEAL_DIR = process.env.SEAL_DIR || join(process.env.HOME, '.config', 'seal');
 const ALERT_CONFIG = join(SEAL_DIR, 'alerts.json');
@@ -124,6 +125,7 @@ async function fireTelegram({ bot_token, chat_id }, summary) {
       disable_web_page_preview: false,
     }),
   });
+  await recordTelegram({ source: 'brain-alert', text: summary, ok: res.ok });
   if (!res.ok) {
     const text = await res.text().catch(() => '');
     throw new Error(`telegram HTTP ${res.status}: ${text.slice(0, 200)}`);

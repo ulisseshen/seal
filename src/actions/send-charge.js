@@ -29,7 +29,7 @@ export class SendChargeAction extends BaseAction {
   async preview(context) {
     const connector = this.connectorFor(context.connector);
     return {
-      summary: `💬 Enviar no ${connector.label} para ${context.author?.name}${context.author?.email ? ` <${context.author.email}>` : ''}?${context.origin ? `\nPedido por: ${context.origin}` : ''}`,
+      summary: `${context.header ? `${context.header}\n\n` : ''}💬 Enviar no ${connector.label} para ${context.author?.name}${context.author?.email ? ` <${context.author.email}>` : ''}?${context.origin ? `\nPedido por: ${context.origin}` : ''}`,
       details: context.message,
       impact: null,
       options: [

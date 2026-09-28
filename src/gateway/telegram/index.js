@@ -1,6 +1,7 @@
 import { BaseGatewayPlugin } from '../base.js';
 import { getOrCreateBot, getExistingBot, destroySharedBot } from './bot.js';
 import { setupCallbackHandlers } from './handlers.js';
+import { recordTelegram } from '../../telegram-outbox.js';
 
 const LEVEL_EMOJI = {
   info: '📋',
@@ -105,6 +106,7 @@ export class TelegramGateway extends BaseGatewayPlugin {
 
     try {
       const sent = await this.bot.sendMessage(chatId, text, opts);
+      await recordTelegram({ source: `gateway:${message.level || 'info'}`, text, ok: true });
       return { delivered: true, messageId: sent.message_id };
     } catch (err) {
       console.error('[seal:gateway:telegram] Send failed:', err.message);
@@ -115,12 +117,14 @@ export class TelegramGateway extends BaseGatewayPlugin {
           delete opts.parse_mode;
           const plainText = `${emoji} [${message.level?.toUpperCase()}]\n\n${message.text}`;
           const sent = await this.bot.sendMessage(chatId, plainText, opts);
+          await recordTelegram({ source: `gateway:${message.level || 'info'}`, text: plainText, ok: true });
           return { delivered: true, messageId: sent.message_id };
         } catch (retryErr) {
           console.error('[seal:gateway:telegram] Retry failed:', retryErr.message);
         }
       }
 
+      await recordTelegram({ source: `gateway:${message.level || 'info'}`, text, ok: false });
       return { delivered: false };
     }
   }
@@ -154,7 +158,13 @@ export class TelegramGateway extends BaseGatewayPlugin {
     };
 
     // Send the confirmation message
-    await this.bot.sendMessage(chatId, text, opts);
+    try {
+      await this.bot.sendMessage(chatId, text, opts);
+    } catch (err) {
+      await recordTelegram({ source: 'approval', text, ok: false });
+      throw err;
+    }
+    await recordTelegram({ source: 'approval', text, ok: true });
 
     // Return a promise that resolves when the user clicks a button
     return new Promise((resolve, reject) => {
