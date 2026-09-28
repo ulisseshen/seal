@@ -50,3 +50,19 @@ test('tempo dormindo não conta para o limite da tarefa', () => {
   timer.stop();
   mock.timers.reset();
 });
+
+test('the sleep tracker notices a gap between ticks and remembers when the Mac woke up', async () => {
+  const { createSleepTracker } = await import('../src/sleep-window.js');
+  let clock = 1_000_000;
+  const tracker = createSleepTracker({ tickMs: 15_000, sleepGapMs: 60_000, now: () => clock });
+  clock += 15_000; tracker.tick();
+  assert.equal(tracker.lastWakeAt(), null);
+  assert.equal(tracker.sleptWithin(3_600_000), false);
+  clock += 15_000 + 20 * 60_000; tracker.tick();
+  assert.equal(tracker.lastWakeAt(), clock);
+  assert.equal(tracker.sleptWithin(3_600_000), true);
+  clock += 61 * 60_000; tracker.tick();
+  assert.equal(tracker.sleptWithin(3_600_000), true, 'a gap in this tick is itself a sleep');
+  for (let i = 0; i < 124; i++) { clock += 15_000; tracker.tick(); }
+  assert.equal(tracker.sleptWithin(30 * 60_000), false);
+});

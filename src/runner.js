@@ -1,3 +1,5 @@
+import './log-timestamps.js';
+import { pendingRestart, readyToRestart, restartNow } from './restart-request.js';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
@@ -78,6 +80,8 @@ import { ensureDefaultProfiles } from './sandbox.js';
 import { loadPolicy, policyRuleCount } from './policy.js';
 import { runPrWatcher } from './sensors/pr-watcher.js';
 import { hasPendingChat, processNextChatRequest, reportStuckTick, runAzurePrReview, shouldTickNow } from './sensors/azure-pr-review.js';
+import { awakeTimer } from './sleep-window.js';
+import { restState } from './rest-mode.js';
 import { ensurePalace } from './memory.js';
 import { isRtkAvailable, getStats as getRtkStats } from './rtk.js';
 import { loadFlows } from './flows/engine.js';
@@ -467,9 +471,23 @@ if (process.env.SEAL_AUTO_ONBOARD !== '1') {
 
 console.log(`[seal] Standing by...`);
 
+let restartLogged = false;
+
 async function pollTasks() {
   try {
     const slots = getRunningSlots();
+    const restart = pendingRestart();
+    if (restart) {
+      const publishing = await db.get(`SELECT COUNT(*) AS n FROM pr_reviews WHERE status = 'publishing'`).catch(() => ({ n: 0 }));
+      if (readyToRestart({ runningTasks: slots.running, publishingReviews: Number(publishing?.n || 0) })) {
+        restartNow(restart);
+      } else if (!restartLogged) {
+        console.log(`[seal:restart] reinício pedido (${restart.reason}); sem tarefa nova até as ${slots.running} em andamento terminarem`);
+        restartLogged = true;
+      }
+      return;
+    }
+    restartLogged = false;
     if (slots.available <= 0) return;
 
     // Atomic claim — marks tasks as 'running' in the same SQL statement so
@@ -607,12 +625,28 @@ function startSensors() {
     console.log(`[seal] azure-pr-review sensor enabled (every ${AZURE_PR_INTERVAL / 60_000} min, watch ${AZURE_PR_WATCH_MS / 1000}s)`);
     const AZURE_PR_TICK_TIMEOUT_MS = (cfg.sensors?.azure_pr_review_tick_timeout_min || 10) * 60 * 1000;
     let ticking = false;
+    let lastRestReason = null;
+    const REST_STATUS_FILE = path.join(os.homedir(), '.config', 'seal', 'run', 'rest-status.json');
     const tickAzurePr = async (reason = 'interval') => {
       if (ticking) return;
+      const rest = await restState(Date.now(), { ignoreBattery: true });
+      try {
+        fs.mkdirSync(path.dirname(REST_STATUS_FILE), { recursive: true });
+        fs.writeFileSync(REST_STATUS_FILE, JSON.stringify({ resting: rest.resting, reason: rest.reason, at: new Date().toISOString() }));
+      } catch {}
+      // A click on "verificar agora" is an explicit ask: it runs one scan even while resting.
+      if (rest.resting && reason !== 'manual') {
+        if (lastRestReason !== rest.reason) console.log(`[seal:descanso] revisão automática pausada: ${rest.reason}`);
+        lastRestReason = rest.reason;
+        return;
+      }
+      if (rest.resting) console.log(`[seal:descanso] varredura pedida à mão, mesmo em descanso (${rest.reason})`);
+      else if (lastRestReason) console.log('[seal:descanso] revisão automática retomada');
+      if (!rest.resting) lastRestReason = null;
       ticking = true;
       let timer;
       const timeout = new Promise((_, reject) => {
-        timer = setTimeout(() => reject(new Error('tick-timeout')), AZURE_PR_TICK_TIMEOUT_MS);
+        timer = awakeTimer(AZURE_PR_TICK_TIMEOUT_MS, () => reject(new Error('tick-timeout')));
       });
       try {
         if (reason !== 'interval') console.log(`[seal] azure-pr-review early tick: ${reason}`);
@@ -621,7 +655,7 @@ function startSensors() {
         console.error('[seal] azure-pr-review error:', err.message);
         if (err.message === 'tick-timeout') await reportStuckTick(AZURE_PR_TICK_TIMEOUT_MS).catch(() => {});
       } finally {
-        clearTimeout(timer);
+        timer?.stop();
         ticking = false;
       }
     };

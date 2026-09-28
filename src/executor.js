@@ -24,6 +24,7 @@ import {
   RESUME_GRACE_MS, USAGE_LIMIT_PREFIX,
 } from './usage-limit.js';
 import { quietUntil, awakeTimer } from './sleep-window.js';
+import { isPrReviewTask, restState } from './rest-mode.js';
 import { getClaudeBin } from './claude-bin.js';
 import { computeNextRun } from './recurrence.js';
 import path from 'path';
@@ -59,6 +60,7 @@ function nagLoginExpired(reason) {
  * Returns a promise that resolves when claude finishes.
  */
 const TASK_AWAKE_LIMIT_MS = 30 * 60 * 1000;
+const REST_RETRY_MS = 15 * 60 * 1000;
 
 export async function executeTask(task) {
   const sleepingUntil = quietUntil();
@@ -66,6 +68,16 @@ export async function executeTask(task) {
     await deferTask(task.id, sleepingUntil.toISOString(), task.result || null);
     console.log(`[seal:sono] ${task.id} adiada para ${sleepingUntil.toISOString()}: o SEAL dorme das 0h às 6h`);
     return;
+  }
+
+  if ((task.executor || 'claude') === 'claude') {
+    const rest = await restState(Date.now(), { ignoreBattery: isPrReviewTask(task.id) });
+    if (rest.resting) {
+      const until = new Date(Date.now() + REST_RETRY_MS).toISOString();
+      await deferTask(task.id, until, task.result || null);
+      console.log(`[seal:descanso] ${task.id} adiada para ${until}: modo descanso (${rest.reason})`);
+      return;
+    }
   }
 
   // ─── Policy gate ────────────────────────────────────

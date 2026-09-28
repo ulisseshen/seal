@@ -2,6 +2,7 @@ import { sendTelegramMessage } from './telegram.js';
 import { sendDiscordMessage } from './discord.js';
 import { sendWhatsAppMessage } from './whatsapp.js';
 import { notify } from './notify.js';
+import { shouldBroadcastLifecycle } from './lifecycle-broadcast.js';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 import os from 'os';
@@ -73,7 +74,7 @@ export async function notifyTaskLifecycle(task, phase, message) {
 
   // 3. Gateway broadcast (fans out to default channel — Telegram).
   //    Skipped when channel === target's channel to avoid duplicate replies.
-  if (gatewayRouter) {
+  if (gatewayRouter && shouldBroadcastLifecycle(task, phase)) {
     try {
       const level =
         phase === 'failed' ? 'urgent' :

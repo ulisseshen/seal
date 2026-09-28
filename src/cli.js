@@ -678,6 +678,15 @@ function cmdStop(args) {
 }
 
 async function cmdRestart(args) {
+  if (!args.includes('--now')) {
+    const { requestRestart, RESTART_REQUEST_FILE } = await import('./restart-request.js');
+    const reason = args.filter((arg) => !arg.startsWith('--')).join(' ') || 'seal restart';
+    requestRestart(reason);
+    console.log(`  Reinício pedido (${reason}): o SEAL termina as tarefas em andamento e reinicia sozinho.`);
+    console.log(C.dim(`  Pedido em ${RESTART_REQUEST_FILE}. Para matar e subir na hora: seal restart --now`));
+    return;
+  }
+  args = args.filter((arg) => arg !== '--now');
   cmdStop(args);
   // Tiny pause so TCP ports release cleanly
   spawnSync('sleep', ['0.3']);

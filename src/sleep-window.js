@@ -48,3 +48,29 @@ export function awakeTimer(limitMs, onExpire, { tickMs = TICK_MS, sleepGapMs = S
     sleptMs: () => slept,
   };
 }
+
+export function createSleepTracker({ tickMs = TICK_MS, sleepGapMs = SLEEP_GAP_MS, now = Date.now } = {}) {
+  let last = now();
+  let wokeAt = null;
+  const tick = () => {
+    const current = now();
+    if (current - last - tickMs > sleepGapMs) wokeAt = current;
+    last = current;
+  };
+  return {
+    tick,
+    lastWakeAt: () => wokeAt,
+    sleptWithin: (ms) => wokeAt !== null && now() - wokeAt < ms,
+  };
+}
+
+let sharedTracker = null;
+
+export function sleepTracker() {
+  if (!sharedTracker) {
+    sharedTracker = createSleepTracker();
+    const id = setInterval(sharedTracker.tick, TICK_MS);
+    if (typeof id.unref === 'function') id.unref();
+  }
+  return sharedTracker;
+}
