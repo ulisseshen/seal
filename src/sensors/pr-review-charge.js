@@ -33,6 +33,12 @@ export function chargeMessage({ author, prId, title, url, verdict, counts, reRev
   return `${name}, a revisão automática da ${pr} terminou: ${text}. Cada comentário traz o prompt de correção; depois do push o bot revisa de novo.\n${url}`;
 }
 
+export function shouldOfferCharge({ verdict, counts, reReview = false }) {
+  if (verdict !== 'needs-work') return false;
+  if (!reReview) return true;
+  return pendingText(counts).total > 0;
+}
+
 export function chargeKeys(entry) {
   return (entry.needsAction || []).map((item) => `${entry.prId}:${item.reason}:${item.since || ''}`);
 }

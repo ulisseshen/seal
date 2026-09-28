@@ -1,4 +1,5 @@
 import { db } from '../db.js';
+import { classifyReviewFailure } from './pr-review-pipeline-logic.js';
 
 await db.exec(`
   CREATE TABLE IF NOT EXISTS pr_reviews (
@@ -23,11 +24,45 @@ for (const ddl of [
   `ALTER TABLE pr_reviews ADD COLUMN publish_started_at TEXT`,
   `ALTER TABLE pr_reviews ADD COLUMN session_id TEXT`,
   `ALTER TABLE pr_reviews ADD COLUMN worktree TEXT`,
+  `ALTER TABLE pr_reviews ADD COLUMN failure_kind TEXT`,
+  `ALTER TABLE pr_reviews ADD COLUMN retry_at TEXT`,
+  `ALTER TABLE pr_reviews ADD COLUMN rounds INTEGER NOT NULL DEFAULT 0`,
+  `ALTER TABLE pr_reviews ADD COLUMN replies_seen_at TEXT`,
+  `ALTER TABLE pr_reviews ADD COLUMN verify_requested_at TEXT`,
+  `ALTER TABLE pr_reviews ADD COLUMN source_branch TEXT`,
+  `ALTER TABLE pr_reviews ADD COLUMN target_branch TEXT`,
+  `ALTER TABLE pr_reviews ADD COLUMN origin_branch TEXT`,
 ]) {
   try {
     await db.exec(ddl);
   } catch {}
 }
+
+// Blocks posted before any review (branch name, target). They never enter pr_reviews, on purpose: the same
+// commit must be reviewable once the author fixes the cause. Kept apart so the panel can list them.
+await db.exec(`
+  CREATE TABLE IF NOT EXISTS pr_blocks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    repo TEXT NOT NULL,
+    pr_id INTEGER NOT NULL,
+    head_sha TEXT NOT NULL,
+    kind TEXT NOT NULL,
+    source_branch TEXT,
+    target_branch TEXT,
+    reason TEXT,
+    at TEXT NOT NULL DEFAULT (datetime('now')),
+    UNIQUE(repo, pr_id, head_sha, kind)
+  );
+`);
+
+export async function recordPreReviewBlock({ repo, prId, headSha, kind, source, target, reason }) {
+  await db.run(
+    `INSERT OR IGNORE INTO pr_blocks (repo, pr_id, head_sha, kind, source_branch, target_branch, reason) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+    [repo, prId, headSha, kind, source || null, target || null, reason || null],
+  );
+}
+
+const RETRY_BASE_MINUTES = 30;
 
 const changed = (result) => (result?.changes ?? result?.rowsAffected ?? 0) > 0;
 
@@ -40,6 +75,11 @@ export async function claimReview({ repo, prId, headSha, mode, taskId }) {
 }
 
 export async function releaseClaim({ repo, prId, headSha, error }) {
+  await db.run(
+    `UPDATE pr_reviews SET status = 'failed', error = ?, finished_at = datetime('now'), retry_at = datetime('now', ?)
+     WHERE repo = ? AND pr_id = ? AND head_sha = ? AND status = 'queued' AND rounds > 0`,
+    [error || null, `+${RETRY_BASE_MINUTES} minutes`, repo, prId, headSha],
+  );
   await db.run(
     `UPDATE pr_reviews SET status = 'cancelled', error = ?, finished_at = datetime('now') WHERE repo = ? AND pr_id = ? AND head_sha = ? AND status = 'queued'`,
     [error || null, repo, prId, headSha],
@@ -64,6 +104,37 @@ export async function finishReview({ repo, prId, headSha, status, verdict = null
   );
 }
 
+export async function setReviewBranches({ repo, prId, headSha, source, target, origin }) {
+  await db.run(
+    `UPDATE pr_reviews SET source_branch = ?, target_branch = ?, origin_branch = ? WHERE repo = ? AND pr_id = ? AND head_sha = ?`,
+    [source || null, target || null, origin || null, repo, prId, headSha],
+  );
+}
+
+export async function reviewedShaAt({ repo, prId, at }) {
+  const row = await db.get(
+    `SELECT head_sha FROM pr_reviews WHERE repo = ? AND pr_id = ? AND status = 'published' AND datetime(finished_at) >= datetime(?)
+     ORDER BY datetime(finished_at) ASC LIMIT 1`,
+    [repo, prId, at],
+  );
+  return row?.head_sha || null;
+}
+
+export async function markVerifyRequested({ repo, prId, headSha }) {
+  const result = await db.run(
+    `UPDATE pr_reviews SET verify_requested_at = datetime('now') WHERE repo = ? AND pr_id = ? AND head_sha = ? AND verify_requested_at IS NULL`,
+    [repo, prId, headSha],
+  );
+  return changed(result);
+}
+
+export async function markRepliesSeen({ repo, prId, headSha, at }) {
+  await db.run(
+    `UPDATE pr_reviews SET replies_seen_at = ? WHERE repo = ? AND pr_id = ? AND head_sha = ? AND (replies_seen_at IS NULL OR replies_seen_at < ?)`,
+    [at, repo, prId, headSha, at],
+  );
+}
+
 export async function lastConversableReview(prId) {
   return db.get(
     `SELECT * FROM pr_reviews WHERE pr_id = ? AND status = 'published' AND session_id IS NOT NULL
@@ -73,8 +144,53 @@ export async function lastConversableReview(prId) {
 }
 
 export async function reviewForSha({ repo, prId, headSha }) {
-  return db.get(`SELECT * FROM pr_reviews WHERE repo = ? AND pr_id = ? AND head_sha = ?`, [repo, prId, headSha]);
+  return db.get(
+    `SELECT *, (retry_at IS NOT NULL AND datetime(retry_at) <= datetime('now')) AS retry_due FROM pr_reviews WHERE repo = ? AND pr_id = ? AND head_sha = ?`,
+    [repo, prId, headSha],
+  );
 }
+
+const retryWaitMinutes = (rounds) => RETRY_BASE_MINUTES * 4 ** (rounds - 1);
+
+export async function failReview({ repo, prId, headSha, error, maxRounds = 3 }) {
+  const kind = classifyReviewFailure(error);
+  const row = await db.get(`SELECT rounds FROM pr_reviews WHERE repo = ? AND pr_id = ? AND head_sha = ?`, [repo, prId, headSha]);
+  const rounds = (row?.rounds || 0) + 1;
+  const exhausted = kind === 'transient' && rounds > maxRounds;
+  const wait = kind === 'transient' && !exhausted ? `+${retryWaitMinutes(rounds)} minutes` : null;
+  await db.run(
+    `UPDATE pr_reviews SET status = 'failed', error = ?, failure_kind = ?, rounds = ?, finished_at = datetime('now'),
+       retry_at = CASE WHEN ? IS NULL THEN NULL ELSE datetime('now', ?) END
+     WHERE repo = ? AND pr_id = ? AND head_sha = ?`,
+    [error || null, kind, rounds, wait, wait, repo, prId, headSha],
+  );
+  const stored = wait ? await db.get(`SELECT retry_at FROM pr_reviews WHERE repo = ? AND pr_id = ? AND head_sha = ?`, [repo, prId, headSha]) : null;
+  return { kind, retryAt: stored?.retry_at || null, exhausted, rounds };
+}
+
+export async function reclaimFailedReview({ repo, prId, headSha, mode, taskId }) {
+  const result = await db.run(
+    `UPDATE pr_reviews SET status = 'queued', mode = ?, task_id = ?, error = NULL, retry_at = NULL, finished_at = NULL,
+       publish_started_at = NULL, claimed_at = datetime('now')
+     WHERE repo = ? AND pr_id = ? AND head_sha = ? AND status = 'failed' AND retry_at IS NOT NULL AND datetime(retry_at) <= datetime('now')`,
+    [mode, taskId, repo, prId, headSha],
+  );
+  return changed(result);
+}
+
+export async function classifyLegacyFailures() {
+  const legacy = await db.all(`SELECT id, error FROM pr_reviews WHERE status = 'failed' AND failure_kind IS NULL`);
+  for (const row of legacy) {
+    const kind = classifyReviewFailure(row.error);
+    await db.run(
+      `UPDATE pr_reviews SET failure_kind = ?, rounds = MAX(rounds, 1), retry_at = CASE WHEN ? = 'transient' THEN datetime('now') ELSE NULL END WHERE id = ?`,
+      [kind, kind, row.id],
+    );
+  }
+  return legacy.length;
+}
+
+await classifyLegacyFailures();
 
 export async function lastPublishedReview({ repo, prId }) {
   return db.get(

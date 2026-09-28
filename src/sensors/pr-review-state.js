@@ -1,6 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { recordTelegram } from '../telegram-outbox.js';
 
 const CONFIG_DIR = path.join(os.homedir(), '.config', 'seal');
 export const PR_REVIEW_STATE_PATH = process.env.SEAL_PR_REVIEW_STATE || path.join(CONFIG_DIR, 'pr-review-state.json');
@@ -92,8 +93,10 @@ export async function sendTelegram(html) {
       signal: AbortSignal.timeout(15_000),
     });
     if (!res.ok) console.warn(`[pr-review] telegram ${res.status}: ${await res.text().catch(() => '')}`);
+    await recordTelegram({ source: 'pr-review', text: html, ok: res.ok });
     return res.ok;
   } catch (err) {
+    await recordTelegram({ source: 'pr-review', text: html, ok: false });
     console.warn(`[pr-review] telegram send failed: ${err.message}`);
     return false;
   }

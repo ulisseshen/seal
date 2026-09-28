@@ -62,15 +62,43 @@ export function decideReviewGate({ pr, threads, myEmail, eligibilityStart = 0, t
 
   const headSha = (pr.lastMergeSourceCommit?.commitId || '').toLowerCase();
   if (!headSha) return { action: 'skip', reason: 'no-head-sha' };
-  if (ledgerForHead) return { action: 'skip', reason: `ledger-${ledgerForHead.status}` };
+  const retry = ledgerForHead?.status === 'failed' && Boolean(ledgerForHead.retry_due);
+  if (ledgerForHead && !retry) {
+    const waiting = ledgerForHead.status === 'failed' && ledgerForHead.retry_at;
+    return { action: 'skip', reason: waiting ? 'ledger-failed-retry-later' : `ledger-${ledgerForHead.status}` };
+  }
 
   if (hasReviewLock(threads, myEmail)) return { action: 'skip', reason: 'locked' };
 
+  const extra = retry ? { retry: true } : {};
   const reviewedSha = (lastPublishedSha || findLastReviewedSha(threads, myEmail) || '').toLowerCase() || null;
-  if (!reviewedSha) return { action: 'first-review', headSha };
+  if (!reviewedSha) return { action: 'first-review', headSha, ...extra };
   if (headSha.startsWith(reviewedSha) || reviewedSha.startsWith(headSha)) return { action: 'skip', reason: 'up-to-date' };
-  return { action: 're-review', headSha, previousSha: reviewedSha };
+  return { action: 're-review', headSha, previousSha: reviewedSha, ...extra };
 }
+
+export const localRulesInstruction = (paths) =>
+  paths.length
+    ? `Then read, in this order: ${paths.join(', ')}. They are machine-local review rules that complement the pipeline and the repo's own skills; on conflict the later file wins over everything before it.`
+    : null;
+
+export const needsCommitVerification = ({ ledgerForHead }) =>
+  ledgerForHead?.status === 'published' && ledgerForHead.verdict === 'needs-work' && Number(ledgerForHead.findings) === 0 && !ledgerForHead.verify_requested_at;
+
+const FAILURE_NOTICE_RE = /^⚠️ A revisão automática (falhou|foi interrompida|não gerou)/;
+
+export function staleFailureNotices({ threads, myEmail, headStatus }) {
+  if (headStatus !== 'published') return [];
+  return (threads || []).flatMap((thread) =>
+    (thread.comments || [])
+      .filter((comment) => !comment.isDeleted && isMine(comment.author, myEmail) && FAILURE_NOTICE_RE.test(comment.content || ''))
+      .map((comment) => ({ threadId: thread.id, commentId: comment.id })),
+  );
+}
+
+const TRANSIENT_FAILURE_RE = /sigterm|exit code (143|-2)\b|orphaned|enoent|no such file|worktree missing|econnreset|etimedout|enotfound|eai_again|socket hang up|network|overloaded|api error: 5\d\d|usage limit|limite/i;
+
+export const classifyReviewFailure = (error) => (TRANSIENT_FAILURE_RE.test(String(error || '')) ? 'transient' : 'permanent');
 
 const mentionsPr = (text, prId) =>
   new RegExp(`(pullrequest/${prId}\\b|\\bPR\\s*#?\\s*${prId}\\b|!${prId}\\b)`, 'i').test(text || '');
@@ -208,6 +236,9 @@ export function parseReviewResult(text) {
       usCoverage: normalizeUsCoverage(data?.usCoverage),
       pairedPrs: Array.isArray(data?.pairedPrs) ? data.pairedPrs : [],
       stagesRun: Array.isArray(data?.stagesRun) ? data.stagesRun.map(String) : [],
+      priorResolved: (Array.isArray(data?.priorResolved) ? data.priorResolved : [])
+        .map((item) => ({ threadId: Number(item?.threadId), title: String(item?.title || '').trim(), reason: String(item?.reason || '').trim() }))
+        .filter((item) => Number.isInteger(item.threadId) && item.threadId > 0),
     },
   };
 }
@@ -232,6 +263,7 @@ export function formatFindingComment(finding, { includeLocation = false } = {}) 
   if (finding.fixPrompt) {
     parts.push(`<details>\n<summary>🤖 Prompt de correção</summary>\n\n\`\`\`\n${finding.fixPrompt.replace(/```/g, "'''")}\n\`\`\`\n</details>`);
   }
+  if (finding.headSha) parts.push(`<!-- seal:finding-sha ${finding.headSha} -->`);
   return parts.join('\n\n');
 }
 
@@ -241,6 +273,72 @@ export const pendingCommentsText = (total) =>
     : `${total} comentários nesta PR, cada um com o prompt de correção.`;
 
 const OPEN_THREAD_STATUSES = new Set([1, 'active', 6, 'pending']);
+const FINDING_SHA_RE = /<!--\s*seal:finding-sha\s+([0-9a-f]{7,40})\s*-->/i;
+const FIX_PROMPT_RE = /<summary>🤖 Prompt de correção<\/summary>\s*```\n?([\s\S]*?)\n?```/;
+
+export function resolvedBotFindings(threads, myEmail) {
+  return (threads || []).flatMap((thread) => {
+    if (OPEN_THREAD_STATUSES.has(thread.status) || thread.isDeleted) return [];
+    const [first] = thread.comments || [];
+    if (!first || first.isDeleted || !isMine(first.author, myEmail)) return [];
+    const content = first.content || '';
+    if (content.startsWith(`**[${REMINDER_LABEL}]`)) return [];
+    const match = content.match(/^\*\*\[[^\]]+\]\s*(.+?)\*\*/);
+    if (!match) return [];
+    const prompt = content.match(FIX_PROMPT_RE);
+    const mark = content.match(FINDING_SHA_RE);
+    return [{ threadId: thread.id, title: match[1].trim(), fixPrompt: prompt ? prompt[1].trim() : null, postedAt: first.publishedDate || null, postedSha: mark ? mark[1].toLowerCase() : null }];
+  });
+}
+
+export function findingPostedSha(finding, threads, myEmail) {
+  if (finding.postedSha) return finding.postedSha;
+  if (!finding.postedAt) return null;
+  const summaries = (threads || []).flatMap((thread) => (thread.comments || [])
+    .filter((comment) => !comment.isDeleted && isMine(comment.author, myEmail) && comment.publishedDate >= finding.postedAt)
+    .map((comment) => ({ at: comment.publishedDate, sha: (comment.content || '').match(REVIEWED_MARKER_RE)?.[1] }))
+    .filter((item) => item.sha));
+  summaries.sort((a, b) => a.at.localeCompare(b.at));
+  return summaries[0]?.sha?.toLowerCase() || null;
+}
+
+export function buildVerifyResolvedQuestion({ prId, headSha, findings }) {
+  const block = (item) => [
+    `${item.open ? 'Ainda aberto' : 'Marcado como resolvido'}: ${item.title} (thread ${item.threadId})`,
+    `Commits depois do comentário: \`git log --oneline ${item.sinceSha}..${headSha}\` · mudança: \`git diff ${item.sinceSha}..${headSha}\``,
+    item.fixPrompt ? `Prompt de correção original:\n${item.fixPrompt}` : null,
+    ...(item.replies || []).map((reply) => `${reply.author}: ${reply.text}`),
+  ].filter(Boolean).join('\n');
+  return [
+    `A revisão do head ${headSha} da PR !${prId} não achou nada novo, mas ficaram comentários anteriores. Confira, nos commits que entraram depois de cada comentário, se a correção está no código:`,
+    '',
+    findings.map(block).join('\n\n'),
+    '',
+    'Para cada um:',
+    '- Ainda aberto e corrigido no código: liste em "resolve" com o título exato e o motivo.',
+    '- Não corrigido, ou corrigido pela metade (aberto ou marcado como resolvido): liste em "reopen": {"reopen": [{"title": "título exato", "missing": "o que ainda falta, com arquivo:linha", "fixPrompt": "prompt autocontido para corrigir só o que falta"}]}.',
+    '- Marcado como resolvido e corrigido: não precisa listar.',
+    'Uma resposta do autor explicando que já está coberto só vale se o código confirmar.',
+  ].join('\n');
+}
+
+export function openBotFindings(threads, myEmail, { excludeThreadIds = [] } = {}) {
+  const excluded = new Set(excludeThreadIds.map(Number));
+  return (threads || []).flatMap((thread) => {
+    if (excluded.has(Number(thread.id)) || !OPEN_THREAD_STATUSES.has(thread.status) || thread.isDeleted) return [];
+    const [first] = thread.comments || [];
+    if (!first || first.isDeleted || !isMine(first.author, myEmail)) return [];
+    if ((first.content || '').startsWith(`**[${REMINDER_LABEL}]`)) return [];
+    const match = (first.content || '').match(/^\*\*\[[^\]]+\]\s*(.+?)\*\*/);
+    if (!match) return [];
+    const prompt = (first.content || '').match(FIX_PROMPT_RE);
+    const mark = (first.content || '').match(FINDING_SHA_RE);
+    const replies = (thread.comments || []).slice(1)
+      .filter((comment) => !comment.isDeleted && comment.commentType !== 'system' && !isMine(comment.author, myEmail) && (comment.content || '').trim())
+      .map((comment) => ({ author: comment.author?.displayName || comment.author?.uniqueName || 'autor', text: comment.content.trim() }));
+    return [{ threadId: thread.id, title: match[1].trim(), fixPrompt: prompt ? prompt[1].trim() : null, postedAt: first.publishedDate || null, postedSha: mark ? mark[1].toLowerCase() : null, replies }];
+  });
+}
 
 export function countOpenBotThreads(threads, myEmail, { excludeThreadIds = [] } = {}) {
   const excluded = new Set(excludeThreadIds.map(Number));
@@ -274,7 +372,7 @@ export function severityOfComment(content) {
   return SEVERITIES.includes(severity) ? severity : null;
 }
 
-export function formatSummaryComment({ data, headSha, priorOpen = 0 }) {
+export function formatSummaryComment({ data, headSha, priorOpen = 0, priorThreads = [], prUrl = null }) {
   const total = blockingFindings(data.findings).length;
   const reminders = data.findings.length - total;
   const pending = total + priorOpen;
@@ -290,6 +388,14 @@ export function formatSummaryComment({ data, headSha, priorOpen = 0 }) {
         `${detail ? `${detail} ` : ''}Resolva e faça push: a PR é revisada de novo no próximo commit.`,
       ]
     : ['**✅ Aprovado** — nenhum ponto pendente.'];
+  if (pending > 0 && priorThreads.length > 0) {
+    const link = (item) => (prUrl ? `[${item.title}](${prUrl}?discussionId=${item.threadId})` : item.title);
+    lines.push('', 'Continuam abertos:');
+    for (const item of priorThreads) {
+      lines.push(`- ${link(item)}`);
+    }
+    lines.push('', 'O prompt de correção está em cada comentário. A cada push o revisor confere esses pontos no código e fecha sozinho o que foi corrigido.');
+  }
   if (reminders > 0) {
     lines.push('', reminders === 1
       ? '📝 1 lembrete para o autor, que não bloqueia a aprovação.'
@@ -370,19 +476,102 @@ export function nextReleaseFrom(mainVersion) {
   return version ? `release/${version[0]}.${version[1] + 1}.0` : null;
 }
 
-export function checkTargetBranch({ source, target, nextRelease, defaultBranch = 'main' }) {
+// Branch naming. The team's new standard is feature/bugfix/hotfix; the names used so far still pass with a
+// reminder, and a branch with no type at all is sent back before any review (it is the cheapest fix, so first).
+const CANONICAL_BRANCH = /^(feature|bugfix|hotfix|release|gmud)\//;
+const LEGACY_BRANCH = /^(fix|feat|task|tasks?-[\w-]+|story|chore|merge|sync|docs|test|bugfix-[\w-]+)\//;
+
+const BRANCH_TYPES_TEXT = [
+  '- `feature/<id>-descricao`: funcionalidade nova ou mudança de comportamento. Sai da próxima release e volta para ela.',
+  '- `bugfix/<id>-descricao`: bug que ainda não chegou em produção (está na release). Sai da release e volta para ela.',
+  '- `hotfix/<id>-descricao`: bug em produção que não pode esperar a próxima GMUD. Sai da `main` e volta para a `main`.',
+].join('\n');
+
+export function suggestBranchName(source, target) {
+  const rest = String(source || '').replace(/^[^/]*\//, '');
+  const id = (String(source).match(/\d{4,}/) || [])[0] || '<id>';
+  const slug = rest.replace(/\d{4,}/g, '').replace(/[^a-z0-9]+/gi, '-').replace(/^-+|-+$/g, '').toLowerCase() || 'descricao';
+  const kind = target === 'main' ? 'hotfix' : /^(fix|bugfix)|bug|fix/i.test(source) ? 'bugfix' : 'feature';
+  return `${kind}/${id}-${slug}`;
+}
+
+export function checkBranchName({ source, target }) {
+  if (!source || CANONICAL_BRANCH.test(source)) return null;
+  const suggestion = suggestBranchName(source, target);
+  if (LEGACY_BRANCH.test(source)) {
+    const hint = /^fix\//.test(source)
+      ? (target === 'main' ? 'Para a `main`, o prefixo novo é `hotfix/`.' : 'Para uma release, o prefixo novo é `bugfix/`.')
+      : `O prefixo novo para este trabalho seria \`${suggestion.split('/')[0]}/\`.`;
+    return {
+      kind: 'doc-request', blocking: false, file: null, line: null, rule: 'Nome da branch',
+      severity: 'NIT',
+      title: `Branch \`${source}\` no padrão antigo de nome`,
+      body: `${hint} Nas próximas, use o padrão novo:\n\n${BRANCH_TYPES_TEXT}`,
+      suggestion: `Na próxima branch, algo como \`${suggestion}\`. Não precisa refazer esta PR.`,
+      sources: ['branch-gate'],
+    };
+  }
+  return {
+    kind: 'code', severity: 'BLOCKER', file: null, line: null, rule: 'Nome da branch',
+    title: `Branch \`${source}\` sem o tipo no nome`,
+    body: `O nome da branch diz o tipo do trabalho e para onde ele vai. Os tipos são:\n\n${BRANCH_TYPES_TEXT}\n\nO Azure não deixa trocar a branch de uma PR aberta, então o caminho é abrir outra.`,
+    suggestion: `Criar \`${suggestion}\` a partir desta branch, abrir uma PR nova com ela e abandonar esta.`,
+    fixPrompt: `A branch \`${source}\` não segue o padrão de nome (feature/, bugfix/ ou hotfix/). Crie a branch certa a partir dela e publique: \`git fetch origin && git checkout -b ${suggestion} origin/${source} && git push -u origin ${suggestion}\`. Abra uma PR nova de \`${suggestion}\` para \`${target}\` com o mesmo título e descrição, e abandone a PR atual.`,
+    sources: ['branch-gate'],
+  };
+}
+
+export function formatNameBlockSummary({ finding, headSha, prUrl = null, threadId = null }) {
+  const title = prUrl && threadId ? `[${finding.title}](${prUrl}?discussionId=${threadId})` : finding.title;
+  return [
+    `**❌ Reprovado** — ${title}.`,
+    '',
+    'Revisei só o nome da branch: o código não foi revisado. Abra uma PR nova com a branch no padrão (o passo a passo está no comentário) e abandone esta; a revisão roda na PR nova.',
+    '',
+    `<!-- seal:target-blocked ${headSha} -->`,
+  ].join('\n');
+}
+
+const listNames = (names) => (names.length <= 1 ? names.join('') : `${names.slice(0, -1).join(', ')} e ${names[names.length - 1]}`);
+
+// Where a branch was cut from: of the mainline refs that contain its fork point, main wins (release
+// branches contain main's history too), then the oldest release, which is where that commit was born.
+export function pickOriginBranch(containing) {
+  const refs = (containing || []).filter(Boolean);
+  if (refs.includes('main')) return 'main';
+  const releases = refs.filter((ref) => /^release\//.test(ref));
+  const versioned = releases.filter((ref) => parseVersion(ref)).sort((a, b) => compareVersions(parseVersion(a), parseVersion(b)));
+  return versioned[0] || releases.sort()[0] || refs.sort()[0] || null;
+}
+
+export function checkTargetBranch({ source, target, nextRelease, defaultBranch = 'main', carried = null }) {
   const next = parseVersion(nextRelease);
   if (!next) return null;
   const fixPrompt = `A PR de \`${source}\` aponta para \`${target}\`, mas trabalho novo entra na próxima release, \`${nextRelease}\` (versão da main + 1). No Azure DevOps, edite a PR e troque a branch de destino para \`${nextRelease}\`. Se houver conflito, faça rebase de \`${source}\` sobre \`origin/${nextRelease}\` e rode a suíte de testes do repo antes do push.`;
   const base = { kind: 'code', file: null, line: null, rule: 'Gate de branch de destino', fixPrompt, sources: ['target-gate'] };
 
   if (target === defaultBranch) {
+    if (/^hotfix\//i.test(source) && carried?.commits > 0) {
+      return {
+        ...base,
+        fixPrompt: `O hotfix \`${source}\` leva para \`${defaultBranch}\` ${carried.commits} commits da \`${carried.release}\` que não são dele. Crie a branch de novo a partir da main (\`git fetch origin && git checkout -b ${source}-v2 origin/${defaultBranch}\`), traga só os commits do hotfix com \`git cherry-pick\`, publique, abra uma PR nova para \`${defaultBranch}\` e abandone esta.`,
+        severity: 'BLOCKER',
+        carriedRelease: carried.release,
+        title: `Hotfix \`${source}\` leva a \`${carried.release}\` junto para a \`${defaultBranch}\``,
+        body: `Hotfix sai da \`${defaultBranch}\` e leva só a correção. Esta branch traz ${carried.commits === 1 ? '1 commit' : `${carried.commits} commits`} da \`${carried.release}\`${carried.authors?.length ? ` (${listNames(carried.authors)})` : ''} que ainda não passaram pela GMUD. A revisão do código fica parada até a branch levar só o hotfix.`,
+        suggestion: 'Recriar a branch a partir da main com cherry-pick só dos commits do hotfix, abrir uma PR nova e abandonar esta.',
+      };
+    }
     if (MAINLINE_SOURCES.test(source)) return null;
+    const carriedText = carried?.commits > 0
+      ? ` A branch traz a \`${carried.release}\` (saiu dela ou recebeu merge dela): mergear em \`${defaultBranch}\` leva junto ${carried.commits === 1 ? '1 commit' : `${carried.commits} commits`} da release${carried.authors?.length ? ` (${listNames(carried.authors)})` : ''} que ainda não passaram pela GMUD. A revisão do código fica parada até o destino mudar para \`${carried.release}\`.`
+      : '';
     return {
       ...base,
       severity: 'BLOCKER',
       title: `PR de trabalho apontando para \`${defaultBranch}\``,
-      body: `\`${source}\` não é release, hotfix nem gmud, então não entra direto em \`${defaultBranch}\`. A próxima release é \`${nextRelease}\`.`,
+      body: `\`${source}\` não é release, hotfix nem gmud, então não entra direto em \`${defaultBranch}\`. A próxima release é \`${nextRelease}\`.${carriedText}\n\nPara onde cada tipo vai:\n\n${BRANCH_TYPES_TEXT}\n\nSe é bug em produção que não pode esperar a GMUD, é hotfix: recrie a branch como \`hotfix/…\` a partir da \`${defaultBranch}\`. Senão, troque o destino para \`${nextRelease}\`.`,
+      ...(carried?.commits > 0 ? { carriedRelease: carried.release } : {}),
       suggestion: `Trocar o destino para \`${nextRelease}\`, ou renomear a branch para \`hotfix/…\` se for de fato um hotfix.`,
     };
   }
@@ -393,10 +582,32 @@ export function checkTargetBranch({ source, target, nextRelease, defaultBranch =
     ...base,
     severity: 'WARNING',
     title: `Destino \`${target}\` é uma release que já foi para a main`,
-    body: `A main já está na versão dessa release; a próxima é \`${nextRelease}\`. Mudança que entra aqui não sai na próxima entrega.`,
+    body: `A main já está na versão dessa release; a próxima é \`${nextRelease}\`. Mudança que entra aqui não sai na próxima entrega.\n\nPara onde cada tipo vai:\n\n${BRANCH_TYPES_TEXT}`,
     suggestion: `Trocar o destino para \`${nextRelease}\` (ou uma release futura, se for para depois).`,
   };
 }
+
+const TARGET_BLOCK_RE = /<!--\s*seal:target-blocked\s+([0-9a-f]{7,40})\s*-->/i;
+
+export function formatTargetBlockSummary({ gate, headSha, prUrl = null, threadId = null }) {
+  const title = prUrl && threadId ? `[${gate.title}](${prUrl}?discussionId=${threadId})` : gate.title;
+  const hotfix = /^Hotfix /.test(gate.title);
+  return [
+    hotfix
+      ? `**❌ Reprovado** — ${title}.`
+      : `**❌ Reprovado** — ${title.replace(/^PR de trabalho/, 'a PR de trabalho')}, e a branch traz a \`${gate.carriedRelease}\` junto.`,
+    '',
+    hotfix
+      ? 'Revisei só o que a branch leva para a `main`: o código não foi revisado. Recrie a branch a partir da `main` só com os commits do hotfix (o passo a passo está no comentário), abra uma PR nova e abandone esta.'
+      : `Revisei só o destino: o código não foi revisado, porque contra \`main\` o diff mistura o trabalho desta PR com o da release inteira. Troque o destino para \`${gate.carriedRelease}\` e a revisão roda sozinha no mesmo commit.`,
+    '',
+    `<!-- seal:target-blocked ${headSha} -->`,
+  ].join('\n');
+}
+
+export const hasTargetBlockSummary = (threads, myEmail, headSha) =>
+  (threads || []).some((thread) => (thread.comments || []).some((comment) =>
+    !comment.isDeleted && isMine(comment.author, myEmail) && (comment.content || '').match(TARGET_BLOCK_RE)?.[1]?.toLowerCase() === headSha.toLowerCase()));
 
 const STICKY_SENT_REASONS = new Set(['blocker', 'pair-desync']);
 
@@ -436,7 +647,43 @@ export function buildChatPrompt({ prId, question }) {
     `${CHAT_BLOCK_START}`,
     '{"resolve": [{"title": "título exato do achado", "reason": "por que ele não se sustenta"}]}',
     `${CHAT_BLOCK_END}`,
-    'Se nenhum achado deve ser resolvido, não inclua o bloco.',
+    'Se o que falta não é código e sim ajustar um work item (critério de aceite de US/Bug, task), liste em "work_items" no mesmo bloco: {"work_items": [{"id": 123, "change": "o que mudar"}]}. Quem ajusta é o dono do SEAL, não o autor da PR.',
+    'Se nenhum achado deve ser resolvido e nenhum work item precisa mudar, não inclua o bloco.',
+  ].join('\n');
+}
+
+const THREAD_STATUS_NAMES = { 1: 'active', 2: 'fixed', 3: 'wontFix', 4: 'closed', 5: 'byDesign', 6: 'pending' };
+
+export function authorReplies({ threads, myEmail, since = 0 }) {
+  const disputes = [];
+  let latestAt = since;
+  for (const thread of threads || []) {
+    const [first, ...rest] = thread.comments || [];
+    if (!first || first.isDeleted || thread.isDeleted || !isMine(first.author, myEmail)) continue;
+    const match = (first.content || '').match(FINDING_TITLE_RE);
+    if (!match) continue;
+    const replies = rest
+      .filter((comment) => !comment.isDeleted && comment.commentType !== 'system' && !isMine(comment.author, myEmail) && (comment.content || '').trim())
+      .filter((comment) => Date.parse(comment.publishedDate || 0) > since)
+      .map((comment) => ({ author: comment.author?.displayName || comment.author?.uniqueName || 'autor', text: comment.content.trim(), at: comment.publishedDate }));
+    if (replies.length === 0) continue;
+    for (const item of replies) latestAt = Math.max(latestAt, Date.parse(item.at));
+    disputes.push({ threadId: thread.id, title: match[1].trim(), status: THREAD_STATUS_NAMES[thread.status] || String(thread.status ?? ''), replies });
+  }
+  return { disputes, latestAt };
+}
+
+export function buildAuthorReplyQuestion({ prId, disputes }) {
+  const blocks = disputes.map((dispute) =>
+    [`Achado: ${dispute.title} (thread ${dispute.threadId}, status ${dispute.status || '?'})`, ...dispute.replies.map((item) => `${item.author}: ${item.text}`)].join('\n'),
+  );
+  return [
+    `O autor respondeu aos seus achados na PR !${prId}, sem commit novo. Reavalie cada um à luz da resposta:`,
+    '',
+    blocks.join('\n\n'),
+    '',
+    'Para cada achado, diga se ele se sustenta. Uma decisão do time registrada na PR é um argumento válido para código; não repita o mesmo achado só porque o critério escrito do work item ainda não mudou.',
+    'Se o que impede aprovar é só o work item desatualizado, resolva o achado e liste o ajuste em "work_items": o dono do SEAL é avisado para fazer.',
   ].join('\n');
 }
 
@@ -444,17 +691,27 @@ export function parseChatReply(text) {
   const source = String(text || '');
   const start = source.lastIndexOf(CHAT_BLOCK_START);
   const end = start >= 0 ? source.indexOf(CHAT_BLOCK_END, start) : -1;
-  if (start < 0 || end < 0) return { answer: source.trim(), resolves: [] };
+  if (start < 0 || end < 0) return { answer: source.trim(), resolves: [], workItems: [], reopen: [] };
   let resolves = [];
+  let workItems = [];
+  let reopen = [];
   try {
     const parsed = JSON.parse(source.slice(start + CHAT_BLOCK_START.length, end).trim().replace(/^```(?:json)?\s*/i, '').replace(/```\s*$/, ''));
     resolves = (Array.isArray(parsed?.resolve) ? parsed.resolve : [])
       .map((item) => ({ title: String(item?.title || '').trim(), reason: String(item?.reason || '').trim() }))
       .filter((item) => item.title);
+    workItems = (Array.isArray(parsed?.work_items) ? parsed.work_items : [])
+      .map((item) => ({ id: Number(item?.id), change: String(item?.change || '').trim() }))
+      .filter((item) => Number.isInteger(item.id) && item.id > 0 && item.change);
+    reopen = (Array.isArray(parsed?.reopen) ? parsed.reopen : [])
+      .map((item) => ({ title: String(item?.title || '').trim(), missing: String(item?.missing || '').trim(), fixPrompt: String(item?.fixPrompt || '').trim() }))
+      .filter((item) => item.title);
   } catch {
     resolves = [];
+    workItems = [];
+    reopen = [];
   }
-  return { answer: (source.slice(0, start) + source.slice(end + CHAT_BLOCK_END.length)).trim(), resolves };
+  return { answer: (source.slice(0, start) + source.slice(end + CHAT_BLOCK_END.length)).trim(), resolves, workItems, reopen };
 }
 
 export function findingThreadIdsByTitle(threads, myEmail) {

@@ -7,8 +7,8 @@ import path from 'path';
 import { insertTaskIfNew, insertEvent, db, updateLastNotified, deferTask } from '../db.js';
 import { parseUsageLimit, resumeAt, usageLimitResult, isUsageLimitResult } from '../usage-limit.js';
 import { triggerAction } from '../actions/hub.js';
-import { readMessagingConfig } from '../messaging/index.js';
-import { chargeMessage, chargeKeys } from './pr-review-charge.js';
+import { getMessagingConnector, readMessagingConfig } from '../messaging/index.js';
+import { chargeMessage, chargeKeys, shouldOfferCharge } from './pr-review-charge.js';
 import { notify } from '../notify.js';
 import { checkClaudeAuth, isLoginExpiredResult } from '../auth.js';
 import { VOTE_MAP } from './azure-pr-review-logic.js';
@@ -22,10 +22,21 @@ import {
   buildChatPrompt,
   findingThreadIdsByTitle,
   parseChatReply,
+  authorReplies,
+  buildAuthorReplyQuestion,
   reviewedMarker,
   buildThreadPayload,
   checkTargetBranch,
+  checkBranchName,
+  formatNameBlockSummary,
+  pickOriginBranch,
   countOpenBotThreads,
+  needsCommitVerification,
+  localRulesInstruction,
+  openBotFindings,
+  resolvedBotFindings,
+  findingPostedSha,
+  buildVerifyResolvedQuestion,
   needsChunking,
   planReviewChunks,
   verdictFor,
@@ -38,6 +49,8 @@ import {
   followUpReasons,
   formatFindingComment,
   formatSummaryComment,
+  formatTargetBlockSummary,
+  hasTargetBlockSummary,
   isMarkedSent,
   postedFindingTitles,
   matchPairedPrs,
@@ -45,12 +58,16 @@ import {
   nextReleaseFrom,
   parseReviewResult,
   shouldNotify,
+  staleFailureNotices,
 } from './pr-review-pipeline-logic.js';
 import { resolveReviewRepos } from './pr-review-repos.js';
-import { appendChatEntry, completeChatRequest, pendingChatRequests, readChatLog } from './pr-review-chat.js';
+import { appendChatEntry, completeChatRequest, enqueueChatRequest, pendingChatRequests, readChatLog } from './pr-review-chat.js';
 import { getClaudeBin } from '../claude-bin.js';
 import { escapeHtml, readReviewState, readSentMarks, sendTelegram, upsertPrEntry, writeReviewState } from './pr-review-state.js';
-import { beginPublish, claimReview, finishReview, healthIssues, lastConversableReview, lastPublishedReview, releaseClaim, releaseOrphanClaims, resumeStalePublishing, reviewForSha } from './pr-review-ledger.js';
+import { beginPublish, claimReview, failReview, finishReview, healthIssues, lastConversableReview, lastPublishedReview, markRepliesSeen, markVerifyRequested, reviewedShaAt, setReviewBranches, recordPreReviewBlock, reclaimFailedReview, releaseClaim, releaseOrphanClaims, resumeStalePublishing, reviewForSha } from './pr-review-ledger.js';
+import { flushDigestIfDue, queueDigest, supersedePendingOffers } from '../telegram-outbox.js';
+import { quietUntil, sleepTracker } from '../sleep-window.js';
+import { restState } from '../rest-mode.js';
 
 const execFileP = promisify(execFile);
 const HERE = path.dirname(fileURLToPath(import.meta.url));
@@ -76,6 +93,10 @@ const PART_TAG = 'pr-review-part:v1';
 const WAITING_FOR_PARTS_AT = '9999-12-31T00:00:00.000Z';
 const WORKTREE_ROOT = process.env.SEAL_PR_WORKTREE_ROOT || path.join(os.homedir(), '.seal-worktrees');
 const PIPELINE_SKILL_PATH = path.resolve(HERE, '..', '..', 'skills', 'pr-review-pipeline', 'SKILL.md');
+const LOCAL_RULES_PATH = process.env.SEAL_REVIEW_RULES || path.join(os.homedir(), '.config', 'seal', 'review-rules.md');
+const LOCAL_RULES_DIR = process.env.SEAL_REVIEW_RULES_DIR || path.join(os.homedir(), '.config', 'seal', 'review-rules');
+const localRulesLine = (repoName) =>
+  localRulesInstruction([LOCAL_RULES_PATH, path.join(LOCAL_RULES_DIR, `${repoName}.md`)].filter((file) => fs.existsSync(file)));
 const DEFAULT_START = '2026-09-23T00:00:00Z';
 const MAX_RETRIES = 5;
 const NAG_COOLDOWN_MIN = 5;
@@ -174,6 +195,7 @@ const ENQUEUE_BACKOFF_MAX_MS = 6 * 60 * 60 * 1000;
 let stuckTickAlertedAt = 0;
 
 export async function reportStuckTick(timeoutMs) {
+  if (quietUntil(new Date()) || sleepTracker().sleptWithin(timeoutMs)) return;
   if (Date.now() - stuckTickAlertedAt < 60 * 60 * 1000) return;
   stuckTickAlertedAt = Date.now();
   await sendTelegram(`⚠️ Um tick da revisão automática passou de ${Math.round(timeoutMs / 60000)} min e foi abandonado. O próximo tick segue normalmente; se repetir, algo externo (Azure, git, disco) está travando.`);
@@ -465,14 +487,15 @@ async function planForDiff(wtPath, mergeBase, headSha) {
   return planReviewChunks(rows);
 }
 
-function buildPartPrompt(part, total) {
+function buildPartPrompt(part, total, repoName) {
   return [
     `Read ${PIPELINE_SKILL_PATH} and follow it exactly, in the "Modo parte" section.`,
+    localRulesLine(repoName),
     `You review ONLY part ${part.id} of ${total}. The part context is in .seal-review/part-${part.id}.json (relative to the current directory).`,
     'This is an unattended run: never ask the user anything, never post, vote, edit files, commit or push.',
     `Write any intermediate file under .seal-review/part-${part.id}/ so parallel parts never overwrite each other.`,
     `Your final message MUST end with the result block delimited by ${RESULT_BLOCK_START} and ${RESULT_BLOCK_END}.`,
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 }
 
 function readResultFile(file) {
@@ -493,20 +516,22 @@ function parseTaskResult(taskResult, resultFile) {
   return parseReviewResult(taskResult);
 }
 
-function buildPrompt() {
+function buildPrompt(repoName) {
   return [
     `Read ${PIPELINE_SKILL_PATH} and follow it exactly.`,
+    localRulesLine(repoName),
     'The review context is in .seal-review/context.json (relative to the current directory).',
     'This is an unattended run: never ask the user anything, never post, vote, edit files, commit or push.',
     `Your final message MUST end with the result block delimited by ${RESULT_BLOCK_START} and ${RESULT_BLOCK_END}.`,
-  ].join('\n');
+  ].filter(Boolean).join('\n');
 }
 
 async function enqueueReview(args) {
   const { repo, pr, gate } = args;
   const claim = { repo: repo.name, prId: pr.pullRequestId, headSha: gate.headSha };
   if (TEST_DRY) return prepareAndQueue(args);
-  if (!(await claimReview({ ...claim, mode: gate.action, taskId: `seal_pr_${pr.pullRequestId}` }))) {
+  const claimFn = gate.retry ? reclaimFailedReview : claimReview;
+  if (!(await claimFn({ ...claim, mode: gate.action, taskId: `seal_pr_${pr.pullRequestId}` }))) {
     console.log(`[pr-review] ${repo.name} !${pr.pullRequestId}@${gate.headSha.slice(0, 8)} already claimed, skipping`);
     return false;
   }
@@ -520,11 +545,146 @@ async function enqueueReview(args) {
   }
 }
 
+async function branchOrigin(repo, headSha) {
+  const cwd = repo.projectDir;
+  await git(cwd, ['fetch', '--quiet', '--prune', 'origin', '+refs/heads/main:refs/remotes/origin/main',
+    '+refs/heads/release/*:refs/remotes/origin/release/*', '+refs/heads/gmud/*:refs/remotes/origin/gmud/*'], 120_000).catch(() => {});
+  await fetchRefs(cwd, [], [headSha]);
+  if (!(await git(cwd, ['cat-file', '-e', `${headSha}^{commit}`]).then(() => true, () => false))) return null;
+  const refs = (await git(cwd, ['for-each-ref', '--format=%(refname:short)', 'refs/remotes/origin/main', 'refs/remotes/origin/release/', 'refs/remotes/origin/gmud/']).catch(() => ''))
+    .split('\n').map((ref) => ref.trim()).filter(Boolean);
+  if (refs.length === 0) return null;
+  const own = (await git(cwd, ['rev-list', '--first-parent', headSha, '--not', ...refs]).catch(() => '')).split('\n').filter(Boolean);
+  const fork = own.length ? await git(cwd, ['rev-parse', `${own[own.length - 1]}^`]).catch(() => null) : headSha;
+  if (!fork) return null;
+  const containing = [];
+  for (const ref of refs) {
+    if (await git(cwd, ['merge-base', '--is-ancestor', fork, ref]).then(() => true, () => false)) containing.push(ref.replace(/^origin\//, ''));
+  }
+  return pickOriginBranch(containing);
+}
+
+async function releaseCarriedIntoMain(repo, { nextRelease, headSha }) {
+  const cwd = repo.projectDir;
+  await fetchRefs(cwd, ['main', nextRelease], [headSha]);
+  const targetBase = await git(cwd, ['merge-base', 'origin/main', headSha]).catch(() => null);
+  const base = await git(cwd, ['merge-base', `origin/${nextRelease}`, headSha]).catch(() => null);
+  if (!targetBase || !base || base === targetBase) return null;
+  // Commits on the branch's own first-parent line are its work, even when a paired PR already put them in the
+  // release; only what came in from the release by merge or as the starting point counts as carried along.
+  const own = new Set((await git(cwd, ['rev-list', '--first-parent', `${targetBase}..${headSha}`]).catch(() => '')).split('\n').filter(Boolean));
+  const log = await git(cwd, ['log', '--no-merges', '--format=%H %an', `${targetBase}..${base}`]).catch(() => '');
+  const names = log.split('\n').filter(Boolean)
+    .map((line) => line.match(/^(\S+) (.*)$/)).filter((match) => match && !own.has(match[1]))
+    .map((match) => match[2].trim()).filter(Boolean);
+  if (names.length === 0) return null;
+  return { release: nextRelease, base, commits: names.length, authors: [...new Set(names)].sort() };
+}
+
+// A branch cut from the next release and aimed at main drags the whole release along; reviewing that diff
+// blames the author for everyone's code. Block on the target alone, without touching the ledger or the
+// reviewed marker, so retargeting the PR (same commit) lets the normal review run on the next tick.
+// Posts a pre-review block (the finding, then a "Reprovado" summary without the reviewed marker, then a -10
+// vote) once per head, and records it for the panel. The ledger is untouched, so fixing the cause reviews
+// the same commit on the next tick.
+async function postPreReviewBlock({ repo, pr, gate, kind, finding, summary, logText }) {
+  const prId = pr.pullRequestId;
+  if (TEST_DRY) {
+    console.log(`[pr-review] [dry] WOULD block !${prId} (${kind}): ${logText}`);
+    return true;
+  }
+  threadsCache.delete(`${repo.id}:${prId}`);
+  const { ok, threads } = await getThreads(repo, prId);
+  if (!ok) return true;
+  if (hasTargetBlockSummary(threads, MY_EMAIL, gate.headSha)) return true;
+  let threadId = findingThreadIdsByTitle(threads, MY_EMAIL).get(finding.title) || null;
+  if (threadId) {
+    const existing = threads.find((thread) => Number(thread.id) === Number(threadId));
+    await writeToAzure(`refresh ${kind} block on !${prId}`, async () => {
+      if (existing?.comments?.[0]?.id) {
+        await azRequest('PATCH', repoUrl(repo, `/pullRequests/${prId}/threads/${threadId}/comments/${existing.comments[0].id}`), { content: formatFindingComment({ ...finding, headSha: gate.headSha }) });
+      }
+      if (![1, 'active'].includes(existing?.status)) await azRequest('PATCH', repoUrl(repo, `/pullRequests/${prId}/threads/${threadId}`), { status: 1 });
+    });
+  } else {
+    const posted = await writeToAzure(`post ${kind} block on !${prId}`, () => postFinding(repo, prId, { ...finding, headSha: gate.headSha }));
+    threadId = posted?.id ?? null;
+  }
+  await writeToAzure(`post ${kind} block summary on !${prId}`, () => azRequest('POST', repoUrl(repo, `/pullRequests/${prId}/threads`), {
+    comments: [{ parentCommentId: 0, content: summary({ headSha: gate.headSha, prUrl: prWebUrl(repo.name, prId), threadId }), commentType: 1 }],
+    status: 4,
+  }));
+  await writeToAzure(`vote rejected on !${prId}`, () => setMyVote(prId, VOTE_MAP.rejected, repo)).catch((err) => console.warn(`[pr-review] vote failed on !${prId}: ${err.message}`));
+  await recordPreReviewBlock({ repo: repo.name, prId, headSha: gate.headSha, kind, source: branchOf(pr.sourceRefName), target: branchOf(pr.targetRefName), reason: finding.title })
+    .catch((err) => console.warn(`[pr-review] record block on !${prId}: ${err.message}`));
+  console.log(`[pr-review] !${prId}: bloqueada (${kind}): ${logText}, revisão parada`);
+  return true;
+}
+
+async function blockOnBranchName({ repo, pr, gate }) {
+  if (pr.status && pr.status !== 'active') return false;
+  if (repo.branchGate === false) return false;
+  const finding = checkBranchName({ source: branchOf(pr.sourceRefName), target: branchOf(pr.targetRefName) });
+  if (!finding || finding.blocking === false) return false;
+  return postPreReviewBlock({
+    repo, pr, gate, kind: 'branch-name', finding,
+    summary: (args) => formatNameBlockSummary({ finding, ...args }),
+    logText: `branch ${branchOf(pr.sourceRefName)} sem o tipo no nome`,
+  });
+}
+
+async function blockOnCarriedRelease({ repo, pr, gate }) {
+  if (pr.status && pr.status !== 'active') return false;
+  if (repo.targetGate === false || branchOf(pr.targetRefName) !== 'main') return false;
+  const source = branchOf(pr.sourceRefName);
+  const nextRelease = nextReleaseFrom(await mainVersion(repo.projectDir));
+  if (!nextRelease) return false;
+  if (/^(release|gmud)\//i.test(source)) return false;
+  const carried = await releaseCarriedIntoMain(repo, { nextRelease, headSha: gate.headSha });
+  if (!carried) return false;
+  const targetGate = checkTargetBranch({ source, target: 'main', nextRelease, carried });
+  if (!targetGate) return false;
+  return postPreReviewBlock({
+    repo, pr, gate, kind: 'target', finding: targetGate,
+    summary: (args) => formatTargetBlockSummary({ gate: targetGate, ...args }),
+    logText: `${carried.commits} commit(s) de ${carried.release} indo para main`,
+  });
+}
+
+// Checks that stop a PR before any review, cheapest first: the branch name, then where it points.
+async function preReviewBlock(args) {
+  return (await blockOnBranchName(args)) || (await blockOnCarriedRelease(args));
+}
+
+async function priorFindingsFor(repo, prId, headSha) {
+  threadsCache.delete(`${repo.id}:${prId}`);
+  const { ok, threads } = await getThreads(repo, prId);
+  if (!ok) return [];
+  const prior = [];
+  for (const item of openBotFindings(threads, MY_EMAIL)) {
+    const sinceSha = findingPostedSha(item, threads, MY_EMAIL) || (item.postedAt ? await reviewedShaAt({ repo: repo.name, prId, at: item.postedAt }) : null);
+    if (sinceSha === headSha) continue;
+    prior.push({
+      threadId: item.threadId,
+      title: item.title,
+      fixPrompt: item.fixPrompt,
+      changesSince: sinceSha ? `git diff ${sinceSha}..${headSha}` : null,
+      replies: item.replies,
+    });
+  }
+  return prior;
+}
+
 async function prepareAndQueue({ repo, repos, pr, gate, sensorCfg, onlyParts = null }) {
   const prId = pr.pullRequestId;
   const workItemIds = await getWorkItemIds(repo, prId);
   const workItems = await getWorkItemsWithStories(workItemIds);
   const { wtPath, mergeBase, targetBranch } = await createWorktree(repo, pr, gate.headSha);
+  const originBranch = await branchOrigin(repo, gate.headSha).catch(() => null);
+  if (!TEST_DRY) {
+    await setReviewBranches({ repo: repo.name, prId, headSha: gate.headSha, source: branchOf(pr.sourceRefName), target: targetBranch, origin: originBranch })
+      .catch((err) => console.warn(`[pr-review] branches of !${prId}: ${err.message}`));
+  }
   const pair = await findPairContext(repo, repos, pr, workItemIds);
   const targetGate = repo.targetGate === false ? null : checkTargetBranch({
     source: branchOf(pr.sourceRefName),
@@ -532,6 +692,7 @@ async function prepareAndQueue({ repo, repos, pr, gate, sensorCfg, onlyParts = n
     nextRelease: nextReleaseFrom(await mainVersion(repo.projectDir)),
   });
 
+  const priorFindings = await priorFindingsFor(repo, prId, gate.headSha);
   const conventions = collectRepoConventions(wtPath);
   const contextDir = path.join(wtPath, '.seal-review');
   fs.mkdirSync(contextDir, { recursive: true });
@@ -565,6 +726,7 @@ async function prepareAndQueue({ repo, repos, pr, gate, sensorCfg, onlyParts = n
     docsTree: conventions.docsTree,
     targetGate,
     pair,
+    priorFindings,
     resultBlock: { start: RESULT_BLOCK_START, end: RESULT_BLOCK_END },
   };
   const plan = await planForDiff(wtPath, mergeBase, gate.headSha);
@@ -602,6 +764,7 @@ async function prepareAndQueue({ repo, repos, pr, gate, sensorCfg, onlyParts = n
       lockCommentId: lock?.comments?.[0]?.id ?? null,
       pair: pair.map((paired) => ({ repo: paired.repo, prId: paired.prId, status: paired.status })),
       targetGate,
+      branchReminder: repo.branchGate === false ? null : checkBranchName({ source: branchOf(pr.sourceRefName), target: targetBranch }),
       testSkills: conventions.repoSkills.map((skill) => skill.name).filter((name) => /test|tdd/i.test(name)),
       prUrl: prWebUrl(repo.name, prId),
       chunked,
@@ -610,7 +773,7 @@ async function prepareAndQueue({ repo, repos, pr, gate, sensorCfg, onlyParts = n
     execute_at: chunked ? WAITING_FOR_PARTS_AT : new Date().toISOString(),
     recurrence: null,
     next_run: null,
-    prompt: buildPrompt(),
+    prompt: buildPrompt(repo.name),
     project: wtPath,
     allowed_tools: '[]',
     disallowed_tools: JSON.stringify(DENIED_TOOLS),
@@ -643,7 +806,7 @@ async function prepareAndQueue({ repo, repos, pr, gate, sensorCfg, onlyParts = n
         summary: `${SUMMARY_PREFIX}${prId}: parte ${part.id}/${parts.length} ${part.label}`.slice(0, 80),
         detail: JSON.stringify({ tag: PART_TAG, repo: repo.name, prId, headSha: gate.headSha, part: part.id, parts: parts.length, kind: part.kind, label: part.label }),
         execute_at: new Date().toISOString(),
-        prompt: buildPartPrompt(part, parts.length),
+        prompt: buildPartPrompt(part, parts.length, repo.name),
         session_id: null,
       });
       if (!partSaved) throw new Error(`part ${part.id} of ${task.id} is still active`);
@@ -723,6 +886,17 @@ async function postFinding(repo, prId, finding) {
   }
 }
 
+function reviewHeaderPlain(entry, data, meta) {
+  const counts = countBySeverity(data.findings);
+  const waiting = data.verdict === 'needs-work';
+  return [
+    `${waiting ? '⏸️ Aguardando autor' : '✅ Aprovado'} · ${entry.repo} !${entry.prId}${meta.mode === 're-review' ? ' · re-revisão' : ''}`,
+    `${entry.title} · ${entry.author}`,
+    ...(waiting ? [`🔴 ${counts.blocker} · 🟡 ${counts.warning} · 🔵 ${counts.nit}${data.blockingReason ? ` — ${data.blockingReason}` : ''}`] : []),
+    ...(data.usCoverage ? [`US: ${data.usCoverage.covered ?? 0}/${data.usCoverage.total ?? 0} cenários com teste`] : []),
+  ].join('\n');
+}
+
 function reviewTelegramText(entry, data, meta) {
   const counts = countBySeverity(data.findings);
   const waiting = data.verdict === 'needs-work';
@@ -743,7 +917,11 @@ function reviewTelegramText(entry, data, meta) {
 
 async function offerCharge(entry, data, meta, priorOpen) {
   const config = readMessagingConfig();
-  if (config.charge?.enabled === false || !entry.author) return;
+  if (config.charge?.enabled === false || !entry.author) return false;
+  if (!shouldOfferCharge({ verdict: data.verdict, counts: entry.counts, reReview: meta.mode === 're-review' })) {
+    console.log(`[pr-review] !${entry.prId}: re-revisão sem achado novo, só informativo, sem cobrança`);
+    return false;
+  }
   const message = chargeMessage({
     author: entry.author,
     prId: entry.prId,
@@ -755,15 +933,20 @@ async function offerCharge(entry, data, meta, priorOpen) {
     priorOpen,
   });
   try {
-    await triggerAction('cobranca', {
+    const expired = await supersedePendingOffers({ actionName: 'cobranca', prId: entry.prId });
+    if (expired > 0) console.log(`[pr-review] !${entry.prId}: ${expired} oferta(s) antiga(s) de cobrança substituída(s)`);
+    const offer = await triggerAction('cobranca', {
       connector: config.default,
       author: { name: entry.author, email: entry.authorEmail || null },
       message,
       prId: entry.prId,
       sentKeys: chargeKeys(entry),
+      header: `${reviewHeaderPlain(entry, data, meta)}\n${entry.url}`,
     });
+    return Boolean(offer);
   } catch (err) {
     console.warn(`[pr-review] cobrança de !${entry.prId} não foi oferecida: ${err.message}`);
+    return false;
   }
 }
 
@@ -790,6 +973,12 @@ async function publishCompletedReviews(repos, state, { taskId = null } = {}) {
       continue;
     }
     const pr = await getPrById(prId);
+    if (pr && pr.status !== 'active') {
+      console.log(`[pr-review] !${prId} is ${pr.status}, dropping its finished review without posting`);
+      await db.run(`UPDATE tasks SET result = result || ? WHERE id = ?`, [`\n\n${PUBLISHED_MARKER} skipped-pr-${pr.status}`, task.id]);
+      await finishReview({ ...claim, status: 'cancelled', error: `PR ${pr.status}`, sessionId: task.session_id, worktree: task.project });
+      continue;
+    }
     const parsed = parseTaskResult(task.result, task.project ? path.join(task.project, '.seal-review', 'result.json') : null);
 
     if (!parsed.ok && (task.retry_count || 0) < 1) {
@@ -804,7 +993,7 @@ async function publishCompletedReviews(repos, state, { taskId = null } = {}) {
         updateLock(repo, prId, meta, `⚠️ A revisão automática não gerou um resultado utilizável (${parsed.error}). Vou tentar de novo no próximo commit.`),
       ).catch((err) => console.warn(`[pr-review] lock update failed: ${err.message}`));
       await db.run(`UPDATE tasks SET result = result || ? WHERE id = ?`, [`\n\n${PUBLISH_FAILED_MARKER} ${parsed.error}`, task.id]);
-      await finishReview({ ...claim, status: 'failed', error: parsed.error });
+      await failReview({ ...claim, error: parsed.error });
       await sendTelegram(`⚠️ Review sem resultado utilizável · ${escapeHtml(repo.name)} !${prId} (${escapeHtml(parsed.error)})`);
       continue;
     }
@@ -814,24 +1003,33 @@ async function publishCompletedReviews(repos, state, { taskId = null } = {}) {
     if (meta.targetGate && !data.findings.some((finding) => (finding.sources || []).includes('target-gate'))) {
       data.findings.unshift(meta.targetGate);
     }
+    if (meta.branchReminder?.blocking === false && !data.findings.some((finding) => (finding.sources || []).includes('branch-gate'))) {
+      data.findings.push(meta.branchReminder);
+    }
     data.verdict = deriveVerdict(data.findings);
+    if ((data.priorResolved || []).length > 0 && !TEST_DRY) {
+      const { resolved } = await resolveFromChat(repo, { pr_id: prId, head_sha: meta.headSha }, data.priorResolved, { approve: false, verified: true })
+        .catch((err) => { console.warn(`[pr-review] closing fixed comments on !${prId}: ${err.message}`); return { resolved: [] }; });
+      if (resolved.length > 0) console.log(`[pr-review] !${prId}: ${resolved.length} comentário(s) anterior(es) corrigido(s) no código, fechado(s)`);
+    }
     threadsCache.delete(`${repo.id}:${prId}`);
     const before = await getThreads(repo, prId);
     const priorOpen = before.ok ? countOpenBotThreads(before.threads, MY_EMAIL, { excludeThreadIds: [meta.lockThreadId].filter(Boolean) }) : 0;
+    const priorThreads = before.ok ? openBotFindings(before.threads, MY_EMAIL, { excludeThreadIds: [meta.lockThreadId].filter(Boolean) }) : [];
     data.verdict = verdictFor(blockingFindings(data.findings).length, priorOpen);
     let failures = 0;
     const alreadyPosted = before.ok ? postedFindingTitles(before.threads, MY_EMAIL) : new Set();
     for (const finding of data.findings) {
       if (alreadyPosted.has(finding.title)) continue;
       try {
-        await writeToAzure(`post finding on !${prId}: ${finding.title}`, () => postFinding(repo, prId, finding));
+        await writeToAzure(`post finding on !${prId}: ${finding.title}`, () => postFinding(repo, prId, { ...finding, headSha: meta.headSha }));
       } catch (err) {
         failures++;
         console.warn(`[pr-review] finding post failed on !${prId}: ${err.message.slice(0, 200)}`);
       }
     }
     try {
-      await writeToAzure(`post summary last on !${prId}`, () => postSummaryLast(repo, prId, meta, formatSummaryComment({ data, headSha: meta.headSha, priorOpen })));
+      await writeToAzure(`post summary last on !${prId}`, () => postSummaryLast(repo, prId, meta, formatSummaryComment({ data, headSha: meta.headSha, priorOpen, priorThreads, prUrl: prWebUrl(repo.name, prId) })));
     } catch (err) {
       console.warn(`[pr-review] summary update failed on !${prId}: ${err.message}`);
     }
@@ -860,8 +1058,9 @@ async function publishCompletedReviews(repos, state, { taskId = null } = {}) {
       entry.notified = { ...entry.notified, blocker: entry.reviewedAt };
     }
 
-    await sendTelegram(reviewTelegramText(entry, data, meta));
-    await offerCharge(entry, data, meta, priorOpen);
+    const offered = await offerCharge(entry, data, meta, priorOpen);
+    if (!offered && data.verdict === 'needs-work') await sendTelegram(reviewTelegramText(entry, data, meta));
+    if (!offered && data.verdict !== 'needs-work') await queueDigest(reviewTelegramText(entry, data, meta));
     await db.run(`UPDATE tasks SET result = result || ? WHERE id = ?`, [`\n\n${PUBLISHED_MARKER} ${data.verdict} findings=${data.findings.length} failures=${failures}`, task.id]);
     await finishReview({ ...claim, status: 'published', verdict: data.verdict, findings: data.findings.length, sessionId: task.session_id, worktree: task.project });
     published++;
@@ -959,6 +1158,123 @@ async function cleanupWorktrees(repos) {
   }
 }
 
+const ledgerTime = (value) => (value ? Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(value) ? value : `${value.replace(' ', 'T')}Z`) || 0 : 0);
+
+const AUTHOR_REPLY_QUIET_MS = 10 * 60 * 1000;
+
+async function approveHead({ repo, prId, headSha, sessionId = null, worktree = null, reason }) {
+  await azRequest('POST', repoUrl(repo, `/pullRequests/${prId}/threads`), {
+    comments: [{ parentCommentId: 0, content: `**✅ Aprovado** — ${reason}\n\n${reviewedMarker(headSha)}`, commentType: 1 }],
+    status: 4,
+  });
+  await setMyVote(prId, VOTE_MAP.approved, repo);
+  await finishReview({ repo: repo.name, prId, headSha, status: 'published', verdict: 'approved', findings: 0, sessionId, worktree });
+  const state = readReviewState();
+  const entry = state.prs[String(prId)];
+  if (entry) {
+    Object.assign(entry, { verdict: 'approved', needsAction: (entry.needsAction || []).filter((item) => item.reason !== 'blocker') });
+    writeReviewState(state);
+  }
+  threadsCache.delete(`${repo.id}:${prId}`);
+  await queueDigest(`✅ <b>Aprovado</b> · ${escapeHtml(repo.name)} <a href="${prWebUrl(repo.name, prId)}">!${prId}</a> · ${escapeHtml(reason)}`);
+}
+
+async function verifyResolvedThenApprove({ repo, pr, threads, ledgerForHead }) {
+  if (!needsCommitVerification({ ledgerForHead })) return false;
+  const prId = pr.pullRequestId;
+  if (TEST_DRY) {
+    console.log(`[pr-review] [dry] WOULD verify comments against commits on !${prId}`);
+    return false;
+  }
+  if (!(await markVerifyRequested({ repo: repo.name, prId, headSha: ledgerForHead.head_sha }))) return false;
+  const candidates = [
+    ...resolvedBotFindings(threads, MY_EMAIL).map((item) => ({ ...item, open: false, replies: [] })),
+    ...openBotFindings(threads, MY_EMAIL).map((item) => ({ ...item, open: true })),
+  ];
+  const findings = [];
+  for (const item of candidates) {
+    const sinceSha = findingPostedSha(item, threads, MY_EMAIL) || (item.postedAt ? await reviewedShaAt({ repo: repo.name, prId, at: item.postedAt }) : null);
+    if (sinceSha && sinceSha !== ledgerForHead.head_sha) findings.push({ ...item, sinceSha });
+  }
+  const stillOpen = countOpenBotThreads(threads, MY_EMAIL);
+  if (findings.length === 0 || !ledgerForHead.session_id) {
+    if (stillOpen > 0) return false;
+    await approveHead({ repo, prId, headSha: ledgerForHead.head_sha, sessionId: ledgerForHead.session_id, worktree: ledgerForHead.worktree, reason: 'nenhum ponto pendente no commit revisado.' });
+    console.log(`[pr-review] !${prId}: nada para conferir, aprovada`);
+    return true;
+  }
+  enqueueChatRequest({ prId, question: buildVerifyResolvedQuestion({ prId, headSha: ledgerForHead.head_sha, findings }), source: 'verify-resolved' });
+  console.log(`[pr-review] !${prId}: conferindo ${findings.length} comentário(s) contra os commits (${findings.filter((item) => item.open).length} aberto(s))`);
+  return true;
+}
+
+async function reopenFindings(repo, row, reopen) {
+  const prId = row.pr_id;
+  threadsCache.delete(`${repo.id}:${prId}`);
+  const { ok, threads } = await getThreads(repo, prId);
+  if (!ok) return { reopened: [], missing: reopen.map((item) => item.title) };
+  const byTitle = findingThreadIdsByTitle(threads, MY_EMAIL);
+  const reopened = [];
+  const missing = [];
+  for (const item of reopen) {
+    const threadId = byTitle.get(item.title);
+    if (!threadId) {
+      missing.push(item.title);
+      continue;
+    }
+    const prompt = item.fixPrompt ? `\n\n<details>\n<summary>🤖 Prompt de correção</summary>\n\n\`\`\`\n${item.fixPrompt.replace(/```/g, "'''")}\n\`\`\`\n</details>` : '';
+    await azRequest('POST', repoUrl(repo, `/pullRequests/${prId}/threads/${threadId}/comments`), {
+      parentCommentId: 1,
+      content: `🤖 Revisei os commits depois deste comentário e ainda falta: ${item.missing || 'a correção não aparece no código.'}${prompt}`,
+      commentType: 1,
+    });
+    await azRequest('PATCH', repoUrl(repo, `/pullRequests/${prId}/threads/${threadId}`), { status: 1 });
+    reopened.push(item.title);
+  }
+  threadsCache.delete(`${repo.id}:${prId}`);
+  return { reopened, missing };
+}
+
+async function forwardAuthorReplies(repo, pr, threads, ledgerForHead) {
+  if (ledgerForHead?.status !== 'published' || !ledgerForHead.session_id) return false;
+  const since = Math.max(ledgerTime(ledgerForHead.finished_at), ledgerTime(ledgerForHead.replies_seen_at));
+  const { disputes, latestAt } = authorReplies({ threads, myEmail: MY_EMAIL, since });
+  if (disputes.length === 0) return false;
+  if (Date.now() - latestAt < AUTHOR_REPLY_QUIET_MS) return false;
+  if (pendingChatRequests().some((request) => request.prId === pr.pullRequestId && request.source === 'author-reply')) return false;
+  if (TEST_DRY) {
+    console.log(`[pr-review] [dry] WOULD forward ${disputes.length} author replies on !${pr.pullRequestId}`);
+    return false;
+  }
+  enqueueChatRequest({ prId: pr.pullRequestId, question: buildAuthorReplyQuestion({ prId: pr.pullRequestId, disputes }), source: 'author-reply' });
+  await markRepliesSeen({ repo: repo.name, prId: pr.pullRequestId, headSha: ledgerForHead.head_sha, at: new Date(latestAt).toISOString() });
+  console.log(`[pr-review] !${pr.pullRequestId}: ${disputes.length} achado(s) com resposta do autor, reavaliando sem commit novo`);
+  return true;
+}
+
+async function notifyOwnerWorkItems(prId, workItems) {
+  const lines = workItems.map((item) => `• #${item.id}: ${item.change}`);
+  const url = (id) => `https://dev.azure.com/${ORG}/${PROJECT}/_workitems/edit/${id}`;
+  await sendTelegram([`📝 <b>Work item para você ajustar</b> · !${prId}`, ...lines.map(escapeHtml), '', ...workItems.map((item) => url(item.id))].join('\n')).catch(() => {});
+  const config = readMessagingConfig();
+  if (config.ownerNotify?.enabled === false) return;
+  const text = [`SEAL: a revisão da !${prId} depende de ajuste em work item, e quem ajusta é você:`, ...lines, ...workItems.map((item) => url(item.id))].join('\n');
+  await getMessagingConnector(config.default, config)
+    .sendDirect({ email: MY_EMAIL }, text)
+    .catch((err) => console.warn(`[pr-review] aviso de work item no Teams falhou: ${err.message}`));
+}
+
+async function clearStaleFailureNotices(repo, pr, threads, ledgerForHead) {
+  const stale = staleFailureNotices({ threads, myEmail: MY_EMAIL, headStatus: ledgerForHead?.status });
+  for (const notice of stale) {
+    const url = repoUrl(repo, `/pullRequests/${pr.pullRequestId}/threads/${notice.threadId}/comments/${notice.commentId}`);
+    await writeToAzure(`delete stale failure notice on !${pr.pullRequestId}`, () => azRequest('DELETE', url));
+    console.log(`[pr-review] !${pr.pullRequestId}: aviso de falha apagado, o commit ${ledgerForHead.head_sha.slice(0, 8)} já foi publicado`);
+  }
+  if (stale.length > 0) threadsCache.delete(`${repo.id}:${pr.pullRequestId}`);
+  return stale.length;
+}
+
 async function clearZombieLocks(repo, pr, threads) {
   const lockComment = threads
     .flatMap((thread) => (thread.comments || []).map((comment) => ({ thread, comment })))
@@ -993,6 +1309,11 @@ async function usageLimitOf(taskId, result) {
   const failedAt = run.finished_at ? new Date(run.finished_at) : new Date();
   return parseUsageLimit(`${run.stdout_preview || ''}\n${run.stderr_preview || ''}`, failedAt);
 }
+
+const failureReason = (result) => (/sigterm|exit code 143/i.test(result) ? 'processo encerrado no meio' : result.slice(0, 120) || 'motivo desconhecido');
+
+const formatRetryAt = (retryAt) =>
+  new Date(`${retryAt.replace(' ', 'T')}Z`).toLocaleString('pt-BR', { timeZone: 'America/Sao_Paulo', day: '2-digit', month: '2-digit', hour: '2-digit', minute: '2-digit' });
 
 async function retryFailedReviews(repos) {
   const recoverable = ['sigterm', 'exit code 143', 'exit code -2', 'orphaned', 'enoent', 'no such file', 'worktree missing'];
@@ -1032,8 +1353,16 @@ async function retryFailedReviews(repos) {
     const meta = parseDetail(task.detail);
     const repo = meta && repos.find((candidate) => candidate.name === meta.repo);
     if (repo && (retryCount >= MAX_RETRIES || !isRecoverable)) {
-      await writeToAzure(`mark lock failed on !${meta.prId}`, () => updateLock(repo, meta.prId, meta, '⚠️ A revisão automática falhou. Vou tentar de novo no próximo commit.')).catch(() => {});
-      await finishReview({ repo: repo.name, prId: meta.prId, headSha: meta.headSha, status: 'failed', error: result.slice(0, 500) });
+      const outcome = await failReview({ repo: repo.name, prId: meta.prId, headSha: meta.headSha, error: result.slice(0, 500) || 'unknown' });
+      const lockText = outcome.retryAt
+        ? `⚠️ A revisão automática foi interrompida (${failureReason(result)}). Tento de novo sozinho a partir de ${formatRetryAt(outcome.retryAt)}.`
+        : '⚠️ A revisão automática falhou. Vou tentar de novo no próximo commit.';
+      await writeToAzure(`mark lock failed on !${meta.prId}`, () => updateLock(repo, meta.prId, meta, lockText)).catch(() => {});
+      if (!outcome.retryAt) {
+        const why = outcome.exhausted ? `interrompida ${outcome.rounds - 1} vezes seguidas` : 'falha que não se resolve sozinha';
+        await sendTelegram(`⚠️ Revisão automática desistiu · ${escapeHtml(repo.name)} !${meta.prId} (${why}: ${escapeHtml(result.slice(0, 200) || 'sem detalhe')}). Só volta no próximo commit.`).catch(() => {});
+      }
+      console.log(`[pr-review] !${meta.prId}@${meta.headSha.slice(0, 8)} falhou (${outcome.kind}, rodada ${outcome.rounds})${outcome.retryAt ? `; nova tentativa a partir de ${outcome.retryAt} UTC` : ''}`);
       await db.run(`UPDATE tasks SET status = 'archived' WHERE id = ?`, [task.id]);
     }
   }
@@ -1071,8 +1400,13 @@ const REASON_LABEL = {
 
 const HEALTH_ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
 
+const SLEEP_SENSITIVE_ISSUES = /^(long-run|stuck-claim|publishing):/;
+const HEALTH_AFTER_WAKE_MS = 60 * 60 * 1000;
+
 async function alertHealth(state, now, extraIssues = []) {
-  const issues = [...(await healthIssues()), ...extraIssues];
+  const justWoke = sleepTracker().sleptWithin(HEALTH_AFTER_WAKE_MS) || process.uptime() * 1000 < HEALTH_AFTER_WAKE_MS;
+  const quiet = Boolean(quietUntil(new Date(now)));
+  const issues = [...(await healthIssues()), ...extraIssues].filter((issue) => !(justWoke && SLEEP_SENSITIVE_ISSUES.test(issue.key)));
   const notified = state.health?.notified || {};
   const fresh = issues.filter((issue) => !notified[issue.key] || now - new Date(notified[issue.key]).getTime() >= HEALTH_ALERT_COOLDOWN_MS);
   state.health = {
@@ -1080,7 +1414,7 @@ async function alertHealth(state, now, extraIssues = []) {
     issues: issues.map((issue) => issue.text),
     notified: Object.fromEntries(Object.entries(notified).filter(([key]) => issues.some((issue) => issue.key === key))),
   };
-  if (fresh.length === 0) return;
+  if (fresh.length === 0 || quiet) return;
   for (const issue of fresh) state.health.notified[issue.key] = new Date(now).toISOString();
   await sendTelegram(['⚠️ <b>Revisão automática travada</b>', ...fresh.map((issue) => `• ${escapeHtml(issue.text)}`)].join('\n'));
 }
@@ -1106,7 +1440,7 @@ async function sendDigest(digest) {
       .filter(Boolean)
       .join('\n');
   });
-  await sendTelegram([`📣 <b>PRs que pedem uma cobrança</b> (${byPr.size})`, ...blocks].join('\n\n'));
+  await queueDigest([`📣 <b>PRs que pedem uma cobrança</b> (${byPr.size})`, ...blocks].join('\n\n'));
 }
 
 async function refreshPairStatuses(state) {
@@ -1204,13 +1538,17 @@ export async function runAzurePrReview(sensorCfg = {}) {
       if (inFlight) continue;
 
       const headSha = (pr.lastMergeSourceCommit?.commitId || '').toLowerCase();
+      const ledgerForHead = headSha ? await reviewForSha({ repo: repo.name, prId: pr.pullRequestId, headSha }) : null;
+      await clearStaleFailureNotices(repo, pr, threads, ledgerForHead).catch((err) => console.warn(`[pr-review] stale notice cleanup on !${pr.pullRequestId}: ${err.message}`));
+      await forwardAuthorReplies(repo, pr, threads, ledgerForHead).catch((err) => console.warn(`[pr-review] author replies on !${pr.pullRequestId}: ${err.message}`));
+      if (await verifyResolvedThenApprove({ repo, pr, threads, ledgerForHead }).catch((err) => { console.warn(`[pr-review] verify resolved on !${pr.pullRequestId}: ${err.message}`); return false; })) continue;
       const gate = decideReviewGate({
         pr,
         threads,
         myEmail: MY_EMAIL,
         eligibilityStart,
         testPrs: TEST_PRS,
-        ledgerForHead: headSha ? await reviewForSha({ repo: repo.name, prId: pr.pullRequestId, headSha }) : null,
+        ledgerForHead,
         lastPublishedSha: (await lastPublishedReview({ repo: repo.name, prId: pr.pullRequestId }))?.head_sha || null,
       });
       if (gate.action === 'skip') {
@@ -1226,6 +1564,10 @@ export async function runAzurePrReview(sensorCfg = {}) {
     const failureKey = `${repo.name}:${pr.pullRequestId}:${gate.headSha}`;
     if (backoffActive(failureKey, now)) {
       stats.skipped.backoff = (stats.skipped.backoff || 0) + 1;
+      continue;
+    }
+    if (await preReviewBlock({ repo, pr, gate }).catch((err) => { console.warn(`[pr-review] pre-review block on !${pr.pullRequestId}: ${err.message}`); return false; })) {
+      stats.skipped['pre-review-blocked'] = (stats.skipped['pre-review-blocked'] || 0) + 1;
       continue;
     }
     if (slots <= 0) {
@@ -1274,6 +1616,11 @@ export async function runAzurePrReview(sensorCfg = {}) {
   await alertHealth(state, now, extraIssues).catch((err) => console.warn(`[pr-review] health: ${err.message}`));
   writeReviewState(state, now);
   await retryFailedReviews(repos).catch((err) => console.warn(`[pr-review] retry: ${err.message}`));
+  // The digest (approvals, follow-ups to charge) lives in the panel; Telegram gets it only when turned on.
+  const digestOut = sensorCfg.azure_pr_review_telegram_digest === true
+    ? flushDigestIfDue({ send: sendTelegram })
+    : db.run(`UPDATE telegram_digest SET flushed_at = ? WHERE flushed_at IS NULL`, [new Date().toISOString()]);
+  await digestOut.catch((err) => console.warn(`[pr-review] digest: ${err.message}`));
 
   lastBacklog = stats.skipped['no-slot'] || 0;
   console.log(`[pr-review] Done. ${JSON.stringify(stats)}`);
@@ -1307,6 +1654,7 @@ export async function runSinglePrReview({ repoName, prId, sensorCfg = {}, timeou
     lastPublishedSha: (await lastPublishedReview({ repo: repo.name, prId }))?.head_sha || null,
   });
   if (gate.action === 'skip') return { skipped: gate.reason };
+  if (await preReviewBlock({ repo, pr, gate })) return { skipped: 'pre-review-blocked' };
   if (!(await enqueueReview({ repo, repos, pr, gate, sensorCfg }))) return { skipped: TEST_DRY ? 'dry-run' : 'already-claimed' };
 
   const taskId = `seal_pr_${prId}`;
@@ -1322,7 +1670,7 @@ export async function runSinglePrReview({ repoName, prId, sensorCfg = {}, timeou
     return { waiting: true, note: 'o runner continua a revisão e publica sozinho quando terminar' };
   }
   if (task.status !== 'done') {
-    await finishReview({ repo: repo.name, prId, headSha: gate.headSha, status: 'failed', error: `task ${task.status}` });
+    await failReview({ repo: repo.name, prId, headSha: gate.headSha, error: task.result?.slice(0, 500) || `task ${task.status}` });
     return { failed: task.status, result: task.result?.slice(0, 500) };
   }
   const state = readReviewState();
@@ -1332,7 +1680,20 @@ export async function runSinglePrReview({ repoName, prId, sensorCfg = {}, timeou
   return { published, verdict: state.prs[String(prId)]?.verdict, counts: state.prs[String(prId)]?.counts };
 }
 
+// Anything on this machine (the Projeto panel's "verificar agora") asks for a scan by touching this file.
+export const TICK_REQUEST_FILE = path.join(os.homedir(), '.config', 'seal', 'run', 'pr-review.tick-now');
+
+function takeTickRequest() {
+  try {
+    fs.unlinkSync(TICK_REQUEST_FILE);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function shouldTickNow() {
+  if (takeTickRequest()) return 'manual';
   const awaitingPublish = await db.get(
     `SELECT id FROM tasks WHERE summary LIKE ? AND detail LIKE ? AND status = 'done' AND result IS NOT NULL AND result NOT LIKE ? AND result NOT LIKE ?
        AND id NOT IN (SELECT task_id FROM pr_reviews WHERE status = 'publishing' AND task_id IS NOT NULL) LIMIT 1`,
@@ -1380,32 +1741,35 @@ async function askReviewAgent(row, question) {
   return stdout.trim();
 }
 
-async function resolveFromChat(repo, row, resolves) {
+async function resolveFromChat(repo, row, resolves, { approve = true, verified = false } = {}) {
   const prId = row.pr_id;
   threadsCache.delete(`${repo.id}:${prId}`);
   const { ok, threads } = await getThreads(repo, prId);
   if (!ok) return { resolved: [], missing: resolves.map((item) => item.title), approved: false };
   const byTitle = findingThreadIdsByTitle(threads, MY_EMAIL);
+  const openIds = new Set(openBotFindings(threads, MY_EMAIL).map((item) => Number(item.threadId)));
   const resolved = [];
   const missing = [];
   for (const item of resolves) {
-    const threadId = byTitle.get(item.title);
+    const threadId = item.threadId ? (openIds.has(Number(item.threadId)) ? Number(item.threadId) : null) : byTitle.get(item.title);
     if (!threadId) {
-      missing.push(item.title);
+      missing.push(item.title || `thread ${item.threadId}`);
       continue;
     }
     await azRequest('POST', repoUrl(repo, `/pullRequests/${prId}/threads/${threadId}/comments`), {
       parentCommentId: 1,
-      content: `🤖 Resolvido depois de uma conversa com o revisor: ${item.reason || 'o achado não se sustenta.'}`,
+      content: verified
+        ? `🤖 Conferi os commits depois deste comentário e a correção está no código: ${item.reason || 'corrigido.'}`
+        : `🤖 Resolvido depois de uma conversa com o revisor: ${item.reason || 'o achado não se sustenta.'}`,
       commentType: 1,
     });
-    await azRequest('PATCH', repoUrl(repo, `/pullRequests/${prId}/threads/${threadId}`), { status: 3 });
-    resolved.push(item.title);
+    await azRequest('PATCH', repoUrl(repo, `/pullRequests/${prId}/threads/${threadId}`), { status: verified ? 2 : 3 });
+    resolved.push(item.title || `thread ${threadId}`);
   }
   threadsCache.delete(`${repo.id}:${prId}`);
   const after = await getThreads(repo, prId);
   const stillOpen = after.ok ? countOpenBotThreads(after.threads, MY_EMAIL) : 1;
-  const approved = resolved.length > 0 && stillOpen === 0;
+  const approved = approve && resolved.length > 0 && stillOpen === 0;
   if (approved) {
     await azRequest('POST', repoUrl(repo, `/pullRequests/${prId}/threads`), {
       comments: [{ parentCommentId: 0, content: `**✅ Aprovado** — os pontos pendentes foram resolvidos na conversa com o revisor.\n\n${reviewedMarker(row.head_sha)}`, commentType: 1 }],
@@ -1416,9 +1780,14 @@ async function resolveFromChat(repo, row, resolves) {
   return { resolved, missing, approved };
 }
 
+const AUTOMATIC_CHAT_SOURCES = new Set(['author-reply', 'verify-resolved']);
+
 export async function processNextChatRequest(sensorCfg = {}) {
   if (chatting) return false;
-  const [request] = pendingChatRequests();
+  const requests = pendingChatRequests();
+  if (requests.length === 0) return false;
+  const resting = (await restState(Date.now(), { ignoreBattery: true })).resting;
+  const request = resting ? requests.find((item) => !AUTOMATIC_CHAT_SOURCES.has(item.source)) : requests[0];
   if (!request) return false;
   chatting = true;
   try {
@@ -1430,15 +1799,36 @@ export async function processNextChatRequest(sensorCfg = {}) {
     const row = await lastConversableReview(request.prId);
     let answer;
     let outcome = { resolved: [], missing: [], approved: false };
+    let workItems = [];
     if (!row) {
       answer = `Não tenho uma revisão com sessão guardada para a !${request.prId}. Só as revisões feitas depois desta função guardam a conversa; a próxima revisão desta PR já vai permitir.`;
     } else {
       const repo = repos.find((candidate) => candidate.name === row.repo);
       if (!repo) throw new Error(`repo ${row.repo} não está configurado`);
+      const pr = await azRequest('GET', repoUrl(repo, `/pullRequests/${row.pr_id}`)).catch(() => null);
+      if (pr && pr.status !== 'active') {
+        const closed = pr.status === 'abandoned' ? 'abandonada' : pr.status === 'completed' ? 'concluída' : pr.status;
+        appendChatEntry(request.prId, { role: 'agent', text: `A !${request.prId} está ${closed}: não há nada a fazer nela.`, actions: [], at: new Date().toISOString(), requestId: request.id });
+        if (!AUTOMATIC_CHAT_SOURCES.has(request.source)) await sendTelegram(`🤖 <b>Revisor da !${request.prId}</b>\n\nA PR está ${escapeHtml(closed)}: não há nada a fazer nela.`);
+        return true;
+      }
       await ensureReviewWorktree(repo, row);
       const reply = parseChatReply(await askReviewAgent(row, request.question));
       answer = reply.answer || '(o revisor não respondeu nada)';
-      if (reply.resolves.length > 0 && !TEST_DRY) outcome = await resolveFromChat(repo, row, reply.resolves);
+      if (reply.resolves.length > 0 && !TEST_DRY) outcome = await resolveFromChat(repo, row, reply.resolves, { approve: request.source !== 'verify-resolved', verified: request.source === 'verify-resolved' });
+      workItems = reply.workItems;
+      if (workItems.length > 0 && !TEST_DRY) await notifyOwnerWorkItems(request.prId, workItems);
+      if (request.source === 'verify-resolved' && !TEST_DRY) {
+        const { reopened, missing: notFound } = reply.reopen.length ? await reopenFindings(repo, row, reply.reopen) : { reopened: [], missing: [] };
+        outcome = { ...outcome, reopened, missing: [...outcome.missing, ...notFound] };
+        threadsCache.delete(`${repo.id}:${row.pr_id}`);
+        const after = await getThreads(repo, row.pr_id);
+        const openAfter = after.ok ? countOpenBotThreads(after.threads, MY_EMAIL) : 1;
+        if (reopened.length === 0 && notFound.length === 0 && openAfter === 0) {
+          await approveHead({ repo, prId: row.pr_id, headSha: row.head_sha, sessionId: row.session_id, worktree: row.worktree, reason: 'conferi os commits depois de cada comentário resolvido e as correções estão no código.' });
+          outcome = { ...outcome, approved: true };
+        }
+      }
       if (outcome.approved) {
         const state = readReviewState();
         const entry = state.prs[String(request.prId)];
@@ -1452,11 +1842,15 @@ export async function processNextChatRequest(sensorCfg = {}) {
       ...outcome.resolved.map((title) => `resolvido: ${title}`),
       ...outcome.missing.map((title) => `não achei a thread de: ${title}`),
       ...(outcome.approved ? ['PR aprovada: não sobrou comentário aberto'] : []),
+      ...workItems.map((item) => `ajustar #${item.id}: ${item.change}`),
+      ...(outcome.reopened || []).map((title) => `reaberto, ainda falta: ${title}`),
     ];
     appendChatEntry(request.prId, { role: 'agent', text: answer, actions, at: new Date().toISOString(), requestId: request.id });
-    const lines = [`🤖 <b>Revisor da !${request.prId}</b>`, '', escapeHtml(answer.slice(0, 3500))];
+    const heading = request.source === 'author-reply' ? `🤖 <b>Revisor da !${request.prId}</b> · reavaliou as respostas do autor` : `🤖 <b>Revisor da !${request.prId}</b>`;
+    const lines = [heading, '', escapeHtml(answer.slice(0, 3500))];
     if (actions.length > 0) lines.push('', ...actions.map((action) => `• ${escapeHtml(action)}`));
-    await sendTelegram(lines.join('\n'));
+    const informOnly = request.source === 'verify-resolved' && !(outcome.reopened || []).length;
+    if (!informOnly && (request.source !== 'author-reply' || actions.length > 0)) await sendTelegram(lines.join('\n'));
   } catch (err) {
     console.warn(`[pr-review] chat !${request.prId} failed: ${err.message}`);
     appendChatEntry(request.prId, { role: 'agent', text: `Não consegui falar com o revisor: ${err.message.slice(0, 300)}`, actions: [], at: new Date().toISOString(), requestId: request.id, error: true });
@@ -1485,6 +1879,41 @@ export async function requeueReviewParts({ repoName, prId, parts: onlyParts, sen
   const gate = { action: row.mode, headSha, previousSha: null };
   await prepareAndQueue({ repo, repos, pr, gate, sensorCfg, onlyParts });
   return { requeued: onlyParts, headSha };
+}
+
+// One-off for ledger rows written before the branches were recorded: source and target come from the PR as it
+// is now; the origin only for PRs still open, since after the merge the branch's commits are in every mainline.
+export async function backfillReviewBranches({ sensorCfg = {} } = {}) {
+  const missing = configureAzure(sensorCfg);
+  if (missing.length > 0) throw new Error(`ingest.json sensors is missing ${missing.join(', ')}`);
+  const repos = resolveReviewRepos(sensorCfg.azure_pr_review_repos);
+  const rows = await db.all(`SELECT DISTINCT repo, pr_id FROM pr_reviews WHERE source_branch IS NULL OR origin_branch IS NULL`);
+  let filled = 0;
+  for (const row of rows) {
+    const repo = repos.find((candidate) => candidate.name === row.repo);
+    if (!repo) continue;
+    const pr = await azRequest('GET', repoUrl(repo, `/pullRequests/${row.pr_id}`)).catch(() => null);
+    if (!pr) continue;
+    const headSha = (pr.lastMergeSourceCommit?.commitId || '').toLowerCase();
+    const origin = pr.status === 'active' && headSha ? await branchOrigin(repo, headSha).catch(() => null) : null;
+    await db.run(
+      `UPDATE pr_reviews SET source_branch = COALESCE(source_branch, ?), target_branch = COALESCE(target_branch, ?), origin_branch = COALESCE(origin_branch, ?)
+       WHERE repo = ? AND pr_id = ? AND (source_branch IS NULL OR origin_branch IS NULL)`,
+      [branchOf(pr.sourceRefName), branchOf(pr.targetRefName), origin, row.repo, row.pr_id],
+    );
+    filled++;
+  }
+  return { prs: rows.length, filled };
+}
+
+export async function blockPrOnTarget({ repoName, prId, sensorCfg = {} }) {
+  const missing = configureAzure(sensorCfg);
+  if (missing.length > 0) throw new Error(`ingest.json sensors is missing ${missing.join(', ')}`);
+  const repo = resolveReviewRepos(sensorCfg.azure_pr_review_repos).find((candidate) => candidate.name === repoName);
+  if (!repo) throw new Error(`repo ${repoName} is not configured`);
+  const pr = await azRequest('GET', repoUrl(repo, `/pullRequests/${prId}`));
+  const headSha = (pr.lastMergeSourceCommit?.commitId || '').toLowerCase();
+  return { blocked: await preReviewBlock({ repo, pr, gate: { headSha } }), headSha };
 }
 
 export async function relabelReminderThreads({ repoName, prId, sensorCfg = {} }) {

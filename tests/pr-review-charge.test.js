@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { chargeMessage, chargeKeys, markChargeSent } from '../src/sensors/pr-review-charge.js';
+import { chargeMessage, chargeKeys, markChargeSent, shouldOfferCharge } from '../src/sensors/pr-review-charge.js';
 import { TeamsConnector } from '../src/messaging/teams.js';
 import { SendChargeAction } from '../src/actions/send-charge.js';
 import { ActionRegistry } from '../src/actions/registry.js';
@@ -62,7 +62,7 @@ test('conector do Teams manda para o teamsbot o e-mail e o texto', async () => {
   const teams = new TeamsConnector({ url: 'http://127.0.0.1:4317/', fetchImpl });
   const res = await teams.sendDirect({ name: 'Bruno Lima Costa', email: 'pessoa@example.com' }, 'oi');
   assert.equal(calls[0].url, 'http://127.0.0.1:4317/api/send');
-  assert.deepEqual(calls[0].body, { to: 'pessoa@example.com', message: 'oi', headless: true });
+  assert.deepEqual(calls[0].body, { to: 'pessoa@example.com', message: 'oi', html: 'oi', headless: true });
   assert.equal(res.sentAt, '2026-09-25T10:05:00Z');
 });
 
@@ -258,4 +258,13 @@ test('ação mensagem mostra destinatário com e-mail e quem pediu', async () =>
   assert.equal(action.name, 'mensagem');
   const preview = await action.preview({ author: { name: 'Bruno Nunes', email: 'pessoa@example.com' }, message: 'oi', origin: 'sessão do Claude Code (MCP do Teams)' });
   assert.match(preview.summary, /para Bruno Nunes <Bruno\.Nunes@empresa\.com>\?\nPedido por: sessão do Claude Code/);
+});
+
+test('a re-review with no new finding is only informative: no charge is offered to send', () => {
+  assert.equal(shouldOfferCharge({ verdict: 'needs-work', counts: {}, reReview: true }), false);
+  assert.equal(shouldOfferCharge({ verdict: 'needs-work', counts: { warning: 0, blocker: 0 }, reReview: true }), false);
+  assert.equal(shouldOfferCharge({ verdict: 'needs-work', counts: { warning: 1 }, reReview: true }), true);
+  assert.equal(shouldOfferCharge({ verdict: 'needs-work', counts: { blocker: 2 }, reReview: false }), true);
+  assert.equal(shouldOfferCharge({ verdict: 'approved', counts: {}, reReview: true }), false);
+  assert.equal(shouldOfferCharge({ verdict: 'approved', counts: {}, reReview: false }), false);
 });

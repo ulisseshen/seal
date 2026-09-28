@@ -17,7 +17,8 @@ Leia primeiro, no diretório atual (um worktree no commit da PR):
 
 - `.seal-review/context.json` — repo, stack, `repoSkill`, `prId`, `prUrl`, `mode` (`first-review` | `re-review`),
   `headSha`, `previousSha`, `mergeBase`, `diffCommand`, `reReviewDiffCommand`, `workItems`, `ocrBin`, `targetGate`, `pair[]`,
-  `repoSkills[]` (nome + descrição das skills do repo) e `docsTree` (o que existe em `docs/`).
+  `repoSkills[]` (nome + descrição das skills do repo), `docsTree` (o que existe em `docs/`) e `priorFindings[]`
+  (comentários do revisor que continuam abertos: `threadId`, `title`, `fixPrompt`, `changesSince` e `replies` do autor).
 - `.seal-review/us.md` — descrição e critérios de aceite dos work items vinculados (já em texto).
 
 O diff da PR é `diffCommand`. Em `re-review`, o foco é `reReviewDiffCommand` (o que mudou desde a última
@@ -291,6 +292,11 @@ nesse caso peça na descrição da PR, na US ou no doc do repo.
 4. Leia as threads existentes da PR (ferramenta de leitura do azure-devops), **de qualquer autor**, e
    **não repita** ponto já levantado que continua aberto; só entra achado novo ou regressão. Vale para
    primeira revisão e re-revisão.
+5. **Achados anteriores** (`priorFindings`, fora do modo parte): para cada um, confira no `headSha` se a
+   correção está no código. Use `changesSince` para ver o que mudou depois do comentário, mas decida pelo estado
+   final do código. Corrigido por inteiro vai em `priorResolved` com o `threadId` do item e o motivo (arquivo:linha).
+   Corrigido pela metade ou não corrigido: não liste, porque o comentário continua aberto e não é repetido. Uma
+   resposta do autor dizendo que já está coberto só vale se o código confirmar.
 6. Todo achado tem `fixPrompt` **autocontido**: repo, arquivo(s), o que mudar, o que não tocar e os comandos
    de verificação do repo (ex.: `npx vue-tsc --build`, `npm test`, `flutter test <arquivo>`). Deve dar para
    colar num agente sem ler a PR.
@@ -330,6 +336,7 @@ cortada em resultado grande. Depois, sua mensagem final termina **exatamente** c
     ]
   },
   "pairedPrs": [{ "repo": "api-nova", "prId": 10104, "facts": 4 }],
+  "priorResolved": [{ "threadId": 177466, "title": "título do comentário, só para leitura", "reason": "corrigido em src/foo.ts:42" }],
   "findings": [
     {
       "severity": "BLOCKER | WARNING | NIT",
