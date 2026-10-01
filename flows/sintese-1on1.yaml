@@ -6,11 +6,11 @@ description: >
 version: 1
 
 defaults:
-  # Pasta-raiz do time no vault Obsidian. Ajuste se mudar de máquina.
-  team_dir: /Users/ulisseshen/Documents/empresa/team/mobile
+  # Pasta-raiz do time no vault Obsidian: vem de SEAL_TEAM_DIR no ambiente do runner.
+  team_dir: ${SEAL_TEAM_DIR}
   # Sufixo do mês a sintetizar — o flow casa arquivos *<cycle>*.md (case-insensitive).
   cycle: Junho
-  out_dir: /Users/ulisseshen/Documents/empresa/team/mobile
+  out_dir: ${SEAL_TEAM_DIR}
 
 steps:
   # 1. Junta todos os 1:1 do ciclo num único blob, com cabeçalho por pessoa.

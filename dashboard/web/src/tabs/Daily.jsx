@@ -50,7 +50,7 @@ export default function Daily() {
       <div className="daily-input">
         <textarea
           className="daily-textarea"
-          placeholder="Ex: Gus: terminou o endpoint de pedidos, hoje pega a tela de listagem, travado numa dúvida de Vue.&#10;Carla: fechou a migração do tela de clientes, vai começar os testes. Tranquila."
+          placeholder="Ex: Gus: terminou o endpoint de pedidos, hoje pega a tela de listagem, travado numa dúvida de Vue.&#10;Carla: fechou a migração da tela de clientes, vai começar os testes. Tranquila."
           value={text}
           onChange={(e) => setText(e.target.value)}
           rows={5}

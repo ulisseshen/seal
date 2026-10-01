@@ -88,7 +88,7 @@ test('reconhece um TL Log típico pelo enquadramento retrospectivo', () => {
 test('reconhece um radar de incidentes pelo tom de triagem', () => {
   const fala =
     'Teve um incidente no Flutter legado, caiu o login de uns clientes. ' +
-    'O impacto é médio, a hipótese é token expirando cedo, o Hugo já atuou.';
+    'O impacto é médio, a hipótese é token expirando cedo, o gestor já atuou.';
 
   const r = classifyByHeuristic(fala);
   assert.equal(r.kind, 'radar');

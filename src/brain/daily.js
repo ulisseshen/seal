@@ -14,7 +14,8 @@
 import { randomBytes } from 'node:crypto';
 import { readFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
-import { db, insertTask } from '../db.js';
+import { db, insertTask, listTeamMembers } from '../db.js';
+import { readCheckinPeople, resolveTeamRecipient } from './team-recipient.js';
 import { getProvider } from '../providers/index.js';
 import { getBreaker } from '../circuit-breaker.js';
 
@@ -228,16 +229,6 @@ export async function buildCheckinSuggestion(person) {
   };
 }
 
-// Email do time, pra enviar via o server Playwright do Teams. Carla vai por nome
-// (não tem email no contacts), igual o daily-checkin.sh faz.
-const TEAMS_TO = {
-  Felipe: 'pessoa@example.com',
-  Gus: 'pessoa@example.com',
-  Gustavo: 'pessoa@example.com',
-  Carla: 'pessoa@example.com',
-  Rafael: 'pessoa@example.com',
-};
-
 const TEAMS_SEND_URL = process.env.SEAL_TEAMS_SEND_URL || 'http://127.0.0.1:4317/api/send';
 
 /**
@@ -245,7 +236,7 @@ const TEAMS_SEND_URL = process.env.SEAL_TEAMS_SEND_URL || 'http://127.0.0.1:4317
  * O TL aprova ANTES de chamar isto — esta função só dispara o que foi aprovado.
  */
 export async function sendToTeams(person, message) {
-  const to = TEAMS_TO[person] || person;
+  const to = resolveTeamRecipient(person, await listTeamMembers({ limit: 500 }).catch(() => []));
   try {
     const res = await fetch(TEAMS_SEND_URL, {
       method: 'POST',
@@ -260,10 +251,10 @@ export async function sendToTeams(person, message) {
 }
 
 /**
- * Prepara as sugestões de check-in pra uma lista de pessoas (default: o time).
+ * Prepara as sugestões de check-in pra uma lista de pessoas (default: `checkin` em ~/.config/seal/team.json).
  * NÃO envia — só gera. O comando /seal:checkin mostra e o TL escolhe o que disparar.
  */
-export async function prepareCheckins(people = ['Felipe', 'Gus', 'Carla', 'Rafael']) {
+export async function prepareCheckins(people = readCheckinPeople()) {
   const out = [];
   for (const person of people) {
     try {
@@ -289,7 +280,7 @@ function genericQuestion(person) {
  * @param {string[]} people
  * @returns {Promise<Array<{person, action, sent?, message?}>>}
  */
-export async function proposeCheckinsViaTelegram(gateway, people = ['Felipe', 'Gus', 'Carla', 'Rafael']) {
+export async function proposeCheckinsViaTelegram(gateway, people = readCheckinPeople()) {
   if (!gateway || typeof gateway.confirm !== 'function') {
     throw new Error('gateway com confirm() é necessário pra propor check-ins no Telegram');
   }

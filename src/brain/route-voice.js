@@ -88,7 +88,7 @@ const TL_LOG_HINTS = [
 const RADAR_HINTS = [
   'incidente', 'incidentes', 'caiu', 'quebrou', 'erro em produção',
   'erro em producao', 'alerta', 'impacto', 'cliente afetado',
-  'hipótese', 'hipotese', 'Hugo', 'triagem', 'rollback',
+  'hipótese', 'hipotese', 'triagem', 'rollback',
   'flutter', 'legado',
 ];
 
@@ -145,7 +145,7 @@ const CLASSIFY_SYSTEM = [
   '  apareceu, decisão técnica, bug que merece prevenção, quem ele ajudou, o que',
   '  lembrar amanhã. Tom retrospectivo, sobre o dia inteiro.',
   '- "radar": leitura matinal do grupo de incidentes. Fala de incidente específico,',
-  '  o que afeta, se tem dono, hipótese, se o Hugo já atuou. Tom de triagem, sobre',
+  '  o que afeta, se tem dono, hipótese, se o gestor já atuou. Tom de triagem, sobre',
   '  um ou mais incidentes concretos.',
   '- "outro": não é nenhum dos dois (uma tarefa solta, um lembrete, uma nota sobre',
   '  uma pessoa do time).',
