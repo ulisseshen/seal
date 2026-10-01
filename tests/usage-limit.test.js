@@ -50,7 +50,7 @@ test('mensagem diz que o limite acabou e a hora local de retomada', () => {
   const msg = usageLimitMessage(limit, 'smart-review PR #10110: parte 1/3');
   assert.match(msg, /limite da sessão de 5h do Claude acabou/);
   assert.match(msg, /retoma sozinha às 18:10/);
-  assert.match(msg, /#44642/);
+  assert.match(msg, /#10110/);
 });
 
 test('avisa uma vez por janela de limite', () => {

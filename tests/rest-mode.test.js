@@ -28,8 +28,8 @@ test('pmset output tells battery from the charger', () => {
 
 test('pr review tasks and their parts are the ones that keep running on battery', async () => {
   const { isPrReviewTask } = await import('../src/rest-mode.js');
-  assert.equal(isPrReviewTask('seal_pr_45106'), true);
-  assert.equal(isPrReviewTask('seal_pr_45106_p2'), true);
+  assert.equal(isPrReviewTask('seal_pr_10137'), true);
+  assert.equal(isPrReviewTask('seal_pr_10137_p2'), true);
   assert.equal(isPrReviewTask('seal_briefing_1'), false);
   assert.equal(isPrReviewTask(null), false);
 });

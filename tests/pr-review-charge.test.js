@@ -9,13 +9,13 @@ import { SendChargeAction } from '../src/actions/send-charge.js';
 import { ActionRegistry } from '../src/actions/registry.js';
 
 const base = {
-  author: 'Bruno Lima Costa', prId: 10110, title: 'Task/store registration invites',
-  url: 'https://dev.azure.com/org/Projeto/_git/app-web/pullrequest/44642',
+  author: 'Bruno Lima Costa', prId: 10110, title: 'Ajuste no cadastro',
+  url: 'https://dev.azure.com/org/Projeto/_git/app-web/pullrequest/10110',
 };
 
 test('primeira revisão com pendências diz quantas e o que fazer', () => {
   const msg = chargeMessage({ ...base, verdict: 'needs-work', counts: { blocker: 1, warning: 1, nit: 0 } });
-  assert.match(msg, /^Bruno, a revisão automática da !10110 \(Task\/store registration invites\) terminou: 2 comentários \(1 bloqueador\)\./);
+  assert.match(msg, /^Bruno, a revisão automática da !10110 \(Ajuste no cadastro\) terminou: 2 comentários \(1 bloqueador\)\./);
   assert.match(msg, /depois do push o bot revisa de novo/);
   assert.ok(msg.endsWith(base.url));
 });
@@ -60,9 +60,9 @@ test('conector do Teams manda para o teamsbot o e-mail e o texto', async () => {
     return { ok: true, status: 200, json: async () => ({ ok: true, to: 'Bruno Lima Costa', sentAt: '2026-09-25T10:05:00Z' }) };
   };
   const teams = new TeamsConnector({ url: 'http://127.0.0.1:4317/', fetchImpl });
-  const res = await teams.sendDirect({ name: 'Bruno Lima Costa', email: 'pessoa@example.com' }, 'oi');
+  const res = await teams.sendDirect({ name: 'Bruno Lima Costa', email: 'bruno.costa@example.com' }, 'oi');
   assert.equal(calls[0].url, 'http://127.0.0.1:4317/api/send');
-  assert.deepEqual(calls[0].body, { to: 'pessoa@example.com', message: 'oi', html: 'oi', headless: true });
+  assert.deepEqual(calls[0].body, { to: 'bruno.costa@example.com', message: 'oi', html: 'oi', headless: true });
   assert.equal(res.sentAt, '2026-09-25T10:05:00Z');
 });
 
@@ -176,8 +176,8 @@ test('conector do Teams manda pelo e-mail quando tem, não pelo nome do Azure', 
     return { ok: true, status: 200, json: async () => ({ ok: true }) };
   };
   const teams = new TeamsConnector({ fetchImpl });
-  await teams.sendDirect({ name: 'Diego Rocha Nunes', email: 'pessoa@example.com' }, 'oi');
-  assert.equal(calls[0].to, 'pessoa@example.com');
+  await teams.sendDirect({ name: 'Diego Rocha Nunes', email: 'diego.nunes@example.com' }, 'oi');
+  assert.equal(calls[0].to, 'diego.nunes@example.com');
 });
 
 test('recusa do Teams vira aviso claro e não marca como enviada', async () => {
@@ -189,7 +189,7 @@ test('recusa do Teams vira aviso claro e não marca como enviada', async () => {
   const action = new SendChargeAction({ connectorFor: () => connector, markSent: (keys) => marked.push(...keys) });
   const result = await action.execute({ author: { name: 'Diego Rocha Nunes' }, message: 'x', sentKeys: ['k'] });
   assert.equal(result.success, false);
-  assert.match(result.message, /não enviei para Bruno: o Teams abriu uma conversa que não era dessa pessoa/);
+  assert.match(result.message, /não enviei para Diego: o Teams abriu uma conversa que não era dessa pessoa/);
   assert.match(result.message, /Nada foi enviado/);
   assert.deepEqual(marked, []);
   assert.match(friendlyError('Teams web session is not authenticated. Open the login browser first.'), /sessão do Teams web caiu/);
@@ -197,9 +197,9 @@ test('recusa do Teams vira aviso claro e não marca como enviada', async () => {
 
 test('se a consulta da PR falhar, o e-mail do autor não se perde', () => {
   const state = { prs: {} };
-  upsertPrEntry(state, { pullRequestId: 10110, title: 't', status: 'active', createdBy: { displayName: 'Bruno Lima Costa', uniqueName: 'pessoa@example.com' } }, 'app-web', 'org', 'Projeto');
+  upsertPrEntry(state, { pullRequestId: 10110, title: 't', status: 'active', createdBy: { displayName: 'Bruno Lima Costa', uniqueName: 'Bruno.Costa@example.com' } }, 'app-web', 'org', 'Projeto');
   const entry = upsertPrEntry(state, { pullRequestId: 10110, title: 't', status: 'active' }, 'app-web', 'org', 'Projeto');
-  assert.equal(entry.authorEmail, 'pessoa@example.com');
+  assert.equal(entry.authorEmail, 'bruno.costa@example.com');
 });
 
 test('oferta que o Telegram não entregou é reenviada, não expira', async () => {
@@ -229,14 +229,14 @@ test('conector resolve a pessoa pelo teamsbot e manda pelo e-mail resolvido', as
   const fetchImpl = async (url, opts) => {
     calls.push({ url, body: opts?.body ? JSON.parse(opts.body) : null });
     if (url.includes('/api/people/resolve')) {
-      return { ok: true, status: 200, json: async () => ({ ok: true, status: 'ok', person: { name: 'Diego Rocha Nunes', email: 'pessoa@example.com' } }) };
+      return { ok: true, status: 200, json: async () => ({ ok: true, status: 'ok', person: { name: 'Diego Rocha Nunes', email: 'diego.nunes@example.com' } }) };
     }
     return { ok: true, status: 200, json: async () => ({ ok: true }) };
   };
   const teams = new TeamsConnector({ fetchImpl });
-  await teams.sendDirect({ name: 'Bruno Nunes' }, 'oi');
-  assert.match(calls[0].url, /\/api\/people\/resolve\?q=Bruno%20Zerino$/);
-  assert.equal(calls[1].body.to, 'pessoa@example.com');
+  await teams.sendDirect({ name: 'Diego Nunes' }, 'oi');
+  assert.match(calls[0].url, /\/api\/people\/resolve\?q=Diego%20Nunes$/);
+  assert.equal(calls[1].body.to, 'diego.nunes@example.com');
 });
 
 test('nome ambíguo não envia para ninguém', async () => {
@@ -256,8 +256,8 @@ test('nome ambíguo não envia para ninguém', async () => {
 test('ação mensagem mostra destinatário com e-mail e quem pediu', async () => {
   const action = new SendChargeAction({ name: 'mensagem', connectorFor: () => fakeConnector().connector, markSent: () => {} });
   assert.equal(action.name, 'mensagem');
-  const preview = await action.preview({ author: { name: 'Bruno Nunes', email: 'pessoa@example.com' }, message: 'oi', origin: 'sessão do Claude Code (MCP do Teams)' });
-  assert.match(preview.summary, /para Bruno Nunes <Bruno\.Nunes@empresa\.com>\?\nPedido por: sessão do Claude Code/);
+  const preview = await action.preview({ author: { name: 'Diego Nunes', email: 'diego.nunes@example.com' }, message: 'oi', origin: 'sessão do Claude Code (MCP do Teams)' });
+  assert.match(preview.summary, /para Diego Nunes <diego\.nunes@example\.com>\?\nPedido por: sessão do Claude Code/);
 });
 
 test('a re-review with no new finding is only informative: no charge is offered to send', () => {

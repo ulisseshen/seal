@@ -5,7 +5,7 @@ import {
   countOpenBotThreads, formatFindingComment,
 } from '../src/sensors/pr-review-pipeline-logic.js';
 
-const ME = 'pessoa@example.com';
+const ME = 'bot@example.com';
 const block = (findings) => `<<<SEAL_REVIEW_JSON\n${JSON.stringify({ verdict: 'needs-work', findings })}\nSEAL_REVIEW_JSON>>>`;
 const semCriterio = { severity: 'WARNING', kind: 'doc-request', title: 'US 64128 e Task 20226 sem critério de aceite', body: 'Peça os critérios.' };
 

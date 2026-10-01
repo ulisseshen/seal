@@ -15,9 +15,9 @@ import {
   PENDING_RESOLVES_MARKER,
 } from '../src/sensors/azure-pr-review-logic.js';
 
-const MY_EMAIL = 'pessoa@example.com';
+const MY_EMAIL = 'eu@example.com';
 const MY_NAME = 'ulisses';
-const SOMEONE = 'pessoa@example.com';
+const SOMEONE = 'colega@example.com';
 const ELIGIBILITY_START = new Date('2026-04-30T00:00:00Z').getTime();
 
 const t = (iso) => new Date(iso).getTime();
