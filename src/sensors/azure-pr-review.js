@@ -32,6 +32,7 @@ import {
   pickOriginBranch,
   countOpenBotThreads,
   needsCommitVerification,
+  usCoverageLine,
   localRulesInstruction,
   openBotFindings,
   resolvedBotFindings,
@@ -54,6 +55,9 @@ import {
   isMarkedSent,
   postedFindingTitles,
   matchPairedPrs,
+  mentionPullRequests,
+  checkVisualEvidence,
+  pickConsumerRepos,
   messageDraftFor,
   nextReleaseFrom,
   parseReviewResult,
@@ -93,6 +97,7 @@ const PART_TAG = 'pr-review-part:v1';
 const WAITING_FOR_PARTS_AT = '9999-12-31T00:00:00.000Z';
 const WORKTREE_ROOT = process.env.SEAL_PR_WORKTREE_ROOT || path.join(os.homedir(), '.seal-worktrees');
 const PIPELINE_SKILL_PATH = path.resolve(HERE, '..', '..', 'skills', 'pr-review-pipeline', 'SKILL.md');
+const ACCEPTANCE_JUDGE_PATH = path.join(path.dirname(PIPELINE_SKILL_PATH), 'acceptance-judge.md');
 const LOCAL_RULES_PATH = process.env.SEAL_REVIEW_RULES || path.join(os.homedir(), '.config', 'seal', 'review-rules.md');
 const LOCAL_RULES_DIR = process.env.SEAL_REVIEW_RULES_DIR || path.join(os.homedir(), '.config', 'seal', 'review-rules');
 const localRulesLine = (repoName) =>
@@ -142,6 +147,8 @@ export function configureAzure(sensorCfg = {}) {
   ORG = process.env.SEAL_AZURE_ORG || sensorCfg.azure_pr_review_org || '';
   PROJECT = process.env.SEAL_AZURE_PROJECT || sensorCfg.azure_pr_review_project || '';
   MY_EMAIL = (process.env.SEAL_AZURE_MY_EMAIL || sensorCfg.azure_pr_review_my_email || '').toLowerCase();
+  const quietMin = Number(sensorCfg.azure_pr_review_reply_quiet_min ?? NaN);
+  AUTHOR_REPLY_QUIET_MS = (Number.isFinite(quietMin) && quietMin >= 0 ? quietMin : 3) * 60 * 1000;
   ORG_BASE = `https://dev.azure.com/${ORG}/${PROJECT}/_apis`;
   if (PAT && MY_EMAIL && !process.env.PERSONAL_ACCESS_TOKEN) {
     process.env.PERSONAL_ACCESS_TOKEN = Buffer.from(`${MY_EMAIL}:${PAT}`).toString('base64');
@@ -656,6 +663,22 @@ async function preReviewBlock(args) {
   return (await blockOnBranchName(args)) || (await blockOnCarriedRelease(args));
 }
 
+async function consumerContext(repos, repo) {
+  const consumers = [];
+  for (const front of pickConsumerRepos(repos, repo)) {
+    await git(front.projectDir, ['fetch', '--quiet', 'origin', '+refs/heads/main:refs/remotes/origin/main', '+refs/heads/release/*:refs/remotes/origin/release/*'], 120_000).catch(() => {});
+    const release = (await git(front.projectDir, ['for-each-ref', '--sort=-v:refname', '--count=1', '--format=%(refname:short)', 'refs/remotes/origin/release/[0-9]*']).catch(() => '')).trim();
+    const refs = [release, 'origin/main'].filter(Boolean);
+    consumers.push({
+      repo: front.name,
+      stack: front.stack,
+      refs,
+      grepCommand: `git -C ${front.projectDir} grep -n -F -e '<trecho da rota>' ${refs.join(' ')} -- . ':!docs' ':!*.md'`,
+    });
+  }
+  return consumers;
+}
+
 async function priorFindingsFor(repo, prId, headSha) {
   threadsCache.delete(`${repo.id}:${prId}`);
   const { ok, threads } = await getThreads(repo, prId);
@@ -726,6 +749,7 @@ async function prepareAndQueue({ repo, repos, pr, gate, sensorCfg, onlyParts = n
     docsTree: conventions.docsTree,
     targetGate,
     pair,
+    consumers: await consumerContext(repos, repo).catch(() => []),
     priorFindings,
     resultBlock: { start: RESULT_BLOCK_START, end: RESULT_BLOCK_END },
   };
@@ -734,6 +758,18 @@ async function prepareAndQueue({ repo, repos, pr, gate, sensorCfg, onlyParts = n
   const parts = chunked
     ? plan.chunks.map((chunk) => ({ ...chunk, diffCommand: `git diff ${mergeBase}..${gate.headSha} -- ${chunk.paths.map((file) => `'${file.replace(/'/g, "'\\''")}'`).join(' ')}` }))
     : [];
+  const authorEmail = (pr.createdBy?.uniqueName || '').toLowerCase();
+  const authorComments = repo.evidenceGate === false ? [] : ((await getThreads(repo, prId)).threads || [])
+    .flatMap((thread) => thread.comments || [])
+    .filter((comment) => !comment.isDeleted && (comment.author?.uniqueName || '').toLowerCase() === authorEmail)
+    .map((comment) => comment.content || '');
+  const evidenceReminder = repo.evidenceGate === false ? null : checkVisualEvidence({
+    stack: repo.stack,
+    paths: plan.chunks.flatMap((chunk) => chunk.paths),
+    description: pr.description || '',
+    authorComments,
+    kit: sensorCfg.azure_pr_review_evidence_kit || null,
+  });
   context.review = chunked ? 'consolidate-parts' : 'single';
   context.resultFile = '.seal-review/result.json';
   context.plan = { totalLines: plan.totalLines, totalFiles: plan.totalFiles, docLines: plan.docLines, parts: parts.map(({ paths, diffCommand, ...rest }) => ({ ...rest, files: paths.length })) };
@@ -765,6 +801,7 @@ async function prepareAndQueue({ repo, repos, pr, gate, sensorCfg, onlyParts = n
       pair: pair.map((paired) => ({ repo: paired.repo, prId: paired.prId, status: paired.status })),
       targetGate,
       branchReminder: repo.branchGate === false ? null : checkBranchName({ source: branchOf(pr.sourceRefName), target: targetBranch }),
+      evidenceReminder,
       testSkills: conventions.repoSkills.map((skill) => skill.name).filter((name) => /test|tdd/i.test(name)),
       prUrl: prWebUrl(repo.name, prId),
       chunked,
@@ -893,7 +930,7 @@ function reviewHeaderPlain(entry, data, meta) {
     `${waiting ? '⏸️ Aguardando autor' : '✅ Aprovado'} · ${entry.repo} !${entry.prId}${meta.mode === 're-review' ? ' · re-revisão' : ''}`,
     `${entry.title} · ${entry.author}`,
     ...(waiting ? [`🔴 ${counts.blocker} · 🟡 ${counts.warning} · 🔵 ${counts.nit}${data.blockingReason ? ` — ${data.blockingReason}` : ''}`] : []),
-    ...(data.usCoverage ? [`US: ${data.usCoverage.covered ?? 0}/${data.usCoverage.total ?? 0} cenários com teste`] : []),
+    ...(data.usCoverage ? [usCoverageLine(data.usCoverage)] : []),
   ].join('\n');
 }
 
@@ -908,7 +945,7 @@ function reviewTelegramText(entry, data, meta) {
     lines.push(`🔴 ${counts.blocker} · 🟡 ${counts.warning} · 🔵 ${counts.nit}${data.blockingReason ? ` — ${escapeHtml(data.blockingReason)}` : ''}`);
   }
   if (data.modelVerdict === 'approved' && waiting) lines.push('⚠️ A LLM sugeriu aprovar, mas a regra do sensor não aprova com comentário pendente.');
-  if (data.usCoverage) lines.push(`US: ${data.usCoverage.covered ?? 0}/${data.usCoverage.total ?? 0} cenários com teste`);
+  if (data.usCoverage) lines.push(usCoverageLine(data.usCoverage));
   if (waiting) {
     lines.push('', '✉️ <b>Mensagem sugerida para o autor:</b>', `<code>${escapeHtml(messageDraftFor('blocker', entry))}</code>`);
   }
@@ -1006,6 +1043,12 @@ async function publishCompletedReviews(repos, state, { taskId = null } = {}) {
     if (meta.branchReminder?.blocking === false && !data.findings.some((finding) => (finding.sources || []).includes('branch-gate'))) {
       data.findings.push(meta.branchReminder);
     }
+    if (meta.evidenceReminder && !data.findings.some((finding) => (finding.sources || []).includes('evidence-gate'))) {
+      data.findings.push(meta.evidenceReminder);
+    }
+    const prMentions = [{ prId, url: prWebUrl(repo.name, prId) }, ...(meta.pair || []).map((paired) => ({ prId: paired.prId, url: prWebUrl(paired.repo, paired.prId) }))];
+    data.findings = data.findings.map((finding) => mentionPullRequests(finding, prMentions));
+    if (typeof data.summary === 'string') data.summary = mentionPullRequests({ body: data.summary }, prMentions).body;
     data.verdict = deriveVerdict(data.findings);
     if ((data.priorResolved || []).length > 0 && !TEST_DRY) {
       const { resolved } = await resolveFromChat(repo, { pr_id: prId, head_sha: meta.headSha }, data.priorResolved, { approve: false, verified: true })
@@ -1160,7 +1203,7 @@ async function cleanupWorktrees(repos) {
 
 const ledgerTime = (value) => (value ? Date.parse(/[zZ]|[+-]\d\d:?\d\d$/.test(value) ? value : `${value.replace(' ', 'T')}Z`) || 0 : 0);
 
-const AUTHOR_REPLY_QUIET_MS = 10 * 60 * 1000;
+let AUTHOR_REPLY_QUIET_MS = 3 * 60 * 1000;
 
 async function approveHead({ repo, prId, headSha, sessionId = null, worktree = null, reason }) {
   await azRequest('POST', repoUrl(repo, `/pullRequests/${prId}/threads`), {
@@ -1208,7 +1251,28 @@ async function verifyResolvedThenApprove({ repo, pr, threads, ledgerForHead }) {
   return true;
 }
 
-async function reopenFindings(repo, row, reopen) {
+async function replyInFindings(repo, row, replies) {
+  const prId = row.pr_id;
+  threadsCache.delete(`${repo.id}:${prId}`);
+  const { ok, threads } = await getThreads(repo, prId);
+  if (!ok) return { replied: [], missing: replies.map((item) => item.title) };
+  const byTitle = findingThreadIdsByTitle(threads, MY_EMAIL);
+  const replied = [];
+  const missing = [];
+  for (const item of replies) {
+    const threadId = byTitle.get(item.title);
+    if (!threadId) {
+      missing.push(item.title);
+      continue;
+    }
+    await azRequest('POST', repoUrl(repo, `/pullRequests/${prId}/threads/${threadId}/comments`), { parentCommentId: 1, content: `🤖 ${item.text}`, commentType: 1 });
+    replied.push(item.title);
+  }
+  threadsCache.delete(`${repo.id}:${prId}`);
+  return { replied, missing };
+}
+
+async function reopenFindings(repo, row, reopen, { lead = '🤖 Revisei os commits depois deste comentário e ainda falta:' } = {}) {
   const prId = row.pr_id;
   threadsCache.delete(`${repo.id}:${prId}`);
   const { ok, threads } = await getThreads(repo, prId);
@@ -1225,7 +1289,7 @@ async function reopenFindings(repo, row, reopen) {
     const prompt = item.fixPrompt ? `\n\n<details>\n<summary>🤖 Prompt de correção</summary>\n\n\`\`\`\n${item.fixPrompt.replace(/```/g, "'''")}\n\`\`\`\n</details>` : '';
     await azRequest('POST', repoUrl(repo, `/pullRequests/${prId}/threads/${threadId}/comments`), {
       parentCommentId: 1,
-      content: `🤖 Revisei os commits depois deste comentário e ainda falta: ${item.missing || 'a correção não aparece no código.'}${prompt}`,
+      content: `${lead} ${item.missing || 'a correção não aparece no código.'}${prompt}`,
       commentType: 1,
     });
     await azRequest('PATCH', repoUrl(repo, `/pullRequests/${prId}/threads/${threadId}`), { status: 1 });
@@ -1238,17 +1302,17 @@ async function reopenFindings(repo, row, reopen) {
 async function forwardAuthorReplies(repo, pr, threads, ledgerForHead) {
   if (ledgerForHead?.status !== 'published' || !ledgerForHead.session_id) return false;
   const since = Math.max(ledgerTime(ledgerForHead.finished_at), ledgerTime(ledgerForHead.replies_seen_at));
-  const { disputes, latestAt } = authorReplies({ threads, myEmail: MY_EMAIL, since });
-  if (disputes.length === 0) return false;
+  const { disputes, general, latestAt } = authorReplies({ threads, myEmail: MY_EMAIL, since });
+  if (disputes.length === 0 && general.length === 0) return false;
   if (Date.now() - latestAt < AUTHOR_REPLY_QUIET_MS) return false;
   if (pendingChatRequests().some((request) => request.prId === pr.pullRequestId && request.source === 'author-reply')) return false;
   if (TEST_DRY) {
     console.log(`[pr-review] [dry] WOULD forward ${disputes.length} author replies on !${pr.pullRequestId}`);
     return false;
   }
-  enqueueChatRequest({ prId: pr.pullRequestId, question: buildAuthorReplyQuestion({ prId: pr.pullRequestId, disputes }), source: 'author-reply' });
+  enqueueChatRequest({ prId: pr.pullRequestId, question: buildAuthorReplyQuestion({ prId: pr.pullRequestId, disputes, general, acceptanceRulesPath: ACCEPTANCE_JUDGE_PATH }), source: 'author-reply' });
   await markRepliesSeen({ repo: repo.name, prId: pr.pullRequestId, headSha: ledgerForHead.head_sha, at: new Date(latestAt).toISOString() });
-  console.log(`[pr-review] !${pr.pullRequestId}: ${disputes.length} achado(s) com resposta do autor, reavaliando sem commit novo`);
+  console.log(`[pr-review] !${pr.pullRequestId}: interação do autor (${disputes.length} achado(s), ${general.length} comentário(s)), reavaliando`);
   return true;
 }
 
@@ -1395,7 +1459,7 @@ const REASON_LABEL = {
   blocker: 'reprovada, comentários pendentes',
   'stale-no-response': 'comentário sem resposta há +1 dia',
   'open-over-1d': 'aberta há +1 dia',
-  'pair-desync': 'PR par já fechada no outro repo',
+  'pair-desync': 'PR par já entrou no outro repo',
 };
 
 const HEALTH_ALERT_COOLDOWN_MS = 6 * 60 * 60 * 1000;
@@ -1680,7 +1744,7 @@ export async function runSinglePrReview({ repoName, prId, sensorCfg = {}, timeou
   return { published, verdict: state.prs[String(prId)]?.verdict, counts: state.prs[String(prId)]?.counts };
 }
 
-// Anything on this machine (the Projeto panel's "verificar agora") asks for a scan by touching this file.
+// Anything on this machine (the team panel's "verificar agora") asks for a scan by touching this file.
 export const TICK_REQUEST_FILE = path.join(os.homedir(), '.config', 'seal', 'run', 'pr-review.tick-now');
 
 function takeTickRequest() {
@@ -1818,6 +1882,13 @@ export async function processNextChatRequest(sensorCfg = {}) {
       if (reply.resolves.length > 0 && !TEST_DRY) outcome = await resolveFromChat(repo, row, reply.resolves, { approve: request.source !== 'verify-resolved', verified: request.source === 'verify-resolved' });
       workItems = reply.workItems;
       if (workItems.length > 0 && !TEST_DRY) await notifyOwnerWorkItems(request.prId, workItems);
+      if (request.source === 'author-reply' && !TEST_DRY) {
+        const { replied, missing: noReply } = reply.replies.length ? await replyInFindings(repo, row, reply.replies) : { replied: [], missing: [] };
+        const { reopened, missing: noReopen } = reply.reopen.length
+          ? await reopenFindings(repo, row, reply.reopen, { lead: '🤖 Reabri: o achado continua valendo no código atual. Falta:' })
+          : { reopened: [], missing: [] };
+        outcome = { ...outcome, replied, reopened, missing: [...outcome.missing, ...noReply, ...noReopen] };
+      }
       if (request.source === 'verify-resolved' && !TEST_DRY) {
         const { reopened, missing: notFound } = reply.reopen.length ? await reopenFindings(repo, row, reply.reopen) : { reopened: [], missing: [] };
         outcome = { ...outcome, reopened, missing: [...outcome.missing, ...notFound] };
@@ -1844,6 +1915,7 @@ export async function processNextChatRequest(sensorCfg = {}) {
       ...(outcome.approved ? ['PR aprovada: não sobrou comentário aberto'] : []),
       ...workItems.map((item) => `ajustar #${item.id}: ${item.change}`),
       ...(outcome.reopened || []).map((title) => `reaberto, ainda falta: ${title}`),
+      ...(outcome.replied || []).map((title) => `respondido no thread: ${title}`),
     ];
     appendChatEntry(request.prId, { role: 'agent', text: answer, actions, at: new Date().toISOString(), requestId: request.id });
     const heading = request.source === 'author-reply' ? `🤖 <b>Revisor da !${request.prId}</b> · reavaliou as respostas do autor` : `🤖 <b>Revisor da !${request.prId}</b>`;

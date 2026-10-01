@@ -17,6 +17,7 @@ Leia primeiro, no diretório atual (um worktree no commit da PR):
 
 - `.seal-review/context.json` — repo, stack, `repoSkill`, `prId`, `prUrl`, `mode` (`first-review` | `re-review`),
   `headSha`, `previousSha`, `mergeBase`, `diffCommand`, `reReviewDiffCommand`, `workItems`, `ocrBin`, `targetGate`, `pair[]`,
+  `consumers[]` (em PR de backend: os apps de front, com `refs` e `grepCommand` para achar quem chama uma rota),
   `repoSkills[]` (nome + descrição das skills do repo), `docsTree` (o que existe em `docs/`) e `priorFindings[]`
   (comentários do revisor que continuam abertos: `threadId`, `title`, `fixPrompt`, `changesSince` e `replies` do autor).
 - `.seal-review/us.md` — descrição e critérios de aceite dos work items vinculados (já em texto).
@@ -74,7 +75,7 @@ flowchart TD
     U -- não --> U0[doc-request: vincular US]
     U -- sim --> UC{tem critério de aceite?}
     UC -- não --> U1[lembrete: pedir critérios<br/>não bloqueia, não deduzir do código]
-    UC -- sim --> U2[7. Cenários da US × testes<br/>test-gap por cenário sem teste]
+    UC -- sim --> U2[7. Juiz de aceitação em subagente<br/>cenários × testes, mock só da fronteira]
     U0 --> D
     U1 --> D
     U2 --> D[8. Cobrança de documentação<br/>inclui 1 achado agregado com as regras tácitas]
@@ -127,7 +128,7 @@ resposta, validações de fechamento, feature flags, mensagens de erro. Use `sho
 arquivo inteiro do par.
 
 Escreva `.seal-review/pair.md` com fatos verificados, um por linha, com `arquivo:linha` do par — por
-exemplo "o backend devolve `dias_disponiveis` ordenado e sem vazio (`motor-de-regras.ts:84`)". Esses fatos
+exemplo "o backend devolve `itens` ordenado e sem vazio (`service.ts:84`)". Esses fatos
 servem para **derrubar** achados que o outro lado já garante e para **levantar** divergência de contrato
 (campo que um manda e o outro não lê, nome diferente, status HTTP diferente do tratado).
 
@@ -135,6 +136,10 @@ Se a PR par aponta para uma release diferente desta PR (`targetBranch` de cada l
 contrato da outra, isso é achado `WARNING`: as duas precisam sair juntas.
 
 Sem par: registre `pair:none` e siga. Não invente contrato do outro lado.
+
+No texto dos achados, cite a PR par como "a PR do Vue" (ou do backend) e o número uma vez só, como `!10146`;
+o sensor troca por link. Work item é `#20229`. No Azure, `#10146` vira link para o work item 10146, que é
+outra coisa.
 
 ### 3. Skill de review do repo
 
@@ -237,6 +242,14 @@ E cobre o que falta:
 - **Teste por regra**: cada regra do inventário da etapa 5 precisa de um teste que a exercite → `test-gap`.
 - **Casos de borda derivados da regra**: o valor exato do limite (`==`), um abaixo e um acima; vazio/nulo;
   caminho de erro → `test-gap`.
+- **Antes de cobrar teste de rota, veja se alguém chama a rota.** Numa PR de backend que muda uma rota que
+  já existe, procure a rota nos fronts com o `grepCommand` de cada item de `consumers[]` (troque
+  `<trecho da rota>` pelo trecho fixo do path, ex.: `clientes/lista`). Se nenhum front chama:
+  - não cobre teste de regressão dessa rota como `WARNING` ou `BLOCKER`. No máximo, lembrete que não bloqueia;
+  - levante um `doc-request` `WARNING` "Rota sem consumidor nos apps", com o grep feito e a pergunta: confirmar
+    tráfego zero nos http-logs dos últimos 30 dias e, se for zero, remover a rota em vez de consertá-la;
+  - diga que ausência nos fronts não prova rota morta: backoffice, support-api e integrações
+    chamam os backends direto. Por isso o achado é pergunta, não conclusão.
 - **Regressão em bug**: PR de correção precisa de um teste que **falharia sem o fix**. Leia o teste e o diff e
   diga por que ele falharia; se não falharia, é `test-gap` `BLOCKER`.
 - **PR sem nenhum teste** para regra nova ou bug corrigido → `BLOCKER`.
@@ -247,20 +260,25 @@ em qual arquivo de teste existente ele entra.
 
 `sources: ["tests"]`.
 
-### 7. Cobertura dos cenários da US
+### 7. Cobertura dos cenários da US (juiz de aceitação)
 
-A partir de `.seal-review/us.md`:
+Quem decide se cada cenário da US está provado é o **juiz de aceitação**, num contexto separado, para não herdar
+o que você concluiu nas etapas anteriores nem aceitar a palavra do autor sem conferir.
 
-1. Extraia os **cenários** que os critérios de aceite descrevem, um por comportamento observável, escritos em
-   **Dado / Quando / Então**. Para bug, o cenário é "o defeito descrito não acontece mais". Se a US não tem
-   critério mas a Task filha tem, use os da Task e diga isso em `source`.
-2. Para cada cenário, procure no diff (e nos testes que ele toca) um teste que o exercite de verdade —
-   asserção sobre o comportamento, não só um teste que passa pelo arquivo. `test` = `arquivo:linha` do teste.
-3. Para cenário sem teste, preencha `where`: o arquivo de teste existente onde ele deve entrar (siga o
-   padrão do repo; só proponha arquivo novo se não houver onde encaixar).
-4. Preencha `usCoverage` com **todos** os cenários (cobertos e não cobertos). **Não crie achado individual
-   para cenário da US sem teste**: o sensor monta um único comentário com todos os descobertos e o prompt
-   que escreve os testes. Não deixe cenário descoberto de fora da lista: é ela que vira a cobrança.
+1. Dispare um subagente (ferramenta Agent, `general-purpose`) com este prompt, trocando `<pasta>` pela pasta
+   deste SKILL.md: "Leia `<pasta>/acceptance-judge.md` e siga. O diretório atual é o worktree da PR." Não passe
+   seus achados nem suas conclusões para ele.
+2. Espere o `ACCEPTANCE_DONE` e leia `.seal-review/acceptance.json`. Sem a ferramenta Agent, leia o
+   `acceptance-judge.md` e aplique você mesmo, do zero, sem reaproveitar o que concluiu antes.
+3. Copie os cenários para `usCoverage.scenarios` como vieram (`covered`, `test`, `issue`, `where`, `proof`,
+   `owner`), com `source` e `note`. Você pode corrigir um cenário só com evidência lida no código (ex.: o teste
+   citado não existe); diga isso em `note`.
+4. **Não crie achado individual para cenário da US sem teste**: o sensor monta um único comentário com todos
+   os descobertos e o prompt que escreve os testes. Não deixe cenário descoberto de fora da lista: é ela que vira
+   a cobrança.
+5. Um cenário que o autor disse "coberto no backend" ou "só dá em UAT" não sai da lista por isso: ou o juiz achou o
+   teste no outro repo (`proof: "elsewhere"` com `test`), ou vira cenário do dono, ou continua cobrado aqui na
+   parte que este repo faz. **Nunca** proponha teste que chame sistema real.
 
 Casos de borda — cobre em vez de inventar:
 - **Sem work item vinculado** → achado `kind: "doc-request"`, `WARNING`: vincular a US/bug na PR.
@@ -306,7 +324,7 @@ Veredito — **a regra é do sensor e você a revisa**:
 - Você revisa essa regra achado por achado: cada um precisa justificar, sozinho, não aprovar a PR. Se não
   justifica, não publique. O que é só gosto pessoal não entra.
 - Escreva `blockingReason`: **uma frase**, direta, dizendo por que a PR não pode ser aprovada agora
-  (ex.: "o fechamento aceita data fora da janela do motor-de-regras e não há teste do cenário da US"). Vazio
+  (ex.: "o fechamento aceita data fora da janela do serviço de agenda e não há teste do cenário da US"). Vazio
   quando não há achados. É o texto do comentário de resumo.
 - `verdict` é a sua opinião independente; se ela divergir da regra, o sensor avisa no Telegram.
 
@@ -332,7 +350,9 @@ cortada em resultado grande. Depois, sua mensagem final termina **exatamente** c
     "note": "falta o cenário de ...",
     "scenarios": [
       { "id": "C1", "text": "Dado ..., Quando ..., Então ...", "covered": true, "test": "test/foo_test.dart:42" },
-      { "id": "C3", "text": "Dado ..., Quando ..., Então ...", "covered": false, "where": "test/foo_test.dart" }
+      { "id": "C3", "text": "Dado ..., Quando ..., Então ...", "covered": false, "where": "test/foo_test.dart" },
+      { "id": "C4", "text": "Dado ..., Quando ..., Então ...", "covered": false, "proof": "elsewhere", "test": "api-nova: test/unit/foo.spec.ts" },
+      { "id": "C5", "text": "Dado ..., Quando ..., Então ...", "covered": false, "test": "test/bar_test.dart:10", "issue": "mocka o provider da feature", "where": "test/acceptance/bar/bar_test.dart" }
     ]
   },
   "pairedPrs": [{ "repo": "api-nova", "prId": 10104, "facts": 4 }],

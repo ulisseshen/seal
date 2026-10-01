@@ -24,6 +24,9 @@ import {
   nextReleaseFrom,
   followUpReasons,
   formatFindingComment,
+  mentionPullRequests,
+  checkVisualEvidence,
+  pickConsumerRepos,
   formatSummaryComment,
   formatTargetBlockSummary,
   hasTargetBlockSummary,
@@ -41,6 +44,7 @@ import {
   CHAT_BLOCK_END,
   sentKey,
   applyUsScenarioFinding,
+  usCoverageLine,
   countOpenBotThreads,
   verdictFor,
   matchPairedPrs,
@@ -229,6 +233,13 @@ test('follow-up reasons: open over a day, my thread unanswered, pair already clo
   assert.deepEqual(followUpReasons({ pr: pr({ creationDate: '2026-09-26T08:00:00Z' }), threads: answered, myEmail: ME, now }), []);
 });
 
+test('an abandoned pair was replaced and does not mean the pair is out of sync; only a merged one does', () => {
+  const now = new Date('2026-09-26T12:00:00Z').getTime();
+  const fresh = pr({ creationDate: '2026-09-26T08:00:00Z' });
+  assert.deepEqual(followUpReasons({ pr: fresh, threads: [], myEmail: ME, now, pairedStatuses: ['active', 'abandoned'] }), []);
+  assert.deepEqual(followUpReasons({ pr: fresh, threads: [], myEmail: ME, now, pairedStatuses: ['abandoned', 'completed'] }), ['pair-desync']);
+});
+
 test('notification cooldown is one day per reason', () => {
   const now = new Date('2026-09-26T12:00:00Z').getTime();
   assert.equal(shouldNotify({}, 'blocker', now), true);
@@ -258,7 +269,7 @@ test('next release is main version + 1 minor', () => {
 test('target gate: work into main blocks; release/hotfix/gmud into main pass', () => {
   const nextRelease = 'release/1.7.0';
   assert.equal(checkTargetBranch({ source: 'feat/x', target: 'main', nextRelease }).severity, 'BLOCKER');
-  for (const source of ['release/1.7.0', 'hotfix/73876-x', 'gmud/4.23.0']) {
+  for (const source of ['release/1.7.0', 'hotfix/20202-x', 'gmud/4.23.0']) {
     assert.equal(checkTargetBranch({ source, target: 'main', nextRelease }), null);
   }
 });
@@ -322,9 +333,9 @@ test('singular and plural read naturally in the summary and in the author messag
 });
 
 test('sibling tasks under the same story pair the PRs even with different work items and branches', () => {
-  const own = pr({ sourceRefName: 'refs/heads/feature/74154-fe' });
+  const own = pr({ sourceRefName: 'refs/heads/feature/20214-fe' });
   const candidates = [
-    { pr: { pullRequestId: 10113, sourceRefName: 'refs/heads/feature/74153-be' }, workItemIds: [20211], storyIds: [20205] },
+    { pr: { pullRequestId: 10113, sourceRefName: 'refs/heads/feature/20211-be' }, workItemIds: [20211], storyIds: [20205] },
     { pr: { pullRequestId: 5, sourceRefName: 'refs/heads/other' }, workItemIds: [9], storyIds: [8] },
   ];
   assert.deepEqual(
@@ -376,6 +387,72 @@ test('full coverage or no criteria adds nothing', () => {
   assert.deepEqual(applyUsScenarioFinding([], null, { repo: 'r' }), []);
 });
 
+test('a scenario owned by another repo is never charged here and, without a test there, is reported for that repo', () => {
+  const usCoverage = {
+    source: 'INC 1', scenarios: [
+      { id: 'C1', text: 'Dado A, Quando B, Então C', covered: true, test: 't.spec.ts:1' },
+      { id: 'C11', text: 'O backoffice recebe o preço sem desconto', covered: false, proof: 'elsewhere', owner: 'api-nova' },
+      { id: 'C20', text: 'Mesmo resultado do app antigo', covered: false, proof: 'manual' },
+    ],
+  };
+  const parsed = parseReviewResult(block({ findings: [], usCoverage })).data;
+  const findings = applyUsScenarioFinding(parsed.findings, parsed.usCoverage, { repo: 'r' });
+  assert.equal(findings.length, 1, 'an unknown proof falls back to test and is charged here');
+  assert.ok(!findings[0].body.includes('C11'));
+  assert.equal(usCoverageLine(parsed.usCoverage), 'US: 1/2 cenários com teste · 1 sem teste em api-nova');
+});
+
+test('a test in another repo that the judge refused is a gap of that repo, not coverage', () => {
+  const usCoverage = {
+    scenarios: [
+      { id: 'C1', text: 'Dado A, Quando B, Então C', covered: true, test: 't.spec.ts:1' },
+      { id: 'C4', text: 'Vence o de menor total', covered: false, proof: 'elsewhere', owner: 'api-nova', test: 'api-nova: a.spec.ts:1', issue: 'chama o service direto' },
+    ],
+  };
+  const parsed = parseReviewResult(block({ findings: [], usCoverage })).data;
+  assert.deepEqual(applyUsScenarioFinding(parsed.findings, parsed.usCoverage, { repo: 'r' }), []);
+  assert.equal(usCoverageLine(parsed.usCoverage), 'US: 1/1 cenários com teste · 1 sem teste em api-nova');
+});
+
+test('an existing test the judge refused shows why it does not count, in the comment and in the fix prompt', () => {
+  const usCoverage = {
+    scenarios: [
+      { id: 'C2', text: 'Cupom acumulável aplica direto', covered: false, test: 'src/a.spec.ts:10', where: 'src/a.spec.ts', issue: 'mocka o useVoucherStore; o cenário precisa passar pelo composable com só o service mockado' },
+    ],
+  };
+  const parsed = parseReviewResult(block({ findings: [], usCoverage })).data;
+  const [gap] = applyUsScenarioFinding(parsed.findings, parsed.usCoverage, { repo: 'r' });
+  assert.match(gap.body, /\*\*C2\*\* Cupom acumulável aplica direto → `src\/a\.spec\.ts`\n  O teste `src\/a\.spec\.ts:10` não conta: mocka o useVoucherStore/);
+  assert.match(gap.fixPrompt, /Teste atual que não conta: src\/a\.spec\.ts:10 \(mocka o useVoucherStore/);
+  assert.match(gap.fixPrompt, /nunca chame sistema real/);
+});
+
+test('a scenario covered by tests in the paired PR counts as covered', () => {
+  const usCoverage = {
+    scenarios: [
+      { id: 'C4', text: 'Vence o de menor total', covered: false, proof: 'elsewhere', test: 'api-nova: desconto.regra-conflict.spec.ts' },
+      { id: 'C2', text: 'Cupom acumulável aplica direto', covered: false, where: 'src/useVoucherFlow.spec.ts' },
+    ],
+  };
+  const parsed = parseReviewResult(block({ findings: [], usCoverage })).data;
+  const [gap] = applyUsScenarioFinding(parsed.findings, parsed.usCoverage, { repo: 'r' });
+  assert.equal(gap.title, '1 cenário da US sem teste');
+  assert.ok(!gap.body.includes('C4'));
+});
+
+test('the gap is counted from the listed scenarios, not from totals the model wrote apart', () => {
+  const usCoverage = {
+    total: 20, covered: 15, scenarios: [
+      { id: 'C1', text: 'Dado A, Quando B, Então C', covered: false, where: 'a.spec.ts' },
+      { id: 'C2', text: 'Dado D, Quando E, Então F', covered: false, where: 'a.spec.ts' },
+      { id: 'C3', text: 'Dado G, Quando H, Então I', covered: true, test: 'a.spec.ts:9' },
+    ],
+  };
+  const parsed = parseReviewResult(block({ findings: [], usCoverage })).data;
+  const [gap] = applyUsScenarioFinding(parsed.findings, parsed.usCoverage, { repo: 'r' });
+  assert.equal(gap.title, '2 cenários da US sem teste (de 3)');
+});
+
 test('re-review with no new comment but bot threads still open stays waiting for the author', () => {
   const threads = [
     { id: 1, status: 1, comments: [myComment('**[WARNING] antigo**')] },
@@ -425,15 +502,15 @@ test('a resumed publish skips findings already on the PR, matched by title', () 
 
 test('chat prompt carries the question and the only way the agent can ask for a change', () => {
   const prompt = buildChatPrompt({ prId: 10116, question: '  por que o C2 é bloqueador?  ' });
-  assert.match(prompt, /PR !44700/);
+  assert.match(prompt, /PR !10116/);
   assert.match(prompt, /por que o C2 é bloqueador\?/);
   assert.ok(prompt.includes(CHAT_BLOCK_START) && prompt.includes(CHAT_BLOCK_END));
 });
 
 test('chat reply splits the answer from the resolve actions; no block means no action', () => {
   const reply = `Você tem razão, o backend já ordena.\n${CHAT_BLOCK_START}\n{"resolve":[{"title":"firstAllowedDay supõe ordem","reason":"o backend garante"},{"title":""}]}\n${CHAT_BLOCK_END}`;
-  assert.deepEqual(parseChatReply(reply), { answer: 'Você tem razão, o backend já ordena.', resolves: [{ title: 'firstAllowedDay supõe ordem', reason: 'o backend garante' }], workItems: [], reopen: [] });
-  assert.deepEqual(parseChatReply('Mantenho o achado.'), { answer: 'Mantenho o achado.', resolves: [], workItems: [], reopen: [] });
+  assert.deepEqual(parseChatReply(reply), { answer: 'Você tem razão, o backend já ordena.', resolves: [{ title: 'firstAllowedDay supõe ordem', reason: 'o backend garante' }], workItems: [], reopen: [], replies: [] });
+  assert.deepEqual(parseChatReply('Mantenho o achado.'), { answer: 'Mantenho o achado.', resolves: [], workItems: [], reopen: [], replies: [] });
   assert.deepEqual(parseChatReply(`ok\n${CHAT_BLOCK_START}\n{quebrado\n${CHAT_BLOCK_END}`).resolves, []);
 });
 
@@ -484,7 +561,7 @@ test('once the head commit is published, every failure notice the bot left on th
     { id: 2, comments: [{ id: 1, ...myComment('⚠️ A revisão automática foi interrompida (processo encerrado no meio). Tento de novo sozinho a partir de 25/09 06:00.') }] },
     { id: 3, comments: [{ id: 1, ...myComment('⚠️ A revisão automática não gerou um resultado utilizável (sem bloco). Vou tentar de novo no próximo commit.') }] },
     { id: 4, comments: [{ id: 1, ...myComment('**⏸️ Aguardando autor** — resumo') }] },
-    { id: 5, comments: [{ id: 1, author: { uniqueName: 'pessoa@example.com' }, content: '⚠️ A revisão automática falhou. Vou tentar de novo no próximo commit.' }] },
+    { id: 5, comments: [{ id: 1, author: { uniqueName: 'dev@example.com' }, content: '⚠️ A revisão automática falhou. Vou tentar de novo no próximo commit.' }] },
     { id: 6, comments: [{ id: 1, isDeleted: true, ...myComment('⚠️ A revisão automática falhou.') }] },
   ];
   assert.deepEqual(staleFailureNotices({ threads, myEmail: ME, headStatus: 'published' }), [
@@ -497,8 +574,8 @@ test('once the head commit is published, every failure notice the bot left on th
   }
 });
 
-const Bruno = 'pessoa@example.com';
-const reply = (content, date) => ({ author: { uniqueName: Bruno, displayName: 'Bruno Lima Costa' }, content, publishedDate: date });
+const REPLY_AUTHOR = 'bruno.costa@example.com';
+const reply = (content, date) => ({ author: { uniqueName: REPLY_AUTHOR, displayName: 'Bruno Lima Costa' }, content, publishedDate: date });
 
 test('author replies on the bot findings after the last review are collected once, with the finding title', () => {
   const threads = [
@@ -512,7 +589,8 @@ test('author replies on the bot findings after the last review are collected onc
   assert.deepEqual(found.disputes, [
     { threadId: 10, title: 'O revert volta a gravar autor nulo', status: 'byDesign', replies: [{ author: 'Bruno Lima Costa', text: 'O autor null é decisão do time.', at: '2026-09-25T15:46:00Z' }] },
   ]);
-  assert.equal(found.latestAt, Date.parse('2026-09-25T15:46:00Z'));
+  assert.deepEqual(found.general.map((item) => [item.threadId, item.text]), [[12, 'ok'], [13, 'x']]);
+  assert.equal(found.latestAt, Date.parse('2026-09-25T15:50:00Z'));
   assert.deepEqual(authorReplies({ threads, myEmail: ME, since: found.latestAt }).disputes, []);
 });
 
@@ -521,10 +599,84 @@ test('the question to the reviewer carries every reply and asks for work item up
     prId: 10128,
     disputes: [{ threadId: 10, title: 'O revert volta a gravar autor nulo', status: 'byDesign', replies: [{ author: 'Bruno Lima Costa', text: 'O autor null é decisão do time.', at: 'x' }] }],
   });
-  assert.match(question, /!44969/);
+  assert.match(question, /!10128/);
   assert.match(question, /O revert volta a gravar autor nulo/);
   assert.match(question, /Bruno Lima Costa: O autor null é decisão do time\./);
   assert.match(question, /work_items/);
+});
+
+test('a finding the author resolved without replying counts as interaction, unless the bot resolved it itself', () => {
+  const since = Date.parse('2026-09-29T19:52:54Z');
+  const threads = [
+    { id: 20, status: 'fixed', lastUpdatedDate: '2026-09-29T20:20:26Z', comments: [{ id: 1, ...myComment('**[WARNING · Teste faltando] 5 cenários da US sem teste (de 20)** x', '2026-09-29T19:52:54Z') }] },
+    { id: 21, status: 'fixed', lastUpdatedDate: '2026-09-29T20:30:00Z', comments: [{ id: 1, ...myComment('**[NIT] Nome**', '2026-09-29T19:52:54Z') }, { id: 2, ...myComment('🤖 Resolvido depois de uma conversa', '2026-09-29T20:30:00Z') }] },
+    { id: 22, status: 'fixed', lastUpdatedDate: '2026-09-29T19:00:00Z', comments: [{ id: 1, ...myComment('**[WARNING] Antigo**', '2026-09-28T10:00:00Z') }] },
+    { id: 23, status: 'active', lastUpdatedDate: '2026-09-29T20:40:00Z', comments: [{ id: 1, ...myComment('**[WARNING] Aberto sem resposta**', '2026-09-29T19:52:54Z') }] },
+  ];
+  const found = authorReplies({ threads, myEmail: ME, since });
+  assert.deepEqual(found.disputes, [
+    { threadId: 20, title: '5 cenários da US sem teste (de 20)', status: 'fixed', replies: [], resolvedWithoutReply: true },
+  ]);
+  assert.equal(found.latestAt, Date.parse('2026-09-29T20:20:26Z'));
+  assert.deepEqual(authorReplies({ threads, myEmail: ME, since: found.latestAt }).disputes, []);
+});
+
+test('resolving again, after the bot reopened, counts as a new interaction', () => {
+  const threads = [
+    { id: 40, status: 'fixed', lastUpdatedDate: '2026-09-29T21:30:00Z', comments: [
+      { id: 1, ...myComment('**[WARNING] Falta teste**', '2026-09-29T19:52:54Z') },
+      { id: 2, ...myComment('🤖 Reabri: o achado continua valendo no código atual. Falta: x', '2026-09-29T21:00:00Z') },
+    ] },
+  ];
+  const found = authorReplies({ threads, myEmail: ME, since: Date.parse('2026-09-29T20:20:26Z') });
+  assert.deepEqual(found.disputes.map((item) => [item.threadId, item.resolvedWithoutReply]), [[40, true]]);
+});
+
+test('a comment of the author anywhere else in the PR counts as interaction; bots and system notes do not', () => {
+  const since = Date.parse('2026-09-29T19:52:54Z');
+  const threads = [
+    { id: 30, status: 'closed', comments: [{ id: 1, ...myComment('**⏸️ Aguardando autor** — resumo <!-- seal:reviewed 91a424ac -->', '2026-09-29T19:52:54Z') }, { id: 2, ...reply('Os cenários de UAT ficam com o QA.', '2026-09-29T20:10:00Z') }] },
+    { id: 31, status: 'active', comments: [{ id: 1, ...reply('Subi o print da tela na descrição.', '2026-09-29T20:12:00Z') }] },
+    { id: 32, comments: [{ id: 1, ...reply('Policy status has been updated', '2026-09-29T20:13:00Z'), commentType: 'system' }] },
+    { id: 33, comments: [{ id: 1, ...reply('<h2>DeepSource Code Review</h2>', '2026-09-29T20:14:00Z'), commentType: 'codeChange' }] },
+    { id: 34, status: 'active', comments: [{ id: 1, ...reply('antigo', '2026-09-29T19:00:00Z') }] },
+  ];
+  const found = authorReplies({ threads, myEmail: ME, since });
+  assert.deepEqual(found.disputes, []);
+  assert.deepEqual(found.general, [
+    { threadId: 30, author: 'Bruno Lima Costa', text: 'Os cenários de UAT ficam com o QA.', at: '2026-09-29T20:10:00Z' },
+    { threadId: 31, author: 'Bruno Lima Costa', text: 'Subi o print da tela na descrição.', at: '2026-09-29T20:12:00Z' },
+  ]);
+  assert.equal(found.latestAt, Date.parse('2026-09-29T20:12:00Z'));
+});
+
+test('the question asks to check a silent resolution in the code and to answer the author in the thread', () => {
+  const question = buildAuthorReplyQuestion({
+    prId: 10143,
+    disputes: [{ threadId: 20, title: '5 cenários da US sem teste (de 20)', status: 'fixed', replies: [], resolvedWithoutReply: true }],
+    general: [{ threadId: 31, author: 'Carla', text: 'Subi o print.', at: 'x' }],
+  });
+  assert.match(question, /marcou como resolvido sem responder/);
+  assert.match(question, /"reopen"/);
+  assert.match(question, /"reply"/);
+  assert.match(question, /Carla \(thread 31\): Subi o print\./);
+  assert.doesNotMatch(question, /sem commit novo/);
+});
+
+test('re-evaluating a test finding applies the current acceptance rule, not the one of the old session', () => {
+  const question = buildAuthorReplyQuestion({
+    prId: 10143,
+    disputes: [{ threadId: 20, title: '5 cenários da US sem teste (de 20)', status: 'fixed', replies: [], resolvedWithoutReply: true }],
+    acceptanceRulesPath: '/seal/skills/pr-review-pipeline/acceptance-judge.md',
+  });
+  assert.match(question, /leia \/seal\/skills\/pr-review-pipeline\/acceptance-judge\.md/);
+  assert.match(question, /"só dá em UAT"/);
+  assert.match(question, /vale mais que a sua revisão anterior/);
+});
+
+test('chat reply can answer the author in the thread of a finding that still holds', () => {
+  const text = `Mantenho.\n${CHAT_BLOCK_START}\n{"reply":[{"title":"Falta teste","text":"O teste citado mocka o store."},{"title":"sem texto"}]}\n${CHAT_BLOCK_END}`;
+  assert.deepEqual(parseChatReply(text).replies, [{ title: 'Falta teste', text: 'O teste citado mocka o store.' }]);
 });
 
 test('chat reply can list work items the owner must update, ignoring entries without id or change', () => {
@@ -563,10 +715,10 @@ test('the summary links each comment still open without repeating its prompt or 
   const text = formatSummaryComment({
     data: { blockingReason: '', findings: [] }, headSha: HEAD, priorOpen: 2,
     priorThreads: [{ threadId: 177466, title: 'Merge rebaixa a versão', fixPrompt: 'Volte package.json para 1.7.0' }, { threadId: 177468, title: 'Sem prompt', fixPrompt: null }],
-    prUrl: 'https://dev.azure.com/o/p/_git/r/pullrequest/45103',
+    prUrl: 'https://dev.azure.com/o/p/_git/r/pullrequest/10134',
   });
   assert.match(text, /Continuam abertos:/);
-  assert.match(text, /\[Merge rebaixa a versão\]\(https:\/\/dev\.azure\.com\/o\/p\/_git\/r\/pullrequest\/45103\?discussionId=177466\)/);
+  assert.match(text, /\[Merge rebaixa a versão\]\(https:\/\/dev\.azure\.com\/o\/p\/_git\/r\/pullrequest\/10134\?discussionId=177466\)/);
   assert.match(text, /\[Sem prompt\]\([^)]*discussionId=177468\)/);
   assert.doesNotMatch(text, /Volte package\.json para 1\.7\.0/);
   assert.doesNotMatch(text, /<details>/);
@@ -611,7 +763,7 @@ test('the verification question gives the commit range after each comment and th
   assert.match(question, /Ainda aberto[\s\S]*Cenário sem teste/);
   assert.match(question, /Carla Souza: Coberto em debfa2d7/);
   assert.match(question, /"resolve"/);
-  assert.match(question, /!45103/);
+  assert.match(question, /!10134/);
   assert.match(question, /git log --oneline 7ec24643\.\.b5c9d244/);
   assert.match(question, /git diff 7ec24643\.\.b5c9d244/);
   assert.match(question, /Versão rebaixada/);
@@ -652,7 +804,7 @@ test('machine-local review rules are listed general first, repo-specific last, a
 
 test('a branch cut from the next release and aimed at main says what it drags along and that only its own work was reviewed', () => {
   const gate = checkTargetBranch({
-    source: 'task/74642-desconto-campaign-precedence', target: 'main', nextRelease: 'release/1.7.0',
+    source: 'task/20232-desconto-progressivo', target: 'main', nextRelease: 'release/1.7.0',
     carried: { release: 'release/1.7.0', base: 'abc', commits: 98, authors: ['Hugo Prado', 'Pedro Alves', 'TiagoRamos'] },
   });
   assert.equal(gate.severity, 'BLOCKER');
@@ -689,19 +841,19 @@ test('the origin of a branch is main when main has its fork point, otherwise the
 });
 
 test('feature, bugfix, hotfix, release and gmud branches pass the name check silently', () => {
-  for (const source of ['feature/74642-cupom', 'bugfix/1-x', 'hotfix/pallet', 'release/1.7.0', 'gmud/4.23.0']) {
+  for (const source of ['feature/20232-frete', 'bugfix/1-x', 'hotfix/frete', 'release/1.7.0', 'gmud/4.23.0']) {
     assert.equal(checkBranchName({ source, target: 'release/1.7.0' }), null, source);
   }
 });
 
 test('the names used so far pass with a reminder that teaches the new standard, fix/ by where it points', () => {
-  const toMain = checkBranchName({ source: 'fix/pallet', target: 'main' });
+  const toMain = checkBranchName({ source: 'fix/frete', target: 'main' });
   assert.equal(toMain.blocking, false);
   assert.match(toMain.body, /Para a `main`, o prefixo novo é `hotfix\/`/);
   assert.match(toMain.body, /feature\/<id>-descricao[\s\S]*bugfix\/<id>-descricao[\s\S]*hotfix\/<id>-descricao/);
   const toRelease = checkBranchName({ source: 'fix/new-order-product-sku', target: 'release/1.7.0' });
   assert.match(toRelease.body, /Para uma release, o prefixo novo é `bugfix\/`/);
-  for (const source of ['task/74642-desconto', 'task-74287/valida-upload', 'feat/x', 'story/y', 'chore/z']) {
+  for (const source of ['task/20232-desconto', 'task-20217/valida-upload', 'feat/x', 'story/y', 'chore/z']) {
     assert.equal(checkBranchName({ source, target: 'release/1.8.0' }).blocking, false, source);
   }
 });
@@ -721,20 +873,20 @@ test('a branch with no type is blocked with the steps to open a new PR from a br
 });
 
 test('the suggested name keeps the work item id and picks the type by where the PR points', () => {
-  assert.equal(suggestBranchName('task/74642-desconto-campaign-precedence', 'release/1.7.0'), 'feature/74642-desconto-campaign-precedence');
-  assert.equal(suggestBranchName('fix/pallet-sem-preco', 'main'), 'hotfix/<id>-pallet-sem-preco');
+  assert.equal(suggestBranchName('task/20232-desconto-progressivo', 'release/1.7.0'), 'feature/20232-desconto-progressivo');
+  assert.equal(suggestBranchName('fix/frete-sem-preco', 'main'), 'hotfix/<id>-frete-sem-preco');
   assert.equal(suggestBranchName('fix/new-order-product-sku', 'release/1.7.0'), 'bugfix/<id>-new-order-product-sku');
 });
 
 test('a hotfix to main that carries release commits is blocked; a clean hotfix and release/gmud pass', () => {
   const carried = { release: 'release/1.7.0', base: 'abc', commits: 4, authors: ['Hugo Prado'] };
-  const gate = checkTargetBranch({ source: 'hotfix/pallet', target: 'main', nextRelease: 'release/1.7.0', carried });
+  const gate = checkTargetBranch({ source: 'hotfix/frete', target: 'main', nextRelease: 'release/1.7.0', carried });
   assert.equal(gate.severity, 'BLOCKER');
   assert.equal(gate.carriedRelease, 'release/1.7.0');
-  assert.match(gate.title, /Hotfix `hotfix\/pallet` leva a `release\/1\.7\.0` junto para a `main`/);
-  assert.match(gate.fixPrompt, /git checkout -b hotfix\/pallet-v2 origin\/main/);
-  assert.equal(checkTargetBranch({ source: 'hotfix/pallet', target: 'main', nextRelease: 'release/1.7.0' }), null);
-  assert.equal(checkTargetBranch({ source: 'hotfix/pallet', target: 'main', nextRelease: 'release/1.7.0', carried: { ...carried, commits: 0 } }), null);
+  assert.match(gate.title, /Hotfix `hotfix\/frete` leva a `release\/1\.7\.0` junto para a `main`/);
+  assert.match(gate.fixPrompt, /git checkout -b hotfix\/frete-v2 origin\/main/);
+  assert.equal(checkTargetBranch({ source: 'hotfix/frete', target: 'main', nextRelease: 'release/1.7.0' }), null);
+  assert.equal(checkTargetBranch({ source: 'hotfix/frete', target: 'main', nextRelease: 'release/1.7.0', carried: { ...carried, commits: 0 } }), null);
   assert.equal(checkTargetBranch({ source: 'gmud/1.7.0', target: 'main', nextRelease: 'release/1.7.0', carried }), null);
   const summary = formatTargetBlockSummary({ gate, headSha: HEAD });
   assert.match(summary, /Recrie a branch a partir da `main`/);
@@ -748,4 +900,67 @@ test('a wrong target teaches where feature, bugfix and hotfix go, and when it is
   assert.match(toMain.body, /troque o destino para `release\/1\.8\.0`/);
   const oldRelease = checkTargetBranch({ source: 'feature/1-x', target: 'release/1.6.0', nextRelease: 'release/1.8.0' });
   assert.match(oldRelease.body, /Para onde cada tipo vai/);
+});
+
+test('a PR cited as #id or !id in a finding becomes a plain link, so Azure shows neither a work item nor a card', () => {
+  const vue = 'https://dev.azure.com/org/Projeto/_git/app-web/pullrequest/10146';
+  const back = 'https://dev.azure.com/org/Projeto/_git/api-nova/pullrequest/10149';
+  const finding = {
+    title: 'Mudança fora do escopo do Bug 20229',
+    body: 'A PR par do Vue (#10146) corrige esse ponto; sem mudança no head da !10146. Esta PR (#10149) expõe o campo.',
+    suggestion: 'Abrir um Bug e vincular ao #20229.',
+    fixPrompt: 'Veja a PR #10146 antes.',
+  };
+  const fixed = mentionPullRequests(finding, [{ prId: 10146, url: vue }, { prId: 10149, url: back }]);
+  assert.equal(fixed.body, `A PR par do Vue ([!10146](${vue})) corrige esse ponto; sem mudança no head da [!10146](${vue}). Esta PR ([!10149](${back})) expõe o campo.`);
+  assert.equal(fixed.suggestion, 'Abrir um Bug e vincular ao #20229.');
+  assert.equal(fixed.fixPrompt, `Veja a PR [!10146](${vue}) antes.`);
+  assert.equal(fixed.title, finding.title);
+  assert.equal(mentionPullRequests(fixed, [{ prId: 10146, url: vue }]).body, fixed.body);
+  assert.equal(mentionPullRequests({ body: 'item #452510 e &#10146;' }, [{ prId: 10146, url: vue }]).body, 'item #452510 e &#10146;');
+  assert.equal(mentionPullRequests(finding, []), finding);
+});
+
+test('a front PR that changes a screen without any image gets a non-blocking reminder to attach visual evidence', () => {
+  const kit = { skill: 'prova-visual', name: 'kit do time', url: 'https://git.example.com/kit', install: 'npx git+ssh://git@git.example.com/kit', setup: '/kit-setup' };
+  const reminder = checkVisualEvidence({
+    kit,
+    stack: 'vue',
+    paths: ['src/features/orders/components/NewOrderCheckout.vue', 'src/features/orders/useNewOrderCart.ts', 'src/__tests__/features/orders/Checkout.spec.ts'],
+    description: '## Antes\n\n<!-- print do antes -->\n\n## Depois\n\n<!-- print do depois -->',
+  });
+  assert.equal(reminder.blocking, false);
+  assert.match(reminder.title, /Sem imagem da tela/);
+  assert.match(reminder.body, /NewOrderCheckout\.vue/);
+  assert.match(reminder.suggestion, /`\/prova-visual`/);
+  assert.match(reminder.suggestion, /\[kit do time\]\(https:\/\/git\.example\.com\/kit\)/);
+  assert.match(reminder.suggestion, /npx git\+ssh:\/\/git@git\.example\.com\/kit` e depois `\/kit-setup`/);
+  assert.match(reminder.suggestion, /Sem o kit, um print do antes e do depois já resolve/);
+  const withoutKit = checkVisualEvidence({ stack: 'vue', paths: ['src/App.vue'], description: '' });
+  assert.equal(withoutKit.suggestion, 'Colar na descrição da PR um print da tela antes e depois da mudança.');
+  assert.match(formatFindingComment(reminder), /LEMBRETE · não bloqueia/);
+});
+
+test('visual evidence is not asked when the PR already shows the screen, is not front, or does not touch a screen', () => {
+  const vue = ['src/features/orders/components/NewOrderCheckout.vue'];
+  assert.equal(checkVisualEvidence({ stack: 'vue', paths: vue, description: 'Depois:\n![image.png](https://dev.azure.com/org/_apis/git/repositories/x/pullRequests/1/attachments/image.png)' }), null);
+  assert.equal(checkVisualEvidence({ stack: 'vue', paths: vue, description: '', authorComments: ['<img src="https://x/antes.png">'] }), null);
+  assert.equal(checkVisualEvidence({ stack: 'node', paths: ['src/routes/orders.cart.route.ts'], description: '' }), null);
+  assert.equal(checkVisualEvidence({ stack: 'vue', paths: ['src/features/orders/useNewOrderCart.ts', 'src/__tests__/Checkout.vue'], description: '' }), null);
+  assert.equal(checkVisualEvidence({ stack: 'flutter', paths: ['lib/src/data/order_repository.dart', 'lib/src/model/order.g.dart'], description: '' }), null);
+  const flutter = checkVisualEvidence({ stack: 'flutter', paths: ['lib/src/features/checkout/presentation/checkout_page.dart'], description: '' });
+  assert.match(flutter.body, /checkout_page\.dart/);
+  assert.ok(checkVisualEvidence({ stack: 'vue-design-system', paths: ['src/components/Button/Button.vue'], description: '' }));
+});
+
+test('a backend review gets the front apps as consumers to search, and a front review gets none', () => {
+  const repos = [
+    { name: 'api-legada', stack: 'node' },
+    { name: 'api-nova', stack: 'node' },
+    { name: 'app-web', stack: 'vue' },
+    { name: 'app-mobile', stack: 'flutter' },
+    { name: 'smart-design-system', stack: 'vue-design-system' },
+  ];
+  assert.deepEqual(pickConsumerRepos(repos, repos[0]).map((repo) => repo.name), ['app-web', 'app-mobile']);
+  assert.deepEqual(pickConsumerRepos(repos, repos[2]), []);
 });

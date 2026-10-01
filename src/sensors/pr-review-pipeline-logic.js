@@ -154,6 +154,8 @@ function normalizeFinding(raw) {
   };
 }
 
+const SCENARIO_PROOFS = new Set(['test', 'elsewhere']);
+
 function normalizeUsCoverage(raw) {
   if (!raw || typeof raw !== 'object') return null;
   const scenarios = (Array.isArray(raw.scenarios) ? raw.scenarios : [])
@@ -163,23 +165,45 @@ function normalizeUsCoverage(raw) {
       covered: scenario?.covered === true,
       test: scenario?.test ? String(scenario.test) : null,
       where: scenario?.where ? String(scenario.where) : null,
+      proof: SCENARIO_PROOFS.has(scenario?.proof) ? scenario.proof : 'test',
+      owner: scenario?.owner ? String(scenario.owner) : null,
+      issue: scenario?.issue ? String(scenario.issue).trim() : null,
     }))
     .filter((scenario) => scenario.text);
-  const total = Number(raw.total ?? scenarios.length) || 0;
-  const covered = Number(raw.covered ?? scenarios.filter((scenario) => scenario.covered).length) || 0;
-  return { total, covered, note: raw.note ? String(raw.note) : '', source: raw.source ? String(raw.source) : null, scenarios };
+  const note = raw.note ? String(raw.note) : '';
+  const source = raw.source ? String(raw.source) : null;
+  if (scenarios.length === 0) {
+    return { total: Number(raw.total) || 0, covered: Number(raw.covered) || 0, elsewhereMissing: {}, note, source, scenarios };
+  }
+  const provenThere = (scenario) => scenario.covered || (!!scenario.test && !scenario.issue);
+  const coveredHere = (scenario) => scenario.covered || (scenario.proof === 'elsewhere' && provenThere(scenario));
+  const elsewhereMissing = {};
+  for (const scenario of scenarios) {
+    if (scenario.proof !== 'elsewhere' || provenThere(scenario)) continue;
+    const owner = scenario.owner || 'outro repo';
+    elsewhereMissing[owner] = (elsewhereMissing[owner] || 0) + 1;
+  }
+  const here = scenarios.filter((scenario) => scenario.proof !== 'elsewhere' || provenThere(scenario));
+  return { total: here.length, covered: here.filter(coveredHere).length, elsewhereMissing, note, source, scenarios };
 }
+
+export function usCoverageLine(usCoverage) {
+  const elsewhere = Object.entries(usCoverage?.elsewhereMissing || {}).map(([owner, n]) => ` · ${n} sem teste em ${owner}`).join('');
+  return `US: ${usCoverage?.covered ?? 0}/${usCoverage?.total ?? 0} cenários com teste${elsewhere}`;
+}
+
+const refused = (scenario) => !!(scenario.test && scenario.issue);
 
 export function usScenarioFinding(usCoverage, { repo, prUrl, testSkills = [] } = {}) {
   if (!usCoverage || usCoverage.total <= 0 || usCoverage.covered >= usCoverage.total) return null;
-  const missing = usCoverage.scenarios.filter((scenario) => !scenario.covered);
-  const gap = usCoverage.total - usCoverage.covered;
+  const missing = usCoverage.scenarios.filter((scenario) => scenario.proof === 'test' && !scenario.covered);
+  const gap = usCoverage.scenarios.length ? missing.length : usCoverage.total - usCoverage.covered;
   const list = missing.length
-    ? missing.map((scenario) => `- **${scenario.id}** ${scenario.text}${scenario.where ? ` → \`${scenario.where}\`` : ''}`).join('\n')
+    ? missing.map((scenario) => `- **${scenario.id}** ${scenario.text}${scenario.where ? ` → \`${scenario.where}\`` : ''}${refused(scenario) ? `\n  O teste \`${scenario.test}\` não conta: ${scenario.issue}` : ''}`).join('\n')
     : `- ${usCoverage.note || 'a revisão não detalhou quais cenários faltam; confira os critérios de aceite da US.'}`;
   const skillHint = testSkills.length ? `Use a skill ${testSkills.map((name) => `/${name}`).join(' ou ')} deste repo.` : 'Siga o padrão de testes que o repo já usa.';
   const scenarioPrompt = missing.length
-    ? missing.map((scenario) => `${scenario.id}. ${scenario.text}${scenario.where ? `\n   Onde: ${scenario.where}` : ''}`).join('\n')
+    ? missing.map((scenario) => `${scenario.id}. ${scenario.text}${scenario.where ? `\n   Onde: ${scenario.where}` : ''}${refused(scenario) ? `\n   Teste atual que não conta: ${scenario.test} (${scenario.issue})` : ''}`).join('\n')
     : (usCoverage.note || 'Leia os critérios de aceite da US vinculada e liste os cenários sem teste.');
   return {
     severity: 'WARNING',
@@ -197,7 +221,8 @@ export function usScenarioFinding(usCoverage, { repo, prUrl, testSkills = [] } =
       scenarioPrompt,
       '',
       skillHint,
-      'Padrão /tdd: um teste por cenário, pela interface pública do módulo (o que o chamador/usuário vê), mock só na fronteira (HTTP, banco, tempo), valor esperado vindo do critério de aceite e não recalculado do jeito que o código calcula, nome do teste descrevendo o comportamento.',
+      'Teste de aceitação: um por cenário, entrando pela interface que o usuário ou o chamador usa (tela, composable, rota), com mock só na fronteira HTTP (o service/http do repo) e, no backend, no provider externo e no banco; nunca chame sistema real (backoffice, motor de regras, UAT, outro app) e nunca mocke store, composable ou service interno do próprio repo.',
+      'Padrão /tdd: valor esperado vindo do critério de aceite e não recalculado do jeito que o código calcula, nome do teste descrevendo o comportamento.',
       'Não altere código de produção. Se um cenário não passar, reporte o que o código faz em vez de ajustar o teste para passar.',
       'Rode a suíte de testes do repo e confirme que todos os testes novos passam.',
     ].join('\n'),
@@ -265,6 +290,19 @@ export function formatFindingComment(finding, { includeLocation = false } = {}) 
   }
   if (finding.headSha) parts.push(`<!-- seal:finding-sha ${finding.headSha} -->`);
   return parts.join('\n\n');
+}
+
+const MENTION_FIELDS = ['title', 'body', 'suggestion', 'fixPrompt'];
+
+export function mentionPullRequests(finding, pullRequests) {
+  const urls = new Map((pullRequests || []).filter((pr) => pr?.prId && pr?.url).map((pr) => [String(pr.prId), pr.url]));
+  if (urls.size === 0) return finding;
+  const pattern = new RegExp(`(^|[^\\w&\\[])[#!](${[...urls.keys()].join('|')})(?!\\d)`, 'g');
+  const fixed = { ...finding };
+  for (const field of MENTION_FIELDS) {
+    if (typeof fixed[field] === 'string') fixed[field] = fixed[field].replace(pattern, (_, lead, id) => `${lead}[!${id}](${urls.get(id)})`);
+  }
+  return fixed;
 }
 
 export const pendingCommentsText = (total) =>
@@ -385,7 +423,7 @@ export function formatSummaryComment({ data, headSha, priorOpen = 0, priorThread
     ? [
         `**⏸️ Aguardando autor** — ${data.blockingReason || fallbackReason}`,
         '',
-        `${detail ? `${detail} ` : ''}Resolva e faça push: a PR é revisada de novo no próximo commit.`,
+        `${detail ? `${detail} ` : ''}Corrija e faça push, ou responda no comentário se discorda: o SEAL reavalia a cada commit, resposta ou comentário resolvido.`,
       ]
     : ['**✅ Aprovado** — nenhum ponto pendente.'];
   if (pending > 0 && priorThreads.length > 0) {
@@ -432,7 +470,7 @@ export function followUpReasons({ pr, threads, myEmail, now = Date.now(), paired
   });
   if (staleThreads.length > 0) reasons.push('stale-no-response');
 
-  if (pairedStatuses.some((status) => status === 'completed' || status === 'abandoned')) reasons.push('pair-desync');
+  if (pairedStatuses.some((status) => status === 'completed')) reasons.push('pair-desync');
   return reasons;
 }
 
@@ -449,7 +487,7 @@ const REASON_TEXT = {
   },
   'stale-no-response': (entry) => `Oi ${entry.authorFirstName}, ficaram comentários sem resposta há mais de 1 dia na PR !${entry.prId} (${entry.title}). Pode responder ou marcar como resolvido? ${entry.url}`,
   'open-over-1d': (entry) => `Oi ${entry.authorFirstName}, a PR !${entry.prId} (${entry.title}) está aberta há mais de 1 dia. Falta algo para ela andar? ${entry.url}`,
-  'pair-desync': (entry) => `Oi ${entry.authorFirstName}, a PR par da !${entry.prId} já foi fechada no outro repo e esta segue aberta. As duas precisam subir juntas — dá para alinhar? ${entry.url}`,
+  'pair-desync': (entry) => `Oi ${entry.authorFirstName}, a PR par da !${entry.prId} já entrou no outro repo e esta segue aberta. As duas precisam subir juntas — dá para alinhar? ${entry.url}`,
 };
 
 export function messageDraftFor(reason, entry) {
@@ -519,6 +557,41 @@ export function checkBranchName({ source, target }) {
     fixPrompt: `A branch \`${source}\` não segue o padrão de nome (feature/, bugfix/ ou hotfix/). Crie a branch certa a partir dela e publique: \`git fetch origin && git checkout -b ${suggestion} origin/${source} && git push -u origin ${suggestion}\`. Abra uma PR nova de \`${suggestion}\` para \`${target}\` com o mesmo título e descrição, e abandone a PR atual.`,
     sources: ['branch-gate'],
   };
+}
+
+const FRONT_STACK = /^(vue|flutter)/;
+const TEST_PATH = /(^|\/)(__tests__|tests?|test_driver|integration_test)\/|\.(spec|test)\.[jt]s$|_test\.dart$/;
+const VUE_SCREEN = /\.(vue|css|scss)$/;
+const FLUTTER_SCREEN = /^lib\/.*(\/(pages?|screens?|widgets?|views?|presentation|ui|components)\/|_(page|screen|widget|view)\.dart$)/;
+const HAS_IMAGE = /!\[[^\]]*\]\([^)]+\)|<img\b|\.(png|jpe?g|gif|webp|mp4|mov)\b/i;
+
+export function checkVisualEvidence({ stack, paths = [], description = '', authorComments = [], kit = null }) {
+  if (!FRONT_STACK.test(stack || '')) return null;
+  const isScreen = (file) => (/^flutter/.test(stack) ? FLUTTER_SCREEN.test(file) && !/\.(g|freezed)\.dart$/.test(file) : VUE_SCREEN.test(file));
+  const screens = paths.filter((file) => !TEST_PATH.test(file) && isScreen(file));
+  if (screens.length === 0) return null;
+  const shown = [description, ...authorComments].some((text) => HAS_IMAGE.test(String(text || '').replace(/<!--[\s\S]*?-->/g, '')));
+  if (shown) return null;
+  const listed = screens.slice(0, 5).map((file) => `- \`${file}\``).join('\n');
+  const more = screens.length > 5 ? `\n- e mais ${screens.length - 5}` : '';
+  return {
+    kind: 'doc-request', blocking: false, file: null, line: null, rule: 'Evidência visual',
+    severity: 'NIT',
+    title: 'Sem imagem da tela na PR',
+    body: `A PR muda tela e a descrição não mostra o resultado:\n\n${listed}${more}\n\nUm antes e depois deixa o revisor e o QA verem o efeito sem rodar a branch.`,
+    suggestion: kit?.skill
+      ? [
+        `Rodar \`/${kit.skill}\` no Claude Code, na branch: a skill captura a mesma tela com e sem a mudança e monta a imagem comparativa. Colar na descrição da PR.`,
+        kit.url || kit.install ? `A skill vem no [${kit.name || 'kit do time'}](${kit.url || '#'})${kit.install ? `. Para instalar: \`${kit.install}\`${kit.setup ? ` e depois \`${kit.setup}\` no Claude Code` : ''}` : ''}. Sem o kit, um print do antes e do depois já resolve.` : 'Sem a skill, um print do antes e do depois já resolve.',
+      ].join('\n\n')
+      : 'Colar na descrição da PR um print da tela antes e depois da mudança.',
+    sources: ['evidence-gate'],
+  };
+}
+
+export function pickConsumerRepos(repos, repo) {
+  if (FRONT_STACK.test(repo?.stack || '')) return [];
+  return (repos || []).filter((other) => other.name !== repo.name && /^(vue|flutter)$/.test(other.stack || ''));
 }
 
 export function formatNameBlockSummary({ finding, headSha, prUrl = null, threadId = null }) {
@@ -643,47 +716,90 @@ export function buildChatPrompt({ prId, question }) {
     '',
     'Responda em português, direto, citando arquivo:linha quando falar de código. Você pode reler o código deste worktree.',
     'Não poste, não vote, não edite arquivos: quem executa qualquer mudança é o sensor.',
-    `Só se você concluir que um achado seu publicado NÃO se sustenta, termine a resposta com o bloco abaixo, usando o título exato do achado:`,
+    `Quando houver ação sobre um achado publicado, termine a resposta com o bloco abaixo, usando o título exato do achado. "resolve" para o que NÃO se sustenta; "reply" para o que se sustenta e merece resposta no thread ao autor; "reopen" para o que se sustenta mas foi marcado como resolvido:`,
     `${CHAT_BLOCK_START}`,
-    '{"resolve": [{"title": "título exato do achado", "reason": "por que ele não se sustenta"}]}',
+    '{"resolve": [{"title": "título exato do achado", "reason": "por que ele não se sustenta"}], "reply": [{"title": "título exato", "text": "o que vai no thread para o autor"}], "reopen": [{"title": "título exato", "missing": "o que falta", "fixPrompt": "prompt de correção"}]}',
     `${CHAT_BLOCK_END}`,
     'Se o que falta não é código e sim ajustar um work item (critério de aceite de US/Bug, task), liste em "work_items" no mesmo bloco: {"work_items": [{"id": 123, "change": "o que mudar"}]}. Quem ajusta é o dono do SEAL, não o autor da PR.',
-    'Se nenhum achado deve ser resolvido e nenhum work item precisa mudar, não inclua o bloco.',
+    'Sem nenhuma ação (nada a resolver, responder, reabrir nem work item a mudar), não inclua o bloco.',
   ].join('\n');
 }
 
 const THREAD_STATUS_NAMES = { 1: 'active', 2: 'fixed', 3: 'wontFix', 4: 'closed', 5: 'byDesign', 6: 'pending' };
+const RESOLVED_STATUSES = new Set(['fixed', 'wontFix', 'closed', 'byDesign']);
+const BOT_OWN_CHANGE_MS = 60_000;
+
+const HUMAN_COMMENT = (comment, myEmail, since) =>
+  !comment.isDeleted
+  && (comment.commentType === undefined || comment.commentType === 'text' || comment.commentType === 1)
+  && !isMine(comment.author, myEmail)
+  && (comment.content || '').trim()
+  && Date.parse(comment.publishedDate || 0) > since;
+
+const asReply = (comment) => ({ author: comment.author?.displayName || comment.author?.uniqueName || 'autor', text: comment.content.trim(), at: comment.publishedDate });
 
 export function authorReplies({ threads, myEmail, since = 0 }) {
   const disputes = [];
+  const general = [];
   let latestAt = since;
+  const seen = (at) => { latestAt = Math.max(latestAt, Date.parse(at)); };
   for (const thread of threads || []) {
-    const [first, ...rest] = thread.comments || [];
-    if (!first || first.isDeleted || thread.isDeleted || !isMine(first.author, myEmail)) continue;
-    const match = (first.content || '').match(FINDING_TITLE_RE);
-    if (!match) continue;
-    const replies = rest
-      .filter((comment) => !comment.isDeleted && comment.commentType !== 'system' && !isMine(comment.author, myEmail) && (comment.content || '').trim())
-      .filter((comment) => Date.parse(comment.publishedDate || 0) > since)
-      .map((comment) => ({ author: comment.author?.displayName || comment.author?.uniqueName || 'autor', text: comment.content.trim(), at: comment.publishedDate }));
-    if (replies.length === 0) continue;
-    for (const item of replies) latestAt = Math.max(latestAt, Date.parse(item.at));
-    disputes.push({ threadId: thread.id, title: match[1].trim(), status: THREAD_STATUS_NAMES[thread.status] || String(thread.status ?? ''), replies });
+    if (thread.isDeleted) continue;
+    const comments = thread.comments || [];
+    const [first, ...rest] = comments;
+    if (!first || first.isDeleted) continue;
+    const botThread = isMine(first.author, myEmail);
+    const match = botThread ? (first.content || '').match(FINDING_TITLE_RE) : null;
+    if (!match) {
+      const human = (botThread ? rest : comments).filter((comment) => HUMAN_COMMENT(comment, myEmail, since));
+      for (const comment of human) {
+        general.push({ threadId: thread.id, ...asReply(comment) });
+        seen(comment.publishedDate);
+      }
+      continue;
+    }
+    const status = THREAD_STATUS_NAMES[thread.status] || String(thread.status ?? '');
+    const replies = rest.filter((comment) => HUMAN_COMMENT(comment, myEmail, since)).map(asReply);
+    if (replies.length > 0) {
+      for (const item of replies) seen(item.at);
+      disputes.push({ threadId: thread.id, title: match[1].trim(), status, replies });
+      continue;
+    }
+    const lastBotAt = Math.max(0, ...comments.filter((comment) => isMine(comment.author, myEmail)).map((comment) => Date.parse(comment.publishedDate || 0)));
+    const updatedAt = Date.parse(thread.lastUpdatedDate || 0);
+    if (RESOLVED_STATUSES.has(status) && updatedAt > since && updatedAt > lastBotAt + BOT_OWN_CHANGE_MS) {
+      seen(thread.lastUpdatedDate);
+      disputes.push({ threadId: thread.id, title: match[1].trim(), status, replies: [], resolvedWithoutReply: true });
+    }
   }
-  return { disputes, latestAt };
+  return { disputes, general, latestAt };
 }
 
-export function buildAuthorReplyQuestion({ prId, disputes }) {
+export function buildAuthorReplyQuestion({ prId, disputes, general = [], acceptanceRulesPath = null }) {
   const blocks = disputes.map((dispute) =>
-    [`Achado: ${dispute.title} (thread ${dispute.threadId}, status ${dispute.status || '?'})`, ...dispute.replies.map((item) => `${item.author}: ${item.text}`)].join('\n'),
+    dispute.resolvedWithoutReply
+      ? `Achado: ${dispute.title} (thread ${dispute.threadId}, status ${dispute.status || '?'})\nO autor marcou como resolvido sem responder. Confira no código se o achado ainda vale.`
+      : [`Achado: ${dispute.title} (thread ${dispute.threadId}, status ${dispute.status || '?'})`, ...dispute.replies.map((item) => `${item.author}: ${item.text}`)].join('\n'),
   );
+  const others = general.map((item) => `${item.author} (thread ${item.threadId}): ${item.text}`);
   return [
-    `O autor respondeu aos seus achados na PR !${prId}, sem commit novo. Reavalie cada um à luz da resposta:`,
+    `O autor interagiu com a sua revisão da PR !${prId}. Leve cada interação a sério e reavalie contra o código atual deste worktree:`,
     '',
     blocks.join('\n\n'),
+    ...(others.length ? ['', 'Comentários do autor fora dos achados:', ...others] : []),
     '',
-    'Para cada achado, diga se ele se sustenta. Uma decisão do time registrada na PR é um argumento válido para código; não repita o mesmo achado só porque o critério escrito do work item ainda não mudou.',
+    'Para cada achado, decida se ele se sustenta:',
+    '- Não se sustenta (a resposta ou um comentário acima traz argumento ou fato que você confirmou no código, na US ou numa decisão do time registrada na PR): liste em "resolve". Não repita o achado só porque o critério escrito do work item ainda não mudou.',
+    '- Se sustenta e o autor respondeu: liste em "reply" com o título exato e o texto que vai no thread, em português, dizendo o que a resposta não cobre e o que falta, com arquivo:linha.',
+    '- Se sustenta e o autor marcou como resolvido sem responder: liste em "reopen" com o título exato, o que falta em "missing" e um "fixPrompt".',
     'Se o que impede aprovar é só o work item desatualizado, resolva o achado e liste o ajuste em "work_items": o dono do SEAL é avisado para fazer.',
+    ...(acceptanceRulesPath
+      ? [
+          '',
+          `Para achado de teste ou de cenário da US, leia ${acceptanceRulesPath} antes de decidir: a régua de lá vale mais que a sua revisão anterior e que o argumento do autor.`,
+          'Por essa régua, "só dá em UAT", "depende do sistema real" ou "o mock só provaria o mock" não resolvem o achado: cada repo prova a parte dele com a fronteira HTTP mockada, e o cenário que cruza sistemas vira um cenário por repo. Nunca peça para mudar o critério de aceite para "validação do QA" nem proponha teste contra sistema real.',
+        ]
+      : []),
   ].join('\n');
 }
 
@@ -691,8 +807,9 @@ export function parseChatReply(text) {
   const source = String(text || '');
   const start = source.lastIndexOf(CHAT_BLOCK_START);
   const end = start >= 0 ? source.indexOf(CHAT_BLOCK_END, start) : -1;
-  if (start < 0 || end < 0) return { answer: source.trim(), resolves: [], workItems: [], reopen: [] };
+  if (start < 0 || end < 0) return { answer: source.trim(), resolves: [], workItems: [], reopen: [], replies: [] };
   let resolves = [];
+  let replies = [];
   let workItems = [];
   let reopen = [];
   try {
@@ -703,6 +820,9 @@ export function parseChatReply(text) {
     workItems = (Array.isArray(parsed?.work_items) ? parsed.work_items : [])
       .map((item) => ({ id: Number(item?.id), change: String(item?.change || '').trim() }))
       .filter((item) => Number.isInteger(item.id) && item.id > 0 && item.change);
+    replies = (Array.isArray(parsed?.reply) ? parsed.reply : [])
+      .map((item) => ({ title: String(item?.title || '').trim(), text: String(item?.text || '').trim() }))
+      .filter((item) => item.title && item.text);
     reopen = (Array.isArray(parsed?.reopen) ? parsed.reopen : [])
       .map((item) => ({ title: String(item?.title || '').trim(), missing: String(item?.missing || '').trim(), fixPrompt: String(item?.fixPrompt || '').trim() }))
       .filter((item) => item.title);
@@ -710,8 +830,9 @@ export function parseChatReply(text) {
     resolves = [];
     workItems = [];
     reopen = [];
+    replies = [];
   }
-  return { answer: (source.slice(0, start) + source.slice(end + CHAT_BLOCK_END.length)).trim(), resolves, workItems, reopen };
+  return { answer: (source.slice(0, start) + source.slice(end + CHAT_BLOCK_END.length)).trim(), resolves, workItems, reopen, replies };
 }
 
 export function findingThreadIdsByTitle(threads, myEmail) {
